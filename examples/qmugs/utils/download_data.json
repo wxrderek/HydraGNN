@@ -1,0 +1,12 @@
+{
+    "data_dir": "/pscratch/sd/w/wxrderek/qmugs",
+    "raw_data_subdir": "raw",
+    "wfns_subdir": "wfns",
+    "urls": {
+        "summary.csv": "https://libdrive.ethz.ch/index.php/s/X5vOBNSITAG5vzM/download?path=%2F&files=summary.csv",
+        "structures.tar.gz": "https://libdrive.ethz.ch/index.php/s/X5vOBNSITAG5vzM/download?path=%2F&files=structures.tar.gz",
+        "vibspectra.tar.gz": "https://libdrive.ethz.ch/index.php/s/X5vOBNSITAG5vzM/download?path=%2F&files=vibspectra.tar.gz",
+        "tarball_assignment.csv": "https://libdrive.ethz.ch/index.php/s/X5vOBNSITAG5vzM/download?path=%2F&files=tarball_assignment.csv",
+        "wfns": "https://libdrive.ethz.ch/index.php/s/X5vOBNSITAG5vzM/download?path=%2Fwfns&files=wfns_$.tar.gz"
+    }
+}

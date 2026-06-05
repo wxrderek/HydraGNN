@@ -1,4 +1,6 @@
 rdkit==2026.3.2 # library for cheminformatics
-openqdc # library for OpenQDC database https://docs.openqdc.io/stable/, used to access QMugs molecular geometry data easier
+openqdc # OPTIONAL: library for OpenQDC database https://docs.openqdc.io/stable/
 
-psi4 # only works with conda installation 
+# ====================================================================================================
+psi4 # only works with conda. REQUIRED for learning density on grid, OPTIONAL for learning density matrices
+# ====================================================================================================

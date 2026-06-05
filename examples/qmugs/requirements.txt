@@ -1,2 +1,4 @@
 rdkit==2026.3.2 # library for cheminformatics
 openqdc # library for OpenQDC database https://docs.openqdc.io/stable/, used to access QMugs molecular geometry data easier
+
+psi4 # only works with conda installation 

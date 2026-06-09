@@ -5,6 +5,7 @@ from mpi4py import MPI
 import argparse
 import numpy as np
 import pandas as pd
+import scipy
 
 import re
 from rdkit import Chem
@@ -43,6 +44,9 @@ def _canon_CHEMBL_id(id: str):
         f'Invalid input format for CHEMBL ID: {id}. Must input either all digits, or start with string CHEMBL'
     )
 
+# ----------------------------------------------------------------------------------------------------
+# NEED TO ACCOUNT FOR MOLECULES WITH LESS THAN 3 CONFORMERS
+# ----------------------------------------------------------------------------------------------------
 
 class QMugsMolecule():
     '''molecule object for QMugs dataset for EDA purposes'''
@@ -143,6 +147,7 @@ class QMugsMolecule():
                 with open(self.paths[f'vibspectrum_conf_{conf}'], 'r') as f:
                     
                     for line in f:
+                        # reg ex match the vibspectrum files
                         m = re.match(
                             r"\s*(\d+)\s+([a-zA-Z-]*)\s+(-?\d+\.\d+)\s+(\d+\.\d+)\s+(-|YES|NO)\s+(-|YES|NO)",
                             line
@@ -183,6 +188,7 @@ class QMugsMolecule():
 
 
     def smiles(self):
+        '''return SMILES of molecule'''
         try:
             return self.props['conf_00']['summary']['smiles']
         except KeyError:
@@ -191,6 +197,7 @@ class QMugsMolecule():
     
 
     def draw(self, outpath: str):
+        '''draw the skeletal structure of molecule'''
         from rdkit.Chem import Draw
         mol = Chem.MolFromSmiles(self.smiles())
         if mol is not None:
@@ -206,6 +213,36 @@ class QMugsMolecule():
         return psi4.core.Wavefunction.from_file(self.paths[f'wfn_conf_{conf_idx}'])
 
 
+    def psi4_molecule(self, conf_idx: str):
+        '''return psi4.core.Molecule object for the given conformer'''
+        import psi4
+        return self.psi4_wfn(conf_idx).molecule()
+
+    
+    def get_principle_axes(self, conf_idx: str):
+        '''returns the spatial basis (normalized) given by the principle axes of inertia of the molecule'''
+        import psi4
+        mol = self.psi4_molecule(conf_idx).clone() # updates a clone of the Molecule object
+        mol.update_geometry()
+        mol.move_to_com()
+
+        # compute principle axes and moments
+        I = np.array(mol.inertia_tensor())
+        moments, axes = np.linalg.eigh(I)
+        ordered_idx = np.argsort(moments)[::-1]
+        moments = moments[ordered_idx]
+        axes = axes[:, ordered_idx]
+
+        # ensure right handed frame
+        if np.linalg.det(axes) < 0: axes[:, 0] *= -1
+        return {
+            'axes': (axes[:, 0], axes[:, 1], axes[:, 2]),
+            'moments': moments
+        }
+
+# ----------------------------------------------------------------------------------------------------
+# print file contents (early EDA)
+
 def inspect_wfn(path):
     wfn = np.load(path, allow_pickle=True).tolist()
     print(wfn)
@@ -214,6 +251,30 @@ def inspect_summary(path):
     summary = pd.read_csv(path)
     print(summary.head(10)) 
 
+# ----------------------------------------------------------------------------------------------------
+# distance measures between density matrices
+
+def frobenius(D1, D2, S1, S2, normalize=True):
+    if normalize:
+        D1 = D1 / np.trace(D1 @ S1)
+        D2 = D2 / np.trace(D2 @ S2)
+    D_delta = D1 - D2
+    fro = np.sqrt(np.trace(D_delta @ D_delta))
+
+    return float(np.real(fro))
+
+def fidelity(D1, D2, S1, S2, normalize=True):
+    '''fidelity in a quantum information sense, note this is NOT symmetric with respect to swapping args'''
+    if normalize:
+        D1 = D1 / np.trace(D1 @ S1)
+        D2 = D2 / np.trace(D2 @ S2)
+    sqrt_D1 = scipy.linalg.sqrtm(D1)
+    fidelity = np.trace(
+        scipy.linalg.sqrtm(sqrt_D1 @ D2 @ sqrt_D1)
+    )
+
+    return np.real(fidelity)**2
+# ----------------------------------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
@@ -245,30 +306,51 @@ if __name__ == "__main__":
 
 
     mol_test = QMugsMolecule(
-        CHEMBL_id='1000', 
+        CHEMBL_id='9999', 
         download_config=download_config,
-        load_conf_00_only=True,
+        load_conf_00_only=False,
     )
 
     # print(mol_test.props)
     # print(mol_test.smiles())
     # mol_test.draw(outpath='mol_test.png')
 
-    # import psi4
-    # wfn_test = mol_test.psi4_wfn('00')
-    # wfn_test_1 = mol_test.psi4_wfn('01')
+    import psi4
+    psi4.core.be_quiet()
+    wfn_test = mol_test.psi4_wfn('00')
+    wfn_test_1 = mol_test.psi4_wfn('01')
 
+    # molecule_test = mol_test.psi4_molecule('00')
+    # print(molecule_test.natom())
+    # for i in range(3):
+    #     inertia_info = mol_test.get_principle_axes(f'0{i}')
+    #     axis = inertia_info['axes'][i]
+    #     moment = inertia_info['moments'][i]
+    #     print(axis)
+    #     print(np.linalg.norm(axis))
+    #     print(moment)
+
+    D0 = wfn_test.Da().np + wfn_test.Db().np
+    D1 = wfn_test_1.Da().np + wfn_test_1.Db().np
+    S0 = psi4.core.MintsHelper(wfn_test.basisset()).ao_overlap().to_array()
+    S1 = psi4.core.MintsHelper(wfn_test_1.basisset()).ao_overlap().to_array()
+
+    # cube_file_dir = './cube_files'
+    # os.makedirs(cube_file_dir, exist_ok=True)
     # psi4.set_options({
     #     'cubeprop_tasks': ['density'],
     #     'cubic_grid_spacing': [0.2, 0.2, 0.2],
     #     'cubic_grid_overage': [4.0, 4.0, 4.0],
-    #     'cubeprop_filepath': './cube_files'
+    #     'cubeprop_filepath': cube_file_dir
     # })
     # # psi4.cubeprop(wfn_test)
 
-    # Da_delta = wfn_test.Da().np - wfn_test_1.Da().np
+    D_delta = D0 - D1
 
-    # print(np.linalg.norm(wfn_test.Da().np, ord='fro'))
-    # print(np.linalg.norm(wfn_test_1.Da().np, ord='fro'))
+    print(f'D0 Frobenius: {np.linalg.norm(D0 @ S0, ord='fro')}')
+    print(f'D1 Frobenius: {np.linalg.norm(D1 @ S1, ord='fro')}')
+
+    print(f'D0-D1 Frobenius: {np.linalg.norm(D_delta, ord='fro')}')
+    print(f'Frobenius normalized: {frobenius(D0, D1, S0, S1, normalize=True)}')
+    print(f'Fidelity measure: {fidelity(D0, D1, S0, S1, normalize=True)}')
     
-    # print(np.linalg.norm(Da_delta, ord='fro'))

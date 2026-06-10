@@ -4,17 +4,22 @@ import sys
 from mpi4py import MPI
 import argparse
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 import random
 import torch
 import torch.distributed as dist
 
+# ----------------------------------------------------------------------------------------------------
 # FIX random seed
 random_state = 0
 torch.manual_seed(random_state)
+random.seed(random_state)
+# ----------------------------------------------------------------------------------------------------
 
 from torch_geometric.data import Data
 from torch_geometric.transforms import Distance
@@ -89,12 +94,25 @@ class QMugsDataset(AbstractBaseDataset):
             self.world_size = torch.distributed.get_world_size()
             self.rank = torch.distributed.get_rank()
 
+        # paths to data
         self.download_config = download_config or {}
         self.data_dir = download_config.get('data_dir', 'dataset')
         self.wfns_dir = os.path.join(self.data_dir, download_config.get('wfns_subdir', 'wfns'))
 
-        self._load_molecules()
-    
+        # get list of chembl_id's of all molecules via tarball_assignment.csv
+        tarball_assignment = pd.read_csv(os.path.join(self.data_dir, 'tarball_assignment.csv'))
+        self.chembl_ids = tarball_assignment['chembl_id'].tolist()
+
+        # get list of dirs where wfns for molecules are stored
+        self.molecule_wfn_dirs = tarball_assignment.apply(
+            lambda row: os.path.join(
+                self.wfns_dir,
+                row['archive_name'].split('.')[0],
+                row['chembl_id'],
+            ), axis=1
+        ).tolist()
+
+
 
     def _mol_to_graph(self, wfn_path):
         '''convert wfn .npy file to torch_geometric.data.Data object and return'''
@@ -171,44 +189,69 @@ class QMugsDataset(AbstractBaseDataset):
 
         return data_object
 
-    
-    # THIS MAY NEED TO BE FURTHER OPTIMIZED
-    # use tarball_assignments.csv to construct paths to wfns instead of walking thru the entire dataset
-    def _load_molecules(self, use_tarball_assignments=True):
-        '''walks through locally downloaded QMugs molecules and maps CHEMBL ids to wfn paths'''
-        molecules = {}
+
+    def _train_val_test_dirs(self, perc_load: float = 1.0, perc_train: float = 0.8):
+        '''return list of directory paths of molecules to load'''
+
+        # sample subset of chembl_id's of molecules to load for task
+        all_molecule_dirs = self.molecule_wfn_dirs.copy()
+        num_molecules_to_load = max(1, int(len(all_molecule_dirs) * perc_load))
+        molecule_dirs_to_load = random.sample(all_molecule_dirs, num_molecules_to_load)
+
+        perc_val = (1 - perc_train) / 2
+        num_train = int(num_molecules_to_load * perc_train)
+        num_val = int(num_molecules_to_load * perc_val)
+
+        # get chembl_id's for train, val, test sets
+        trainset_dirs = molecule_dirs_to_load[: num_train]
+        valset_dirs = molecule_dirs_to_load[num_train : num_train + num_val]
+        testset_dirs = molecule_dirs_to_load[num_train + num_val :]
+
+        return trainset_dirs, valset_dirs, testset_dirs
+
+
+    def load_and_split_dataset(self, 
+        perc_load: float = 1.0, 
+        perc_train: float = 0.8,
+    ):
+        '''load and split data, with splitting done per molecule, not per conformer'''
+
+        # get chembl_id's for train, val, test sets
+        trainset_dirs, valset_dirs, testset_dirs = self._train_val_test_dirs(
+            perc_load=perc_load,
+            perc_train=perc_train
+        )
+
+        # helper loader
+        def _load_molecules_from_dir_list(dir_list, res_list, pbar):
+            for dir in dir_list:
+                for _, _, files in os.walk(dir):
+                    for filename in files:
+                        wfn_path = os.path.join(dir, filename)
+                        data_object = self._mol_to_graph(wfn_path=wfn_path)
+
+                        # append to trainset and self.dataset
+                        res_list.append(data_object)
+                        self.dataset.append(data_object)
+                pbar.update(1)
+
+        # load trainset
+        trainset = []
+        with tqdm(total=len(trainset_dirs), desc='Loading train set molecules') as pbar:
+            _load_molecules_from_dir_list(trainset_dirs, trainset, pbar)
         
-        # map molecules (CHEMBL ids) to the paths of its conformers
-        with tqdm(total=NUM_CONFORMERS, desc='Walking through molecules') as pbar:
-            for root, _, files in os.walk(self.wfns_dir):
-                for filename in files:
-                    wfn_path = os.path.join(root, filename)
-
-                    chembl_id = wfn_path.split('/')[-2]
-                    if chembl_id not in molecules:
-                        molecules[chembl_id] = []
-                    molecules[chembl_id].append(wfn_path)
-                    pbar.update(1)
+        # load valset
+        valset = []
+        with tqdm(total=len(valset_dirs), desc='Loading validation set molecules') as pbar:
+            _load_molecules_from_dir_list(valset_dirs, valset, pbar)
         
-        print(f'Walked through {pbar.n} total conformers')
-        self.molecules_dict = molecules
-    
+        # load testset
+        testset = []
+        with tqdm(total=len(testset_dirs), desc='Loading test set molecules') as pbar:
+            _load_molecules_from_dir_list(testset_dirs, testset, pbar)
 
-    def load_dataset(self, sampling_ratio: float = 1.0):
-        '''samples a subset of all molecules and loads them as Data objects'''
-        molecules = self.molecules_dict.copy()
-        chembl_ids = list(molecules.keys())
-        num_molecules_to_load = max(1, int(len(chembl_ids) * sampling_ratio))
-
-        random.seed(random_state)
-        sampled_molecule_ids = random.sample(chembl_ids, num_molecules_to_load)
+        return trainset, valset, testset
         
-        # load all conformers for each sampled molecule
-        for chembl_id in sampled_molecule_ids:
-            for wfn_path in sorted(molecules[chembl_id]):
-                data_obj = self._mol_to_graph(wfn_path=wfn_path)
-                self.dataset.append(data_obj)
-
         
     def len(self):
         return len(self.dataset)
@@ -219,9 +262,56 @@ class QMugsDataset(AbstractBaseDataset):
 
 if __name__ == "__main__":
 
-    with open('qmugs_densmat.json', 'r') as f:
-        config = json.load(f)
+    # ----------------------------------------------------------------------------------------------------
+    # args
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--sampling", type=float, help="sampling ratio", default=None)
+    parser.add_argument(
+        "--preonly",
+        action="store_true",
+        help="preprocess only (no training)",
+    )
+    parser.add_argument(
+        "--inputfile", help="input config file", type=str, default="qmugs_densmat.json"
+    )
+    parser.add_argument("--ddstore", action="store_true", help="ddstore dataset")
+    parser.add_argument("--ddstore_width", type=int, help="ddstore width", default=None)
+    parser.add_argument("--shmem", action="store_true", help="shmem")
+    parser.add_argument("--log", help="log name")
+    parser.add_argument("--batch_size", type=int, help="batch_size", default=None)
+    parser.add_argument("--everyone", action="store_true", help="gptimer")
+    parser.add_argument("--modelname", help="model name")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "fp64", "bf16"],
+        default=None,
+        help="Override precision; defaults to fp32 when not set",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--adios",
+        help="Adios dataset",
+        action="store_const",
+        dest="format",
+        const="adios",
+    )
+    group.add_argument(
+        "--pickle",
+        help="Pickle dataset",
+        action="store_const",
+        dest="format",
+        const="pickle",
+    )
+    parser.set_defaults(format="pickle") # not sure how ADIOS2 works on Perlmutter
+    args = parser.parse_args()
 
+    # ----------------------------------------------------------------------------------------------------
+    # set up dataset object
+    with open(args.inputfile, 'r') as f:
+        config = json.load(f)
     with open('utils/download_data.json', 'r') as f:
         download_config = json.load(f)
     
@@ -230,9 +320,14 @@ if __name__ == "__main__":
         download_config=download_config,
     )
 
+    # data loading and splitting
     start = time.perf_counter()
-    dataset_object.load_dataset(sampling_ratio=0.0001)
+    trainset, valset, testset = dataset_object.load_and_split_dataset(
+        perc_load=0.01, 
+        perc_train=0.8,
+    )
     end = time.perf_counter()
 
     print(f'Loaded {dataset_object.len()} conformers')
-    print(f'Time for dataset sampling + loading (without accounting for object initialization): {end-start}')
+    print(f'trainset {len(trainset)}, valset {len(valset)}, testset {len(testset)}')
+    print(f'Time for dataset loading + splitting (without accounting for object initialization): {end-start}')

@@ -2,5 +2,5 @@ rdkit==2026.3.2 # library for cheminformatics
 openqdc # OPTIONAL: library for OpenQDC database https://docs.openqdc.io/stable/
 
 # ====================================================================================================
-psi4 # only works with conda. REQUIRED for learning density on grid, OPTIONAL for learning density matrices
+psi4 # only works with conda
 # ====================================================================================================

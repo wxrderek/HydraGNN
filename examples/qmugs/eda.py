@@ -138,8 +138,18 @@ class QMugsMolecule():
 
             # from structures
             if self.load_structures:
-                structure_props = next(Chem.SDMolSupplier(self.paths[f'structures_conf_{conf}'], removeHs=False)).GetPropsAsDict()
-                conf_props.update({'structure': structure_props})
+                mol_object = Chem.SDMolSupplier(self.paths[f'structures_conf_{conf}'], removeHs=False)[0]
+                
+                # get coordinates and atomic numbers
+                pos = mol_object.GetConformer().GetPositions().tolist()
+                atomic_numbers = [atom.GetAtomicNum() for atom in mol_object.GetAtoms()]
+                other_structure_props = next(Chem.SDMolSupplier(self.paths[f'structures_conf_{conf}'], removeHs=False)).GetPropsAsDict()
+
+                conf_props.update({'structure': {
+                    'geom': pos,
+                    'atomic_numbers': atomic_numbers,
+                    'other_props': other_structure_props,
+                }})
 
             # from vibspectra
             if self.load_vibspectra:
@@ -306,10 +316,13 @@ if __name__ == "__main__":
 
 
     mol_test = QMugsMolecule(
-        CHEMBL_id='9999', 
+        CHEMBL_id='1000', 
         download_config=download_config,
-        load_conf_00_only=False,
+        load_structures=True,
+        load_conf_00_only=True,
     )
+
+    print(json.dumps(mol_test.props['conf_00']['structure'], indent=4))
 
     # print(mol_test.props)
     # print(mol_test.smiles())
@@ -317,8 +330,8 @@ if __name__ == "__main__":
 
     import psi4
     psi4.core.be_quiet()
-    wfn_test = mol_test.psi4_wfn('00')
-    wfn_test_1 = mol_test.psi4_wfn('01')
+    # wfn_test = mol_test.psi4_wfn('00')
+    # wfn_test_1 = mol_test.psi4_wfn('01')
 
     # molecule_test = mol_test.psi4_molecule('00')
     # print(molecule_test.natom())
@@ -330,27 +343,17 @@ if __name__ == "__main__":
     #     print(np.linalg.norm(axis))
     #     print(moment)
 
-    D0 = wfn_test.Da().np + wfn_test.Db().np
-    D1 = wfn_test_1.Da().np + wfn_test_1.Db().np
-    S0 = psi4.core.MintsHelper(wfn_test.basisset()).ao_overlap().to_array()
-    S1 = psi4.core.MintsHelper(wfn_test_1.basisset()).ao_overlap().to_array()
+    # D0 = wfn_test.Da().np + wfn_test.Db().np
+    # D1 = wfn_test_1.Da().np + wfn_test_1.Db().np
+    # S0 = psi4.core.MintsHelper(wfn_test.basisset()).ao_overlap().to_array()
+    # S1 = psi4.core.MintsHelper(wfn_test_1.basisset()).ao_overlap().to_array()
 
-    # cube_file_dir = './cube_files'
-    # os.makedirs(cube_file_dir, exist_ok=True)
-    # psi4.set_options({
-    #     'cubeprop_tasks': ['density'],
-    #     'cubic_grid_spacing': [0.2, 0.2, 0.2],
-    #     'cubic_grid_overage': [4.0, 4.0, 4.0],
-    #     'cubeprop_filepath': cube_file_dir
-    # })
-    # # psi4.cubeprop(wfn_test)
+    # D_delta = D0 - D1
 
-    D_delta = D0 - D1
+    # print(f'D0 Frobenius: {np.linalg.norm(D0 @ S0, ord='fro')}')
+    # print(f'D1 Frobenius: {np.linalg.norm(D1 @ S1, ord='fro')}')
 
-    print(f'D0 Frobenius: {np.linalg.norm(D0 @ S0, ord='fro')}')
-    print(f'D1 Frobenius: {np.linalg.norm(D1 @ S1, ord='fro')}')
-
-    print(f'D0-D1 Frobenius: {np.linalg.norm(D_delta, ord='fro')}')
-    print(f'Frobenius normalized: {frobenius(D0, D1, S0, S1, normalize=True)}')
-    print(f'Fidelity measure: {fidelity(D0, D1, S0, S1, normalize=True)}')
+    # print(f'D0-D1 Frobenius: {np.linalg.norm(D_delta, ord='fro')}')
+    # print(f'Frobenius normalized: {frobenius(D0, D1, S0, S1, normalize=True)}')
+    # print(f'Fidelity measure: {fidelity(D0, D1, S0, S1, normalize=True)}')
     

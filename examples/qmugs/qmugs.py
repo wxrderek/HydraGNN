@@ -65,12 +65,77 @@ transform_coordinates = Distance(norm=False, cat=False)
 NUM_MOLECULES = 665911
 NUM_CONFORMERS = 1992984
 
+BOHR_TO_ANGSTROM = 0.52917721092
+
+# ----------------------------------------------------------------------------------------------------
+# util functions (might move)
+
+def _build_xyz_grid(
+    center = (0.0, 0.0, 0.0), # (x, y, z), Angstrom by default
+    box_size = 30.0, # Angstrom by default
+    spacing = 0.5, # Angstrom by default
+    input_units: str = 'Angstrom', # 'Angstrom' or 'Bohr'
+    output_units: str = 'Angstrom', # 'Angstrom' or 'Bohr'
+):
+    '''builds (N, 3) dim array of grid points to express scalar field quantities, in Angstrom units by default, covering a square box'''
+
+    if input_units.lower() not in ['angstrom', 'bohr']:
+        raise ValueError(f'Input units not recognized: {input_units}')
+    if output_units.lower() not in ['angstrom', 'bohr']:
+        raise ValueError(f'Output units not recognized: {output_units}')
+    
+    # change everything to Angstrom
+    if input_units.lower() == 'bohr':
+        center = center * BOHR_TO_ANGSTROM
+        box_size = box_size * BOHR_TO_ANGSTROM
+        spacing = spacing * BOHR_TO_ANGSTROM
+    
+    center = np.asarray(center)
+    n = int(round(box_size / spacing))
+    half = box_size / 2
+
+    # ensure box_size is integer multiple of spacing
+    if abs(n * spacing - box_size) > 1e-8:
+        raise ValueError('box_size must be an integer multiple of spacing')
+
+    x = np.linspace(
+        center[0] - half + spacing / 2,
+        center[0] + half - spacing / 2,
+        n,
+    )
+
+    y = np.linspace(
+        center[1] - half + spacing / 2,
+        center[1] + half - spacing / 2,
+        n,
+    )
+
+    z = np.linspace(
+        center[2] - half + spacing / 2,
+        center[2] + half - spacing / 2,
+        n,
+    )
+
+    # build grid
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    grid = np.column_stack(
+        (X.ravel(), Y.ravel(), Z.ravel())
+    )
+
+    # convert to Bohr if specified
+    if output_units.lower() == 'bohr':
+        grid = grid * 1.0 / BOHR_TO_ANGSTROM
+
+    return grid
+
+# ----------------------------------------------------------------------------------------------------
+
 
 class QMugsDataset(AbstractBaseDataset):
     '''QMugs dataset class'''
 
     # pad density matrix to ensure dimension of output is invariant across moledules
-    max_padded_density_matrix_dimension = 2000
+    max_padded_density_matrix_dimension = 2500
 
     def __init__(
         self,
@@ -157,9 +222,33 @@ class QMugsDataset(AbstractBaseDataset):
         return padded
 
 
-    def _preprocess_scalar_density(self, wfn, grid_size: int):
+    def _preprocess_scalar_density(
+        self, 
+        wfn: psi4.core.Wavefunction, 
+        grid_xyz: np.ndarray, # (N, 3) dim array of grid points measured in Angstrom units
+        spin: str = 'total', # 'total', 'alpha', 'beta', 'spin'
+    ):
         '''for each conformer wfn, map density matrix -> scalar density'''
-        pass
+
+        Da = wfn.Da().np
+        Db = wfn.Db().np
+        basis = wfn.basisset()
+
+        # prep matrix
+        if spin == 'alpha':
+            D = Da.copy()
+        elif spin == 'beta':
+            D = Db.copy()
+        elif spin == 'total':
+            D = Da.copy() + Db.copy()
+        elif spin == 'spin':
+            D = Da.copy() - Db.copy()
+        else:
+            raise ValueError(F'Unrecognized density type input: {spin}')
+        
+        # FINISH
+
+
     
 
     def _postprocess_scalar_density(self, coeffs, grid_size: int):
@@ -196,7 +285,9 @@ class QMugsDataset(AbstractBaseDataset):
         Db = psi4_wfn.Db().np
         D_tot = Da + Db
 
-        print(D_tot.shape)
+        # check if density matrix is too big for padding
+        if D_tot.shape[0] > self.__class__.max_padded_density_matrix_dimension:
+            raise ValueError(f'A loaded density matrix has size {D_tot.shape}, the output dimension is {self.__class__.max_padded_density_matrix_dimension}')
 
         # pad density matrix
         if self.pad_density_matrix:
@@ -383,9 +474,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ddstore", action="store_true", help="ddstore dataset")
     parser.add_argument("--ddstore_width", type=int, help="ddstore width", default=None)
-    parser.add_argument("--shmem", action="store_true", help="shmem")
     parser.add_argument("--log", help="log name")
     parser.add_argument("--batch_size", type=int, help="batch_size", default=None)
+    parser.add_argument("--num_epoch", type=int, help="number of epochs to train", default=None)
     parser.add_argument("--everyone", action="store_true", help="gptimer")
     parser.add_argument("--modelname", help="model name")
     parser.add_argument(
@@ -425,7 +516,7 @@ if __name__ == "__main__":
     # read config files
     with open(input_filename, 'r') as f:
         config = json.load(f)
-    with open('utils/download_data.json', 'r') as f:
+    with open(os.path.join(dirpwd, 'utils/download_data.json'), 'r') as f:
         download_config = json.load(f)
         
     dataset_dir = download_config.get('data_dir', './dataset')    
@@ -444,9 +535,11 @@ if __name__ == "__main__":
     var_config["node_feature_names"] = node_feature_names
     var_config["node_feature_dims"] = node_feature_dims
 
-    # reset batch size if specified
+    # reset batch size and epochs if specified
     if args.batch_size is not None:
         config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
+    if args.num_epoch is not None: 
+        config["NeuralNetwork"]["Training"]["num_epoch"] = args.num_epoch
     
     comm_size, rank = hydragnn.utils.distributed.setup_ddp()
     comm = MPI.COMM_WORLD
@@ -601,8 +694,72 @@ if __name__ == "__main__":
     comm.Barrier()
 
     # LINE BELOW THROWS DIMENSION MISMATCH ERROR
+    # if output dimension is not invariant and not specified in the config and script
     hydragnn.utils.input_config_parsing.save_config(config, log_name)
 
     timer.stop()
+
+    # ----------------------------------------------------------------------------------------------------
+    # train
+
+    precision = args.precision.lower() if args.precision is not None else "fp32"
+    config["NeuralNetwork"]["Training"]["precision"] = precision
+
+    model = hydragnn.models.create_model_config(
+        config=config["NeuralNetwork"],
+        verbosity=verbosity,
+    )
+
+    learning_rate = config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=0.00001
+    )
+
+    model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
+        model, optimizer, verbosity
+    )
+
+    # Print details of neural network architecture
+    print_model(model)
+
+    hydragnn.utils.model.load_existing_model_config(
+        model, config["NeuralNetwork"]["Training"], optimizer=optimizer
+    )
+
+    hydragnn.train.train_validate_test(
+        model,
+        optimizer,
+        train_loader,
+        val_loader,
+        test_loader,
+        writer,
+        scheduler,
+        config["NeuralNetwork"],
+        log_name,
+        verbosity,
+        create_plots=False,
+        compute_grad_energy=config["NeuralNetwork"]["Architecture"].get(
+            "enable_interatomic_potential", False
+        ),
+        precision=precision,
+    )
+
+    hydragnn.utils.model.save_model(model, optimizer, log_name)
+    hydragnn.utils.profiling_and_tracing.print_timers(verbosity)
+    if writer is not None:
+        writer.close()
+
+    if tr.has("GPTLTracer"):
+        import gptl4py as gp
+
+        eligible = rank if args.everyone else 0
+        if rank == eligible:
+            gp.pr_file(os.path.join("logs", log_name, "gp_timing.p%d" % rank))
+        gp.pr_summary_file(os.path.join("logs", log_name, "gp_timing.summary"))
+        gp.finalize()
+
+    dist.destroy_process_group()
+    sys.exit(0)
 
     # ----------------------------------------------------------------------------------------------------

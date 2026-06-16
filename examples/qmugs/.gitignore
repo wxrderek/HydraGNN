@@ -1,5 +1,6 @@
 *.cube
 *.xyz
 *.png
+*.out
 
 /cube_files

@@ -32,6 +32,8 @@ MINIMAL_WFN_MATRIX_INFO = [
     'Db',
 ]
 
+BOHR_TO_ANGSTROM = 0.52917721092
+
 
 def _canon_CHEMBL_id(id: str):
     '''ensure the prefix CHEMBL is attached to the inputted CHEMBL_id'''
@@ -316,13 +318,18 @@ if __name__ == "__main__":
 
 
     mol_test = QMugsMolecule(
-        CHEMBL_id='1000', 
+        CHEMBL_id='1', 
         download_config=download_config,
         load_structures=True,
         load_conf_00_only=True,
     )
 
-    print(json.dumps(mol_test.props['conf_00']['structure'], indent=4))
+    geom_sdf = np.array(mol_test.props['conf_00']['structure']['geom'])
+    geom_psi4 = np.array(mol_test.psi4_molecule('00').geometry()) * BOHR_TO_ANGSTROM
+    max_diff = np.abs(geom_sdf - geom_psi4).max()
+    print(max_diff)
+
+    # print(json.dumps(mol_test.props['conf_00']['structure'], indent=4))
 
     # print(mol_test.props)
     # print(mol_test.smiles())

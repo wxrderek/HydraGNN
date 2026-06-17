@@ -133,5 +133,6 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
-    --perc_load=0.001 \
-    --perc_train=0.8
+    --perc_load=0.01 \
+    --perc_train=0.8 \
+    --modelname="QMugs001"

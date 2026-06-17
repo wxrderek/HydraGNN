@@ -6,9 +6,16 @@ import argparse
 import numpy as np
 import pandas as pd
 import scipy
+from tqdm import tqdm
 
 import re
 from rdkit import Chem
+
+try:
+    import psi4
+    psi4.core.be_quiet()
+except ImportError:
+    print('[WARNING] psi4 package not detected')
 
 
 MINIMAL_SUMMARY_INFO = [
@@ -34,6 +41,130 @@ MINIMAL_WFN_MATRIX_INFO = [
 
 BOHR_TO_ANGSTROM = 0.52917721092
 
+
+# ----------------------------------------------------------------------------------------------------
+# checking across all data
+
+def compile_molecule_dirs(download_config, outpath: str = None):
+    '''compile the dirs for wfn files and sdf files in one dictionary'''
+
+    # data download info
+    data_dir = download_config.get('data_dir', 'dataset')
+    wfns_dir = os.path.join(data_dir, download_config.get('wfns_subdir', 'wfns'))
+    tarball_assignment = pd.read_csv(os.path.join(data_dir, 'tarball_assignment.csv'))
+
+    # get dirs
+    molecule_dirs = {} 
+    for _, row in tarball_assignment.iterrows():
+        chembl_id = row['chembl_id']
+        wfn_dir = os.path.join(
+            wfns_dir,
+            row['archive_name'].split('.')[0],
+            chembl_id,
+        )
+        sdf_dir = os.path.join(
+            data_dir, 
+            'structures',
+            chembl_id,
+        )
+        
+        # check id match
+        wfn_chembl_id = os.path.basename(wfn_dir)
+        sdf_chembl_id = os.path.basename(sdf_dir)
+        if wfn_chembl_id != chembl_id or sdf_chembl_id != chembl_id:
+            raise ValueError(
+                f"chembl_id mismatch for {chembl_id}: "
+                f"wfn_dir ends with {wfn_chembl_id}, "
+                f"sdf_dir ends with {sdf_chembl_id}"
+            )
+        
+        molecule_dirs[chembl_id] = {
+            'wfn_dir': wfn_dir,
+            'sdf_dir': sdf_dir,
+        }
+
+    if outpath:
+        parent_dir = os.path.dirname(outpath)
+        os.makedirs(parent_dir, exist_ok=True)
+        with open(outpath, 'w', encoding='utf-8') as f:
+            json.dump(molecule_dirs, f, indent=4)
+    
+    return molecule_dirs
+
+
+
+def scan_density_matrices(download_config, scan_config, molecule_dirs = None):
+    '''scan density matrix info for all downloaded data'''
+
+    print('Scanning through density matrices...')
+
+    # data download info
+    data_dir = download_config.get('data_dir', 'dataset')
+    wfns_dir = os.path.join(data_dir, download_config.get('wfns_subdir', 'wfns'))
+    tarball_assignment = pd.read_csv(os.path.join(data_dir, 'tarball_assignment.csv'))
+
+    max_size = 0
+    info = {
+        'sizes': {}, # per molecule
+        'smallest_entry': {}, # per conformer
+        'frobenius_norms': {}, # per conformer
+        'conformer_diff_frobenius_norms': {}, # per molecule
+    }
+
+    # run through all wfn files
+    if molecule_dirs:
+        # NOT IMPLEMENTED
+        pass
+
+    else:
+        # get directories from tarball_assignment.csv
+        for _, row in tarball_assignment.iterrows():
+            chembl_id = row['chembl_id']
+            wfn_dir = os.path.join(
+                wfns_dir,
+                row['archive_name'].split('.')[0],
+                chembl_id,
+            )
+
+            # scan through sizes of conformer 00 only
+            if scan_config['sizes']:
+                conf_00_path = os.path.join(wfn_dir, 'wfn_conf_00.npy')
+                if not os.path.exists(conf_00_path):
+                    print(f'[WARNING] The path {conf_00_path} obtained from tarball_assignment.csv does not exist')
+                    continue
+
+                psi4_wfn = psi4.core.Wavefunction.from_file(conf_00_path)
+                Da = psi4_wfn.Da().np
+                size = Da.shape[0]
+                
+                info['sizes'][chembl_id] = size
+                if size > max_size:
+                    max_size = size
+                
+            # scan through all conformers of each wfn
+            if (scan_config['smallest_entry'] or scan_config['frobenius_norms'] or scan_config['conformer_diff_frobenius_norms']):
+                # walk through wfn files
+                for _, _, files in os.walk(wfn_dir):
+                    for filename in files:
+                        wfn_path = os.path.join(wfn_dir, filename)
+                        psi4_wfn = psi4.core.Wavefunction.from_file(wfn_path)
+
+                        Da = psi4_wfn.Da().np
+                        Db = psi4_wfn.Db().np
+                        D_tot = Da + Db
+
+                        # NOT FINISHED
+
+    info['max_size'] = max_size
+    return max_size, info
+
+
+
+def scan_molecular_geometries(download_config, scan_config, molecule_dirs = None):
+    pass
+
+
+# ----------------------------------------------------------------------------------------------------
 
 def _canon_CHEMBL_id(id: str):
     '''ensure the prefix CHEMBL is attached to the inputted CHEMBL_id'''
@@ -255,13 +386,16 @@ class QMugsMolecule():
 # ----------------------------------------------------------------------------------------------------
 # print file contents (early EDA)
 
-def inspect_wfn(path):
+def inspect_wfn(path, outpath: str = 'inspect_wfn.txt'):
     wfn = np.load(path, allow_pickle=True).tolist()
-    print(wfn)
+    with open(outpath, 'w', encoding='utf-8') as f:
+        print(wfn, file=f)
 
-def inspect_summary(path):
+
+def inspect_summary(path, output_file: str = 'inspect_summary.txt', n_head: int = 10):
     summary = pd.read_csv(path)
-    print(summary.head(10)) 
+    with open(output_file, 'w', encoding='utf-8') as f:
+        print(summary.head(n_head), file=f) 
 
 # ----------------------------------------------------------------------------------------------------
 # distance measures between density matrices
@@ -274,6 +408,7 @@ def frobenius(D1, D2, S1, S2, normalize=True):
     fro = np.sqrt(np.trace(D_delta @ D_delta))
 
     return float(np.real(fro))
+
 
 def fidelity(D1, D2, S1, S2, normalize=True):
     '''fidelity in a quantum information sense, note this is NOT symmetric with respect to swapping args'''
@@ -291,8 +426,16 @@ def fidelity(D1, D2, S1, S2, normalize=True):
 
 if __name__ == "__main__":
 
+    dirpwd = os.path.dirname(os.path.abspath(__file__))
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=dirpwd,
+        help="directory to output EDA results if applicable"
     )
     parser.add_argument(
         "--inspect_wfn",
@@ -306,28 +449,71 @@ if __name__ == "__main__":
         default=None,
         help="look at summary.csv"
     )
+    parser.add_argument(
+        "--get_densmat_info",
+        action="store_true",
+        help="extract size and other info of all density matrices in the downloaded dataset"
+    )
+    parser.add_argument(
+        "--get_molecular_geometry_info",
+        action="store_true",
+        help="extract box sizes in Angstrom and other info of all molecules in the dataset"
+    )
     args = parser.parse_args()
 
-    if args.inspect_wfn:
-        inspect_wfn(args.inspect_wfn)
-    if args.inspect_summary:
-        inspect_summary(args.inspect_summary)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ----------------------------------------------------------------------------------------------------
     
-    with open('utils/download_data.json', 'r') as f:
+    output_dir = args.output_dir if args.output_dir else dirpwd
+    with open(os.path.join(dirpwd, 'utils/download_data.json'), 'r') as f:
         download_config = json.load(f)
 
+    if args.inspect_wfn:
+        inspect_wfn(path=args.inspect_wfn, outpath=os.path.join(output_dir, 'inspect_wfn.txt'))
+    
+    if args.inspect_summary:
+        inspect_summary(path=args.inspect_summary, outpath=os.path.join(output_dir, 'inspect_summary.txt'), n_head=50)
+    
+    # ----------------------------------------------------------------------------------------------------
+    
+    densmat_scan_config = {
+        'sizes': True,
+        'smallest_entry': False,
+        'frobenius_norms': False,
+        'conformer_diff_frobenius_norms': False,
+    }
 
-    mol_test = QMugsMolecule(
-        CHEMBL_id='1', 
-        download_config=download_config,
-        load_structures=True,
-        load_conf_00_only=True,
-    )
+    if args.get_densmat_info:
+        max_matrix_size, matrix_info = scan_density_matrices(download_config=download_config, scan_config=densmat_scan_config)
+        print(f'Max density matrix size detected: {max_matrix_size} by {max_matrix_size}')
 
-    geom_sdf = np.array(mol_test.props['conf_00']['structure']['geom'])
-    geom_psi4 = np.array(mol_test.psi4_molecule('00').geometry()) * BOHR_TO_ANGSTROM
-    max_diff = np.abs(geom_sdf - geom_psi4).max()
-    print(max_diff)
+        # save scan results
+        eda_dir = os.path.join(output_dir, 'eda')
+        os.makedirs(eda_dir, exist_ok=True)
+        with open(os.path.join(eda_dir, 'densmat_eda.json'), 'w', encoding='utf-8') as f:
+            json.dump(matrix_info, f, indent=4)
+    
+    geo_scan_config = {}
+
+    if args.get_molecular_geometry_info:
+        max_box_size, geometry_info = scan_molecular_geometries(download_config=download_config, scan_config = geo_scan_config)
+        print(f'Max box sizes for molecular configurations: {max_box_size} by {max_box_size}')
+    
+    # ----------------------------------------------------------------------------------------------------
+
+
+    # mol_test = QMugsMolecule(
+    #     CHEMBL_id='1', 
+    #     download_config=download_config,
+    #     load_structures=True,
+    #     load_conf_00_only=True,
+    # )
+
+    # geom_sdf = np.array(mol_test.props['conf_00']['structure']['geom'])
+    # geom_psi4 = np.array(mol_test.psi4_molecule('00').geometry()) * BOHR_TO_ANGSTROM
+    # max_diff = np.abs(geom_sdf - geom_psi4).max()
+    # print(max_diff)
 
     # print(json.dumps(mol_test.props['conf_00']['structure'], indent=4))
 
@@ -335,8 +521,7 @@ if __name__ == "__main__":
     # print(mol_test.smiles())
     # mol_test.draw(outpath='mol_test.png')
 
-    import psi4
-    psi4.core.be_quiet()
+
     # wfn_test = mol_test.psi4_wfn('00')
     # wfn_test_1 = mol_test.psi4_wfn('01')
 
@@ -363,4 +548,3 @@ if __name__ == "__main__":
     # print(f'D0-D1 Frobenius: {np.linalg.norm(D_delta, ord='fro')}')
     # print(f'Frobenius normalized: {frobenius(D0, D1, S0, S1, normalize=True)}')
     # print(f'Fidelity measure: {fidelity(D0, D1, S0, S1, normalize=True)}')
-    

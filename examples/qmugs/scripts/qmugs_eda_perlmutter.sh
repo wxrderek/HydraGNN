@@ -3,11 +3,11 @@
 #SBATCH -J HydraGNN-QMugs-Train
 #SBATCH -o job-%j.out
 #SBATCH -e job-%j.out
-#SBATCH -t 15:00:00
+#SBATCH -t 10:00:00
 #SBATCH -C cpu
 #SBATCH -q regular
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
 #SBATCH -c 32
 
 function cmd() {
@@ -104,13 +104,5 @@ fi
 
 cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
     --export=ALL \
-    python -u "$EXAMPLE_DIR/qmugs.py" \
-    --log=qmugs-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION-TP$TASK_PARALLEL --everyone \
-    --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
-    --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
-    --precision=fp32 \
-    --pickle \
-    --perc_load=0.01 \
-    --perc_train=0.8 \
-    --preonly \
-    --modelname="QMugs001"
+    python -u "$EXAMPLE_DIR/eda.py" \
+    --get_densmat_info

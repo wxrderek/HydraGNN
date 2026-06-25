@@ -744,7 +744,8 @@ class Base(Module):
         # if no dataset_name, set it to be 0
         if not hasattr(data, "dataset_name"):
             setattr(data, "dataset_name", data.batch.unique() * 0)
-        datasetIDs = data.dataset_name.unique()
+        # datasetIDs = data.dataset_name.unique()
+        datasetIDs = list(set(data.dataset_name))
         unique, node_counts = torch.unique_consecutive(data.batch, return_counts=True)
         for head_dim, headloc, type_head in zip(
             self.head_dims, self.heads_NN, self.head_type
@@ -876,7 +877,7 @@ class Base(Module):
 
         return nll_loss, tasks_mseloss, []
 
-    def loss_hpweighted(self, pred, value, head_index, var=None):
+    def loss_hpweighted(self, pred, value, head_index, mask=None, var=None):
         # weights for different tasks as hyper-parameters
         tot_loss = 0
         tasks_loss = []
@@ -887,14 +888,33 @@ class Base(Module):
             value_shape = head_val.shape
             if pred_shape != value_shape:
                 head_val = torch.reshape(head_val, pred_shape)
+
             if var is None:
                 assert (
                     self.loss_function_type != "GaussianNLLLoss"
                 ), "Expecting var for GaussianNLLLoss, but got None"
-                tot_loss += (
-                    self.loss_function(head_pre, head_val) * self.loss_weights[ihead]
-                )
-                tasks_loss.append(self.loss_function(head_pre, head_val))
+
+                # mask
+                if mask is not None:
+                    head_mask = mask[head_index[ihead]]
+                    mask_shape = head_mask.shape
+                    if pred_shape != mask_shape:
+                        head_mask = torch.reshape(head_mask, pred_shape).bool()
+                    
+                    head_loss = self.loss_function(
+                        head_pre[head_mask],
+                        head_val[head_mask],
+                    )
+
+                    tot_loss += head_loss * self.loss_weights[ihead]
+                    tasks_loss.append(head_loss)
+                
+                else: 
+                    tot_loss += (
+                        self.loss_function(head_pre, head_val) * self.loss_weights[ihead]
+                    )
+                    tasks_loss.append(self.loss_function(head_pre, head_val))
+                
             else:
                 head_var = var[ihead]
                 tot_loss += (

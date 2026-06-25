@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -A m4828
-#SBATCH -J HydraGNN-QMugs-Train
-#SBATCH -o job-%j.out
-#SBATCH -e job-%j.out
-#SBATCH -t 15:00:00
+#SBATCH -J QMugs-DataLoad
+#SBATCH -o dataload-job-%j.out
+#SBATCH -e dataload-job-%j.out
+#SBATCH -t 16:00:00
 #SBATCH -C cpu
 #SBATCH -q regular
 #SBATCH --nodes=1
@@ -93,7 +93,7 @@ export HYDRAGNN_MASTER_ADDR=$MASTER_ADDR
 export HYDRAGNN_MASTER_PORT=$MASTER_PORT
 
 # FSDP knobs (for multi-dataset, set HYDRAGNN_USE_FSDP=0)
-export HYDRAGNN_USE_FSDP=1
+export HYDRAGNN_USE_FSDP=0
 export HYDRAGNN_FSDP_VERSION=2
 export HYDRAGNN_FSDP_STRATEGY=SHARD_GRAD_OP
 
@@ -102,7 +102,7 @@ if [ "$TASK_PARALLEL" = "1" ]; then
     TASK_PARALLEL_ARG="--task_parallel"
 fi
 
-cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
+cmd srun -N$SLURM_JOB_NUM_NODES -n1 -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/qmugs.py" \
     --log=qmugs-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION-TP$TASK_PARALLEL --everyone \
@@ -110,7 +110,7 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
-    --perc_load=0.01 \
+    --perc_load=0.1 \
     --perc_train=0.8 \
     --preonly \
-    --modelname="QMugs001"
+    --modelname="QMugs01"

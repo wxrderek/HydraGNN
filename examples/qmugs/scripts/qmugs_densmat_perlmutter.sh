@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH -A m4828
-#SBATCH -J HydraGNN-QMugs-Train
-#SBATCH -o job-%j.out
-#SBATCH -e job-%j.out
-#SBATCH -t 06:00:00
+#SBATCH -A m5216
+#SBATCH -J QMugs-Train
+#SBATCH -o train-job-%j.out
+#SBATCH -e train-job-%j.out
+#SBATCH -t 16:00:00
 #SBATCH -C gpu
-#SBATCH -q regular
-#SBATCH -N 1
+#SBATCH -q debug
+#SBATCH -N 2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH -c 32
@@ -18,13 +18,16 @@ function cmd() {
 
 # --- Paths (override with environment variables if needed) ---
 HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/.conda/envs/.venv}
+VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
 EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
 
 # --- Perlmutter module + conda setup ---
-module reset
+# module reset
 ml nersc-default/1.0 || true
 ml conda/Miniforge3-24.11.3-0 || ml conda/Miniforge3-24.7.1-0
+
+source "$HYDRAGNN_ROOT/installation_DOE_supercomputers/module_loads_perlmutter.sh"
+load_perlmutter_modules 12.9
 
 if ! command -v conda >/dev/null 2>&1; then
     echo "ERROR: conda command not found."
@@ -44,6 +47,7 @@ if [ ! -d "$VENV_PATH" ]; then
     exit 1
 fi
 
+echo "Virtual environment path: $VENV_PATH"
 conda activate "$VENV_PATH"
 
 cd "$HYDRAGNN_ROOT" || exit 1
@@ -56,6 +60,8 @@ echo "===== Check ====="
 which python
 python -c "import adios2; print(adios2.__version__, adios2.__file__)"
 python -c "import torch; print(torch.__version__, torch.__file__)"
+python -c "import psi4; print(psi4.__version__)"
+python -c "import hydragnn"
 
 echo "===== LD_LIBRARY_PATH ====="
 echo "$LD_LIBRARY_PATH" | tr ':' '\n'
@@ -77,7 +83,7 @@ export HYDRAGNN_MAX_NUM_BATCH=1000
 export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
 export BATCH_SIZE=32
-export NUM_EPOCH=5
+export NUM_EPOCH=300
 
 export HYDRAGNN_DDSTORE_METHOD=1
 export HYDRAGNN_CUSTOM_DATALOADER=1
@@ -116,9 +122,9 @@ export HYDRAGNN_MASTER_ADDR=$MASTER_ADDR
 export HYDRAGNN_MASTER_PORT=$MASTER_PORT
 
 # FSDP knobs (for multi-dataset, set HYDRAGNN_USE_FSDP=0)
-export HYDRAGNN_USE_FSDP=1
+export HYDRAGNN_USE_FSDP=0
 export HYDRAGNN_FSDP_VERSION=2
-export HYDRAGNN_FSDP_STRATEGY=SHARD_GRAD_OP
+export HYDRAGNN_FSDP_STRATEGY=FULL_SHARD
 
 TASK_PARALLEL_ARG=""
 if [ "$TASK_PARALLEL" = "1" ]; then
@@ -135,4 +141,4 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     --pickle \
     --perc_load=0.01 \
     --perc_train=0.8 \
-    --modelname="QMugs001"
+    --modelname="QMugs001_new"

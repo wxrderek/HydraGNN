@@ -11,3 +11,5 @@ installation_DOE_supercomputers/HydraGNN-Installation-Frontier*/
 .venv/
 .psi4-env/
 *.dat
+
+HydraGNN-Installation-Perlmutter/

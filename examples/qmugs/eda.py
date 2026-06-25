@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import scipy
 from tqdm import tqdm
+from mpi4py import MPI
 
 import re
 from rdkit import Chem
@@ -16,6 +17,9 @@ try:
     psi4.core.be_quiet()
 except ImportError:
     print('[WARNING] psi4 package not detected')
+
+NUM_MOLECULES = 665911
+NUM_CONFORMERS = 1992984
 
 
 MINIMAL_SUMMARY_INFO = [
@@ -93,18 +97,24 @@ def compile_molecule_dirs(download_config, outpath: str = None):
 
 
 
-def scan_density_matrices(download_config, scan_config, molecule_dirs = None):
+def scan_density_matrices(download_config, scan_config, molecule_dirs = None, miniters = 1000):
     '''scan density matrix info for all downloaded data'''
 
-    print('Scanning through density matrices...')
+    psi4.set_num_threads(1)
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    comm_size = comm.Get_size()
+
+    if rank == 0: 
+        print('Scanning through density matrices...')
 
     # data download info
     data_dir = download_config.get('data_dir', 'dataset')
     wfns_dir = os.path.join(data_dir, download_config.get('wfns_subdir', 'wfns'))
     tarball_assignment = pd.read_csv(os.path.join(data_dir, 'tarball_assignment.csv'))
 
-    max_size = 0
-    info = {
+    local_max_size = 0
+    local_info = {
         'sizes': {}, # per molecule
         'smallest_entry': {}, # per conformer
         'frobenius_norms': {}, # per conformer
@@ -114,36 +124,48 @@ def scan_density_matrices(download_config, scan_config, molecule_dirs = None):
     # run through all wfn files
     if molecule_dirs:
         # NOT IMPLEMENTED
-        pass
+        raise NotImplementedError
 
     else:
         # get directories from tarball_assignment.csv
-        for _, row in tarball_assignment.iterrows():
+        for idx, (_, row) in enumerate(tarball_assignment.iterrows()):
+
+            # simple round-robin assignment
+            if idx % comm_size != rank:
+                continue
+
             chembl_id = row['chembl_id']
+
             wfn_dir = os.path.join(
                 wfns_dir,
                 row['archive_name'].split('.')[0],
                 chembl_id,
             )
 
-            # scan through sizes of conformer 00 only
+            # warn if wfn dir does not exist
+            if not os.path.exists(wfn_dir):
+                print(f'[WARNING] The directory {wfn_dir} obtained from tarball_assignment.csv does not exist')
+                continue
+
+            # per molecule
             if scan_config['sizes']:
                 conf_00_path = os.path.join(wfn_dir, 'wfn_conf_00.npy')
-                if not os.path.exists(conf_00_path):
-                    print(f'[WARNING] The path {conf_00_path} obtained from tarball_assignment.csv does not exist')
-                    continue
 
-                psi4_wfn = psi4.core.Wavefunction.from_file(conf_00_path)
-                Da = psi4_wfn.Da().np
-                size = Da.shape[0]
-                
-                info['sizes'][chembl_id] = size
-                if size > max_size:
-                    max_size = size
-                
-            # scan through all conformers of each wfn
-            if (scan_config['smallest_entry'] or scan_config['frobenius_norms'] or scan_config['conformer_diff_frobenius_norms']):
-                # walk through wfn files
+                if os.path.exists(conf_00_path):
+                    psi4_wfn = psi4.core.Wavefunction.from_file(conf_00_path)
+
+                    Da = psi4_wfn.Da().np
+                    size = Da.shape[0]
+
+                    local_info['sizes'][chembl_id] = size
+                    local_max_size = max(local_max_size, size)
+
+            # per conformer
+            if (
+                scan_config['smallest_entry']
+                or scan_config['frobenius_norms']
+                or scan_config['conformer_diff_frobenius_norms']
+            ):
                 for _, _, files in os.walk(wfn_dir):
                     for filename in files:
                         wfn_path = os.path.join(wfn_dir, filename)
@@ -155,13 +177,138 @@ def scan_density_matrices(download_config, scan_config, molecule_dirs = None):
 
                         # NOT FINISHED
 
+
+    gathered_max_sizes = comm.gather(local_max_size, root=0)
+    gathered_infos = comm.gather(local_info, root=0)
+
+    if rank != 0:
+        return None, None
+
+    max_size = max(gathered_max_sizes)
+
+    info = {
+        'sizes': {},
+        'smallest_entry': {},
+        'frobenius_norms': {},
+        'conformer_diff_frobenius_norms': {},
+    }
+
+    for proc_info in gathered_infos:
+
+        info['sizes'].update(
+            proc_info['sizes']
+        )
+
+        info['smallest_entry'].update(
+            proc_info['smallest_entry']
+        )
+
+        info['frobenius_norms'].update(
+            proc_info['frobenius_norms']
+        )
+
+        info['conformer_diff_frobenius_norms'].update(
+            proc_info['conformer_diff_frobenius_norms']
+        )
+
     info['max_size'] = max_size
     return max_size, info
 
+    #     with tqdm(total=NUM_MOLECULES, desc='Scanning molecules for EDA', miniters=miniters) as pbar:
+    #         for _, row in tarball_assignment.iterrows():
+    #             chembl_id = row['chembl_id']
+    #             wfn_dir = os.path.join(
+    #                 wfns_dir,
+    #                 row['archive_name'].split('.')[0],
+    #                 chembl_id,
+    #             )
+
+    #             # warn if wfn dir does not exist
+    #             if not os.path.exists(wfn_dir):
+    #                 print(f'[WARNING] The directory {wfn_dir} obtained from tarball_assignment.csv does not exist')
+    #                 continue
+
+    #             # scan through sizes of conformer 00 only
+    #             if scan_config['sizes']:
+    #                 conf_00_path = os.path.join(wfn_dir, 'wfn_conf_00.npy')
+    #                 if not os.path.exists(conf_00_path):
+    #                     print(f'[WARNING] The path {conf_00_path} obtained from tarball_assignment.csv does not exist')
+    #                     continue
+
+    #                 psi4_wfn = psi4.core.Wavefunction.from_file(conf_00_path)
+    #                 Da = psi4_wfn.Da().np
+    #                 size = Da.shape[0]
+                    
+    #                 info['sizes'][chembl_id] = size
+    #                 if size > max_size:
+    #                     max_size = size
+                    
+    #             # scan through all conformers of each wfn
+    #             if (scan_config['smallest_entry'] or scan_config['frobenius_norms'] or scan_config['conformer_diff_frobenius_norms']):
+    #                 # walk through wfn files
+    #                 for _, _, files in os.walk(wfn_dir):
+    #                     for filename in files:
+    #                         wfn_path = os.path.join(wfn_dir, filename)
+    #                         psi4_wfn = psi4.core.Wavefunction.from_file(wfn_path)
+
+    #                         Da = psi4_wfn.Da().np
+    #                         Db = psi4_wfn.Db().np
+    #                         D_tot = Da + Db
+
+    #                         # NOT FINISHED
+
+    # info['max_size'] = max_size
+    # return max_size, info
 
 
-def scan_molecular_geometries(download_config, scan_config, molecule_dirs = None):
-    pass
+
+def scan_molecular_geometries(download_config, scan_config, molecule_dirs = None, miniters = 1000):
+    '''scan sdf structure files for all downloaded data'''
+    
+    print('Scanning through molecule structures (sdfs)...')
+
+    # data download info
+    data_dir = download_config.get('data_dir', 'dataset')
+    tarball_assignment = pd.read_csv(os.path.join(data_dir, 'tarball_assignment.csv'))
+
+    max_box_size = 0
+    info = {
+        'box_sizes': {}, # per conformer, in Angstrom
+        'max_avg_conformer_diff': {}, # per molecule, in Angstrom, max avg difference between coords in pairs of conformers
+    }
+
+    # run through all sdf files
+    if molecule_dirs:
+        # NOT IMPLEMENTED
+        pass
+
+    else:
+        # get directories from tarball_assignment.csv
+        for _, row in tarball_assignment.iterrows():
+            chembl_id = row['chembl_id']
+            sdf_dir = os.path.join(
+                data_dir,
+                'structures',
+                chembl_id,
+            )
+
+            # warn if sdf dir does not exist
+            if not os.path.exists(sdf_dir):
+                print(f'[WARNING] The directory {sdf_dir} obtained from tarball_assignment.csv does not exist')
+                continue
+                
+            # scan through all conformers of each molecule
+            if (scan_config['box_sizes'] or scan_config['max_avg_conformer_diff']):
+                # walk through sdf files
+                for _, _, files in os.walk(sdf_dir):
+                    for filename in files:
+                        sdf_path = os.path.join(sdf_dir, filename)
+                        sdf_mol = Chem.SDMolSupplier(sdf_path, removeHs=False)[0]
+
+                        # NOT FINISHED
+
+    info['max_box_size'] = max_box_size
+    return max_box_size, info
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -459,6 +606,12 @@ if __name__ == "__main__":
         action="store_true",
         help="extract box sizes in Angstrom and other info of all molecules in the dataset"
     )
+    parser.add_argument(
+        "--miniters",
+        type=int,
+        default=1000,
+        help="miniters argument on tdqm for scanning"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -485,7 +638,7 @@ if __name__ == "__main__":
     }
 
     if args.get_densmat_info:
-        max_matrix_size, matrix_info = scan_density_matrices(download_config=download_config, scan_config=densmat_scan_config)
+        max_matrix_size, matrix_info = scan_density_matrices(download_config=download_config, scan_config=densmat_scan_config, miniters=args.miniters)
         print(f'Max density matrix size detected: {max_matrix_size} by {max_matrix_size}')
 
         # save scan results
@@ -494,10 +647,13 @@ if __name__ == "__main__":
         with open(os.path.join(eda_dir, 'densmat_eda.json'), 'w', encoding='utf-8') as f:
             json.dump(matrix_info, f, indent=4)
     
-    geo_scan_config = {}
+    geo_scan_config = {
+        'box_sizes': True,
+        'max_avg_conformer_diff': False,
+    }
 
     if args.get_molecular_geometry_info:
-        max_box_size, geometry_info = scan_molecular_geometries(download_config=download_config, scan_config = geo_scan_config)
+        max_box_size, geometry_info = scan_molecular_geometries(download_config=download_config, scan_config=geo_scan_config, miniters=args.miniters)
         print(f'Max box sizes for molecular configurations: {max_box_size} by {max_box_size}')
     
     # ----------------------------------------------------------------------------------------------------

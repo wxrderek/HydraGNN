@@ -3,14 +3,20 @@
 ## Dev Reminders for Perlmutter
 Before doing anything, make sure the correct modules are loaded on the machine. From the HydraGNN root directory, run
 ```
-cd installation_DOE_supercomputers
-source module_loads_perlmutter.sh
-load_perlmutter_modules "12.4"
+source installation_DOE_supercomputers/module_loads_perlmutter.sh
+load_perlmutter_modules "12.9"
+module -t list | sort
 ```
 
-Then install `rdkit` with `conda install rdkit==2026.3.2`.
+Set up the `conda` environment by running
+```
+bash installation_DOE_supercomputers/hydragnn_installation_bash_script_perlmutter.sh
+conda activate .../hydragnn_venv/
+python -m pip install -e . --no-deps
+```
+Note the `--no-deps` flag avoids reinstalling possibly incompatible versions of torch family modules after compatible ones have been installed by the installation script. 
 
-The `psi4` package only supports downloading via `conda`. With a `conda` environment activated and all other HydraGNN dependencies installed, run:
+The `psi4` package only supports downloading via `conda`. With the `conda` environment activated and all other HydraGNN dependencies installed, run:
 ```
 conda install psi4 python=3.11 -c conda-forge
 ```

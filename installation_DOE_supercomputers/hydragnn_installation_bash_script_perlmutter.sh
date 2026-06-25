@@ -25,6 +25,11 @@
 
 set -Eeuo pipefail
 
+PYTHON_VERSION=3.11
+EXPECTED_CUDA_MM=12.9
+TORCH_CUDA_TAG=cu129
+INSTALL_PSI4=1
+
 # =========================
 # Pretty printing helpers
 # =========================
@@ -151,6 +156,7 @@ assert_numpy_1264
 # ============================================================
 banner "Install Core Python Packages"
 
+pip_retry click==8.0.0
 pip_retry ninja
 pip_retry cmake
 pip_retry astunparse
@@ -166,9 +172,11 @@ pip_retry sympy==1.14.0
 pip_retry filelock
 pip_retry networkx
 pip_retry jinja2
-pip_retry tqdm==4.67.1
+pip_retry tqdm==4.67.3
 pip_retry types-dataclasses
 pip_retry scipy==1.14.1
+pip_retry matscipy
+pip_retry matplotlib==3.10.6
 pip_retry pyparsing
 pip_retry build
 pip_retry Cython
@@ -176,7 +184,7 @@ pip_retry tensorboard==2.20.0
 pip_retry scikit-learn==1.5.1
 pip_retry pytest
 pip_retry ase==3.26.0
-pip_retry rdkit
+pip_retry rdkit==2026.3.2
 pip_retry jarvis-tools
 pip_retry pymatgen
 pip_retry igraph
@@ -197,7 +205,7 @@ TORCH_CUDA_TAG="${TORCH_CUDA_TAG:-cu129}"
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
 
 subbanner "Install PyTorch from ${PYTORCH_INDEX_URL}"
-pip_retry --index-url "${PYTORCH_INDEX_URL}" torch torchvision
+pip_retry --index-url "${PYTORCH_INDEX_URL}" torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 assert_numpy_1264
 
 python - <<'PY'
@@ -208,6 +216,9 @@ print("cuda available =", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("gpu name =", torch.cuda.get_device_name(0))
 PY
+
+subbanner "Install extra torch-adjacent packages without touching torch"
+pip_retry torch-ema==0.3 torchmetrics==1.4.0 --no-deps
 
 # ============================================================
 # PyTorch-Geometric stack (SOURCE BUILDS to avoid GLIBC mismatch)
@@ -231,10 +242,10 @@ subbanner "Build/install PyG compiled deps from source (no wheels)"
 # Note: torch-scatter built for you already; torch-sparse previously failed due to old GCC.
 # With gcc-native/13.2 + CC/CXX forced, torch-sparse should compile.
 
-pip_retry --no-binary :all: --no-build-isolation torch-scatter
-pip_retry --no-binary :all: --no-build-isolation torch-sparse
-pip_retry --no-binary :all: --no-build-isolation torch-cluster
-pip_retry --no-binary :all: --no-build-isolation torch-spline-conv
+pip_retry --no-cache-dir --no-binary=:all: --no-build-isolation torch-scatter==2.1.2
+pip_retry --no-cache-dir --no-binary=:all: --no-build-isolation torch-sparse==0.6.18
+pip_retry --no-cache-dir --no-binary=:all: --no-build-isolation torch-cluster==1.6.3
+pip_retry --no-cache-dir --no-binary=:all: --no-build-isolation torch-spline-conv==1.2.2
 
 # pyg-lib is optional; many HydraGNN workloads run without it.
 BUILD_PYG_LIB="${BUILD_PYG_LIB:-0}"
@@ -246,20 +257,37 @@ else
 fi
 
 subbanner "Install torch-geometric (pure python wrapper package)"
-pip_retry torch-geometric
+pip_retry torch-geometric==2.6.1
 assert_numpy_1264
 
 subbanner "Install e3nn and openequivariance"
 pip_retry e3nn openequivariance --verbose
 assert_numpy_1264
 
+subbanner "Recheck PyTorch"
+python - <<'PY'
+import torch
+print("torch.__version__ =", torch.__version__)
+print("torch.version.cuda =", torch.version.cuda)
+print("cuda available =", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu name =", torch.cuda.get_device_name(0))
+PY
+
 subbanner "PyG import sanity check"
+
+python - <<'PY'
+import torch_geometric
+print("pyg:", torch_geometric.__version__)
+PY
+
 python - <<'PY'
 import torch
 import torch_geometric
-print("torch:", torch.__version__)
-print("pyg:", torch_geometric.__version__)
+print("torch and torch_geometric simultaneous import success", torch.__version__, torch_geometric.__version__)
+PY
 
+python - <<'PY'
 mods = ["pyg_lib", "torch_sparse", "torch_scatter", "torch_cluster", "torch_spline_conv"]
 for m in mods:
     try:
@@ -284,6 +312,12 @@ pushd mpi4py >/dev/null
 rm -rf build
 CC=cc MPICC=cc pip_retry . --verbose
 popd >/dev/null
+
+python - <<'PY'
+import mpi4py
+import os
+print(mpi4py.__file__)
+PY
 
 # ============================================================
 # ADIOS2
@@ -371,6 +405,25 @@ git clone https://github.com/jychoi-hpc/gptl4py.git || true
 pushd gptl4py >/dev/null
 GPTL_DIR=$VENV_PATH CC=cc CXX=CC pip_retry . --no-build-isolation --verbose
 popd >/dev/null
+
+# ============================================================
+# Psi4
+# ============================================================
+INSTALL_PSI4="${INSTALL_PSI4:-0}"
+if [[ "$INSTALL_PSI4" -eq 1 ]]; then
+  banner "Psi4 (optional)"
+  conda install psi4 python=3.11 -c conda-forge
+fi
+
+subbanner "Recheck PyTorch"
+python - <<'PY'
+import torch
+print("torch.__version__ =", torch.__version__)
+print("torch.version.cuda =", torch.version.cuda)
+print("cuda available =", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu name =", torch.cuda.get_device_name(0))
+PY
 
 # ============================================================
 # Final Summary

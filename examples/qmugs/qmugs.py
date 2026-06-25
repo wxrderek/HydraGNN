@@ -135,7 +135,7 @@ class QMugsDataset(AbstractBaseDataset):
     '''QMugs dataset class'''
 
     # pad density matrix to ensure dimension of output is invariant across moledules
-    max_padded_density_matrix_dimension = 2500
+    max_padded_density_matrix_dimension = 2002
 
     def __init__(
         self,
@@ -222,6 +222,16 @@ class QMugsDataset(AbstractBaseDataset):
         return padded
 
 
+    def _get_density_matrix_mask(
+        self, 
+        wfn: psi4.core.Wavefunction,
+        mask_method: str = "unif_atoms",
+        **kwargs,
+    ):
+        '''outputs binary mask for density matrix'''
+        return
+
+
     def _preprocess_scalar_density(
         self, 
         wfn: psi4.core.Wavefunction, 
@@ -247,13 +257,6 @@ class QMugsDataset(AbstractBaseDataset):
             raise ValueError(F'Unrecognized density type input: {spin}')
         
         # FINISH
-
-
-    
-
-    def _postprocess_scalar_density(self, coeffs, grid_size: int):
-        '''for each conformer Data object, map predicted basis coeffs -> scalar density'''
-        pass
 
     # ----------------------------------------------------------------------------------------------------
     # dataset prep
@@ -330,10 +333,16 @@ class QMugsDataset(AbstractBaseDataset):
         # ----------------------------------------------------------------------------------------------------
         # declare data object
 
+        density_mask = self._get_density_matrix_mask(
+            wfn=psi4_wfn,
+            mask_method="unif_atoms",
+            perc_atoms_masked = 0.2,
+        )
+
         x = torch.cat([atomic_numbers, pos], dim=1) # atomic numbers + geometry only
 
         data_object = Data(
-            dataset_name='qmugs',
+            dataset_name="qmugs",
             natoms=natoms,
             pos=pos,
             cell=cell, # not needed
@@ -346,11 +355,11 @@ class QMugsDataset(AbstractBaseDataset):
             x=x,
             density_matrix=D_tot,
             # auxiliary inputs
-            density_matrix_dim=density_matrix_dim,
             chembl_id=chembl_id,
             graph_attr=graph_attr,
         )
         data_object.y = data_object.density_matrix
+        data_object.y_mask = density_mask
 
         data_object = self.radius_graph(data_object)
         data_object = transform_coordinates(data_object)
@@ -521,10 +530,11 @@ if __name__ == "__main__":
         
     dataset_dir = download_config.get('data_dir', './dataset')    
     verbosity = config["Verbosity"]["level"]
+    padding_dim = int((QMugsDataset.max_padded_density_matrix_dimension)**2)
     
     # set up features
     graph_feature_names = ['density_matrix']
-    graph_feature_dims = [4000000]
+    graph_feature_dims = [padding_dim]
     node_feature_names = ['atomic_number', 'cartesian_coordinates']
     node_feature_dims = [1, 3]
     
@@ -534,6 +544,9 @@ if __name__ == "__main__":
     var_config["graph_feature_dims"] = graph_feature_dims
     var_config["node_feature_names"] = node_feature_names
     var_config["node_feature_dims"] = node_feature_dims
+
+    # ensure consistent padded matrix dimensions
+    assert (var_config["output_dim"][0] == padding_dim)
 
     # reset batch size and epochs if specified
     if args.batch_size is not None:

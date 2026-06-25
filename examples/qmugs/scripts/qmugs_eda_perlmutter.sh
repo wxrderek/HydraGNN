@@ -3,11 +3,11 @@
 #SBATCH -J HydraGNN-QMugs-Train
 #SBATCH -o job-%j.out
 #SBATCH -e job-%j.out
-#SBATCH -t 10:00:00
+#SBATCH -t 24:00:00
 #SBATCH -C cpu
 #SBATCH -q regular
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=4
 #SBATCH -c 32
 
 function cmd() {
@@ -65,7 +65,8 @@ export MPICH_VERSION_DISPLAY=0
 export MPICH_GPU_SUPPORT_ENABLED=1
 export PYTHONNOUSERSITE=1
 
-export OMP_NUM_THREADS=8
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 export HYDRAGNN_NUM_WORKERS=1
 export HYDRAGNN_USE_VARIABLE_GRAPH_SIZE=1
 export HYDRAGNN_AGGR_BACKEND=mpi
@@ -105,4 +106,5 @@ fi
 cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/eda.py" \
-    --get_densmat_info
+    --get_densmat_info \
+    --miniters=1000

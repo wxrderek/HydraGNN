@@ -3,7 +3,7 @@
 #SBATCH -J QMugs-DataLoad
 #SBATCH -o dataload-job-%j.out
 #SBATCH -e dataload-job-%j.out
-#SBATCH -t 16:00:00
+#SBATCH -t 04:00:00
 #SBATCH -C cpu
 #SBATCH -q regular
 #SBATCH --nodes=1
@@ -17,13 +17,16 @@ function cmd() {
 
 # --- Paths (override with environment variables if needed) ---
 HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/.conda/envs/.venv}
+VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
 EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
 
 # --- Perlmutter module + conda setup ---
-module reset
+# module reset
 ml nersc-default/1.0 || true
 ml conda/Miniforge3-24.11.3-0 || ml conda/Miniforge3-24.7.1-0
+
+source "$HYDRAGNN_ROOT/installation_DOE_supercomputers/module_loads_perlmutter.sh"
+load_perlmutter_modules 12.9
 
 if ! command -v conda >/dev/null 2>&1; then
     echo "ERROR: conda command not found."
@@ -102,15 +105,15 @@ if [ "$TASK_PARALLEL" = "1" ]; then
     TASK_PARALLEL_ARG="--task_parallel"
 fi
 
-cmd srun -N$SLURM_JOB_NUM_NODES -n1 -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
+cmd srun -N$SLURM_JOB_NUM_NODES -n1 -c32 --ntasks-per-node=1 -l --kill-on-bad-exit=1 \
     --export=ALL \
-    python -u "$EXAMPLE_DIR/qmugs.py" \
+    python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
     --log=qmugs-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION-TP$TASK_PARALLEL --everyone \
     --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
-    --perc_load=0.1 \
+    --perc_load=0.01 \
     --perc_train=0.8 \
     --preonly \
-    --modelname="QMugs01"
+    --modelname="QMugs001"

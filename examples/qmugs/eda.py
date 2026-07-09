@@ -18,6 +18,8 @@ try:
 except ImportError:
     print('[WARNING] psi4 package not detected')
 
+from utils import frobenius_dist, fidelity
+
 NUM_MOLECULES = 665911
 NUM_CONFORMERS = 1992984
 
@@ -214,53 +216,6 @@ def scan_density_matrices(download_config, scan_config, molecule_dirs = None, mi
     info['max_size'] = max_size
     return max_size, info
 
-    #     with tqdm(total=NUM_MOLECULES, desc='Scanning molecules for EDA', miniters=miniters) as pbar:
-    #         for _, row in tarball_assignment.iterrows():
-    #             chembl_id = row['chembl_id']
-    #             wfn_dir = os.path.join(
-    #                 wfns_dir,
-    #                 row['archive_name'].split('.')[0],
-    #                 chembl_id,
-    #             )
-
-    #             # warn if wfn dir does not exist
-    #             if not os.path.exists(wfn_dir):
-    #                 print(f'[WARNING] The directory {wfn_dir} obtained from tarball_assignment.csv does not exist')
-    #                 continue
-
-    #             # scan through sizes of conformer 00 only
-    #             if scan_config['sizes']:
-    #                 conf_00_path = os.path.join(wfn_dir, 'wfn_conf_00.npy')
-    #                 if not os.path.exists(conf_00_path):
-    #                     print(f'[WARNING] The path {conf_00_path} obtained from tarball_assignment.csv does not exist')
-    #                     continue
-
-    #                 psi4_wfn = psi4.core.Wavefunction.from_file(conf_00_path)
-    #                 Da = psi4_wfn.Da().np
-    #                 size = Da.shape[0]
-                    
-    #                 info['sizes'][chembl_id] = size
-    #                 if size > max_size:
-    #                     max_size = size
-                    
-    #             # scan through all conformers of each wfn
-    #             if (scan_config['smallest_entry'] or scan_config['frobenius_norms'] or scan_config['conformer_diff_frobenius_norms']):
-    #                 # walk through wfn files
-    #                 for _, _, files in os.walk(wfn_dir):
-    #                     for filename in files:
-    #                         wfn_path = os.path.join(wfn_dir, filename)
-    #                         psi4_wfn = psi4.core.Wavefunction.from_file(wfn_path)
-
-    #                         Da = psi4_wfn.Da().np
-    #                         Db = psi4_wfn.Db().np
-    #                         D_tot = Da + Db
-
-    #                         # NOT FINISHED
-
-    # info['max_size'] = max_size
-    # return max_size, info
-
-
 
 def scan_molecular_geometries(download_config, scan_config, molecule_dirs = None, miniters = 1000):
     '''scan sdf structure files for all downloaded data'''
@@ -310,6 +265,54 @@ def scan_molecular_geometries(download_config, scan_config, molecule_dirs = None
     info['max_box_size'] = max_box_size
     return max_box_size, info
 
+
+def plot_density_matrix_size_histogram(eda_json_path, output_dir=None):
+    '''plot histogram of dimensions of all density matrices in dataset, AFTER running scan_density_matrices with sizes enabled'''
+    import matplotlib.pyplot as plt
+    try:
+        with open(eda_json_path, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f'File not found: {eda_json_path}')
+        return
+
+    # dimensions
+    sizes = list(data["sizes"].values())
+    bins = range(0, 2002, 50)
+    plt.figure(figsize=(8, 5))
+    plt.hist(sizes, bins=bins)
+    plt.xlabel("Density Matrix Dimension")
+    plt.ylabel("Count")
+    plt.title("Distribution of Density Matrix Dimensions")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if output_dir:
+        output_path = os.path.join(output_dir, 'sizes.png')
+        plt.savefig(output_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Histogram of dimensions ssaved to {output_path}")
+    else:
+        plt.show()
+    
+    # num entries
+    num_entries = np.array(sizes)**2
+    bins = range(0, 4008004, 50000)
+    plt.figure(figsize=(8, 5))
+    plt.hist(num_entries, bins=bins)
+    plt.xlabel("Density Matrix Number of Entries")
+    plt.ylabel("Count")
+    plt.title("Distribution of Density Matrix Number of Entries")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if output_dir:
+        output_path_entries = os.path.join(output_dir, 'entries.png')
+        plt.savefig(output_path_entries, dpi=300, bbox_inches="tight")
+        print(f"Histogram of entries saved to {output_path}")
+    else:
+        plt.show()
+    
 
 # ----------------------------------------------------------------------------------------------------
 
@@ -545,30 +548,6 @@ def inspect_summary(path, output_file: str = 'inspect_summary.txt', n_head: int 
         print(summary.head(n_head), file=f) 
 
 # ----------------------------------------------------------------------------------------------------
-# distance measures between density matrices
-
-def frobenius(D1, D2, S1, S2, normalize=True):
-    if normalize:
-        D1 = D1 / np.trace(D1 @ S1)
-        D2 = D2 / np.trace(D2 @ S2)
-    D_delta = D1 - D2
-    fro = np.sqrt(np.trace(D_delta @ D_delta))
-
-    return float(np.real(fro))
-
-
-def fidelity(D1, D2, S1, S2, normalize=True):
-    '''fidelity in a quantum information sense, note this is NOT symmetric with respect to swapping args'''
-    if normalize:
-        D1 = D1 / np.trace(D1 @ S1)
-        D2 = D2 / np.trace(D2 @ S2)
-    sqrt_D1 = scipy.linalg.sqrtm(D1)
-    fidelity = np.trace(
-        scipy.linalg.sqrtm(sqrt_D1 @ D2 @ sqrt_D1)
-    )
-
-    return np.real(fidelity)**2
-# ----------------------------------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
@@ -612,6 +591,11 @@ if __name__ == "__main__":
         default=1000,
         help="miniters argument on tdqm for scanning"
     )
+    parser.add_argument(
+        "--plot_matrix_size_histogram",
+        action="store_true",
+        help="plot a histogram of density matrix sizes"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -621,6 +605,9 @@ if __name__ == "__main__":
     output_dir = args.output_dir if args.output_dir else dirpwd
     with open(os.path.join(dirpwd, 'utils/download_data.json'), 'r') as f:
         download_config = json.load(f)
+    
+    eda_dir = os.path.join(output_dir, 'eda')
+    os.makedirs(eda_dir, exist_ok=True)
 
     if args.inspect_wfn:
         inspect_wfn(path=args.inspect_wfn, outpath=os.path.join(output_dir, 'inspect_wfn.txt'))
@@ -642,8 +629,6 @@ if __name__ == "__main__":
         print(f'Max density matrix size detected: {max_matrix_size} by {max_matrix_size}')
 
         # save scan results
-        eda_dir = os.path.join(output_dir, 'eda')
-        os.makedirs(eda_dir, exist_ok=True)
         with open(os.path.join(eda_dir, 'densmat_eda.json'), 'w', encoding='utf-8') as f:
             json.dump(matrix_info, f, indent=4)
     
@@ -657,6 +642,12 @@ if __name__ == "__main__":
         print(f'Max box sizes for molecular configurations: {max_box_size} by {max_box_size}')
     
     # ----------------------------------------------------------------------------------------------------
+
+    if args.plot_matrix_size_histogram:
+        plot_density_matrix_size_histogram(
+            eda_json_path=os.path.join(eda_dir, 'densmat_eda.json'),
+            output_dir=eda_dir,
+        )
 
 
     # mol_test = QMugsMolecule(
@@ -702,5 +693,5 @@ if __name__ == "__main__":
     # print(f'D1 Frobenius: {np.linalg.norm(D1 @ S1, ord='fro')}')
 
     # print(f'D0-D1 Frobenius: {np.linalg.norm(D_delta, ord='fro')}')
-    # print(f'Frobenius normalized: {frobenius(D0, D1, S0, S1, normalize=True)}')
+    # print(f'Frobenius normalized: {frobenius_dist(D0, D1, S0, S1, normalize=True)}')
     # print(f'Fidelity measure: {fidelity(D0, D1, S0, S1, normalize=True)}')

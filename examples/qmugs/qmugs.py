@@ -1,14 +1,14 @@
 import os, json
 import logging
-import sys
-from mpi4py import MPI
-import argparse
 import time
-from concurrent.futures import ProcessPoolExecutor
+import pickle
+import gc
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import glob
+from collections import OrderedDict
 
 import random
 import torch
@@ -19,33 +19,23 @@ import torch.distributed as dist
 random_state = 0
 torch.manual_seed(random_state)
 random.seed(random_state)
+rng = np.random.default_rng(random_state)
 # ----------------------------------------------------------------------------------------------------
 
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import Distance
 
 import hydragnn
+from hydragnn.train.train_validate_test import move_batch_to_device, resolve_precision, get_autocast_and_scaler
 from hydragnn.utils.datasets.abstractbasedataset import AbstractBaseDataset
-from hydragnn.utils.model import print_model
+from hydragnn.utils.model import print_model, loss_function_selection
+from hydragnn.utils.distributed import get_device
 from hydragnn.utils.print.print_utils import iterate_tqdm, log
 from hydragnn.preprocess.graph_samples_checks_and_updates import (
     RadiusGraph,
     gather_deg,
 )
-
-import hydragnn.utils.profiling_and_tracing.tracer as tr
-from hydragnn.utils.profiling_and_tracing.time_utils import Timer
-
-from hydragnn.utils.datasets.distdataset import DistDataset
-from hydragnn.utils.datasets.pickledataset import (
-    SimplePickleWriter,
-    SimplePickleDataset,
-)
-
-try:
-    from hydragnn.utils.datasets.adiosdataset import AdiosWriter, AdiosDataset
-except ImportError:
-    pass
 
 from rdkit import Chem
 from rdkit import RDLogger
@@ -57,7 +47,6 @@ try:
 except ImportError:
     print('[WARNING] psi4 package not detected')
 
-
 # ----------------------------------------------------------------------------------------------------
 transform_coordinates = Distance(norm=False, cat=False)
 # ----------------------------------------------------------------------------------------------------
@@ -65,71 +54,11 @@ transform_coordinates = Distance(norm=False, cat=False)
 NUM_MOLECULES = 665911
 NUM_CONFORMERS = 1992984
 
-BOHR_TO_ANGSTROM = 0.52917721092
+BOHR_PER_ANGSTROM = 0.52917721092
+
 
 # ----------------------------------------------------------------------------------------------------
-# util functions (might move)
-
-def _build_xyz_grid(
-    center = (0.0, 0.0, 0.0), # (x, y, z), Angstrom by default
-    box_size = 30.0, # Angstrom by default
-    spacing = 0.5, # Angstrom by default
-    input_units: str = 'Angstrom', # 'Angstrom' or 'Bohr'
-    output_units: str = 'Angstrom', # 'Angstrom' or 'Bohr'
-):
-    '''builds (N, 3) dim array of grid points to express scalar field quantities, in Angstrom units by default, covering a square box'''
-
-    if input_units.lower() not in ['angstrom', 'bohr']:
-        raise ValueError(f'Input units not recognized: {input_units}')
-    if output_units.lower() not in ['angstrom', 'bohr']:
-        raise ValueError(f'Output units not recognized: {output_units}')
-    
-    # change everything to Angstrom
-    if input_units.lower() == 'bohr':
-        center = center * BOHR_TO_ANGSTROM
-        box_size = box_size * BOHR_TO_ANGSTROM
-        spacing = spacing * BOHR_TO_ANGSTROM
-    
-    center = np.asarray(center)
-    n = int(round(box_size / spacing))
-    half = box_size / 2
-
-    # ensure box_size is integer multiple of spacing
-    if abs(n * spacing - box_size) > 1e-8:
-        raise ValueError('box_size must be an integer multiple of spacing')
-
-    x = np.linspace(
-        center[0] - half + spacing / 2,
-        center[0] + half - spacing / 2,
-        n,
-    )
-
-    y = np.linspace(
-        center[1] - half + spacing / 2,
-        center[1] + half - spacing / 2,
-        n,
-    )
-
-    z = np.linspace(
-        center[2] - half + spacing / 2,
-        center[2] + half - spacing / 2,
-        n,
-    )
-
-    # build grid
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    grid = np.column_stack(
-        (X.ravel(), Y.ravel(), Z.ravel())
-    )
-
-    # convert to Bohr if specified
-    if output_units.lower() == 'bohr':
-        grid = grid * 1.0 / BOHR_TO_ANGSTROM
-
-    return grid
-
-# ----------------------------------------------------------------------------------------------------
-
+# QMugs dataset class
 
 class QMugsDataset(AbstractBaseDataset):
     '''QMugs dataset class'''
@@ -145,7 +74,9 @@ class QMugsDataset(AbstractBaseDataset):
         graphgps_transform=None,
         energy_per_atom=False,
         dist=False,
-        pad_density_matrix=False,
+        pad_density_matrix=True,
+        mask_output_loss=None,
+        predict_alpha_beta=False,
         normalize=False, # NOT IMPLEMENTED YET
     ):
         super().__init__()
@@ -156,7 +87,16 @@ class QMugsDataset(AbstractBaseDataset):
         self.energy_per_atom = energy_per_atom
 
         self.pad_density_matrix = pad_density_matrix
+        self.predict_alpha_beta = predict_alpha_beta
         self.normalize=normalize
+
+        # parse masking configuration as specified
+        if mask_output_loss is not None:
+            self.mask = mask_output_loss.get('mask', False)
+            self.mask_method = mask_output_loss.get('mask_method', 'unif_atoms')
+            self.mask_config = mask_output_loss.get('mask_config', {})
+        else:
+            self.mask = False
 
         self.radius_graph = RadiusGraph(
             self.radius, loop=False, max_num_neighbors=self.max_neighbours
@@ -213,50 +153,33 @@ class QMugsDataset(AbstractBaseDataset):
     # pre and post processing of densities
     def _pad_density_matrix(self, density_matrix):
         '''pad density matrix with 0's to match maximal dimension in dataset'''
-        N = self.__class__.max_padded_density_matrix_dimension
-        n = density_matrix.shape[0]
 
-        padded = np.zeros((N, N), dtype=density_matrix.dtype)
-        padded[:n, :n] = density_matrix
+        from utils import pad_density_matrix
+        N = self.__class__.max_padded_density_matrix_dimension
+        padded = pad_density_matrix(density_matrix=density_matrix, max_size=N)
 
         return padded
 
 
     def _get_density_matrix_mask(
         self, 
+        rng,
         wfn: psi4.core.Wavefunction,
         mask_method: str = "unif_atoms",
         **kwargs,
     ):
-        '''outputs binary mask for density matrix'''
-        return
+        '''returns binary mask for density matrix'''
 
+        from utils import get_density_matrix_mask
+        mask, _ = get_density_matrix_mask(
+            wfn=wfn,
+            rng=rng,
+            random_state=random_state,
+            mask_method=mask_method,
+            kwargs=kwargs,
+        )
 
-    def _preprocess_scalar_density(
-        self, 
-        wfn: psi4.core.Wavefunction, 
-        grid_xyz: np.ndarray, # (N, 3) dim array of grid points measured in Angstrom units
-        spin: str = 'total', # 'total', 'alpha', 'beta', 'spin'
-    ):
-        '''for each conformer wfn, map density matrix -> scalar density'''
-
-        Da = wfn.Da().np
-        Db = wfn.Db().np
-        basis = wfn.basisset()
-
-        # prep matrix
-        if spin == 'alpha':
-            D = Da.copy()
-        elif spin == 'beta':
-            D = Db.copy()
-        elif spin == 'total':
-            D = Da.copy() + Db.copy()
-        elif spin == 'spin':
-            D = Da.copy() - Db.copy()
-        else:
-            raise ValueError(F'Unrecognized density type input: {spin}')
-        
-        # FINISH
+        return mask
 
     # ----------------------------------------------------------------------------------------------------
     # dataset prep
@@ -264,8 +187,9 @@ class QMugsDataset(AbstractBaseDataset):
     def _mol_to_graph(self, wfn_path, sdf_path):
         '''convert molecule data to torch_geometric.data.Data object and return'''    
 
-        # track chembl_id since each object is a conformer
+        # track chembl_id and conformer_id since each object is a conformer
         chembl_id = wfn_path.split('/')[-2]
+        conformer_id = wfn_path.split('/')[-1].split('.')[0][-2:]
 
         # load objects
         psi4_wfn = psi4.core.Wavefunction.from_file(wfn_path)
@@ -288,18 +212,35 @@ class QMugsDataset(AbstractBaseDataset):
         Db = psi4_wfn.Db().np
         D_tot = Da + Db
 
+        # save original density matrix dimension
+        density_matrix_dim = torch.tensor(int(Da.shape[0]), dtype=torch.int32)
+
         # check if density matrix is too big for padding
         if D_tot.shape[0] > self.__class__.max_padded_density_matrix_dimension:
             raise ValueError(f'A loaded density matrix has size {D_tot.shape}, the output dimension is {self.__class__.max_padded_density_matrix_dimension}')
 
         # pad density matrix
         if self.pad_density_matrix:
-            D_tot = self._pad_density_matrix(D_tot.copy())
+            if self.predict_alpha_beta:
+                Da = self._pad_density_matrix(Da.copy())
+                Db = self._pad_density_matrix(Db.copy())
 
-        D_tot = torch.from_numpy(D_tot.copy()).to(torch.float32)
+                Da = torch.from_numpy(Da).to(torch.float32)
+                Db = torch.from_numpy(Db).to(torch.float32)
+            else: 
+                D_tot = self._pad_density_matrix(D_tot.copy())
+                D_tot = torch.from_numpy(D_tot).to(torch.float32)
 
-        # save original density matrix dimension
-        density_matrix_dim = torch.IntTensor(Da.shape[0])
+        # charge and multiplicity
+        charge = torch.tensor(
+            int(psi4_mol.molecular_charge()),
+            dtype=torch.int32,
+        )
+
+        multiplicity = torch.tensor(
+            int(psi4_mol.multiplicity()),
+            dtype=torch.int32,
+        )
 
         # ----------------------------------------------------------------------------------------------------
         # data available in sdf or psi4
@@ -310,6 +251,10 @@ class QMugsDataset(AbstractBaseDataset):
         assert(natoms_psi4 == natoms_sdf)
         assert(len(pos) == natoms_psi4)
         natoms = torch.IntTensor(natoms_psi4)
+        natoms_int = torch.tensor(
+            int(natoms_psi4),
+            dtype=torch.int32,
+        )
 
         # atomic_numbers
         atomic_numbers_psi4 = [int(psi4_mol.ftrue_atomic_number(i)) for i in range(psi4_mol.natom())]
@@ -329,45 +274,145 @@ class QMugsDataset(AbstractBaseDataset):
         # ----------------------------------------------------------------------------------------------------
         # other attributes
         graph_attr = None # not adding charge / spin for now, both are available in QMugss summary.csv file
-                
+
+        # ----------------------------------------------------------------------------------------------------
+        # masking
+
+        if self.predict_alpha_beta:
+            # mask alpha and beta independently
+            if self.mask:
+                alpha_density_mask = self._get_density_matrix_mask(
+                    wfn=psi4_wfn,
+                    rng=rng,
+                    mask_method=self.mask_method,
+                    perc_entries_masked = self.mask_config.get('perc_entries_masked', 0.2),
+                    perc_atom_pairs_masked = self.mask_config.get('perc_atom_pairs_masked', 0.2),
+                )
+                beta_density_mask = self._get_density_matrix_mask(
+                    wfn=psi4_wfn,
+                    rng=rng,
+                    mask_method=self.mask_method,
+                    perc_entries_masked = self.mask_config.get('perc_entries_masked', 0.2),
+                    perc_atom_pairs_masked = self.mask_config.get('perc_atom_pairs_masked', 0.2),
+                )
+            # mask out the padded region only
+            else:
+                alpha_density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+                beta_density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+            
+            # for test set, mask out only the padded region
+            alpha_density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+            beta_density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+            
+            # pad mask to correct dimension
+            alpha_density_mask = self._pad_density_matrix(alpha_density_mask)
+            beta_density_mask = self._pad_density_matrix(beta_density_mask)
+            alpha_density_test_mask = self._pad_density_matrix(alpha_density_test_mask)
+            beta_density_test_mask = self._pad_density_matrix(beta_density_test_mask)
+
+            alpha_density_mask = torch.from_numpy(alpha_density_mask).to(torch.float32)
+            beta_density_mask = torch.from_numpy(beta_density_mask).to(torch.float32)
+            alpha_density_test_mask = torch.from_numpy(alpha_density_test_mask).to(torch.float32)
+            beta_density_test_mask = torch.from_numpy(beta_density_test_mask).to(torch.float32)
+        
+        else:
+            # mask total density
+            if self.mask:
+                density_mask = self._get_density_matrix_mask(
+                wfn=psi4_wfn,
+                rng=rng,
+                mask_method=self.mask_method,
+                perc_entries_masked = self.mask_config.get('perc_entries_masked', 0.2),
+                perc_atom_pairs_masked = self.mask_config.get('perc_atom_pairs_masked', 0.2),
+            )
+            # mask out the padded region only
+            else: 
+                density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+
+            # for test set, mask out only the padded region
+            density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+            
+            # pad mask to correct dimension
+            density_mask = self._pad_density_matrix(density_mask)
+            density_test_mask = self._pad_density_matrix(density_test_mask)
+
+            density_mask = torch.from_numpy(density_mask).to(torch.float32)
+            density_test_mask = torch.from_numpy(density_test_mask).to(torch.float32)
+        
+
         # ----------------------------------------------------------------------------------------------------
         # declare data object
 
-        density_mask = self._get_density_matrix_mask(
-            wfn=psi4_wfn,
-            mask_method="unif_atoms",
-            perc_atoms_masked = 0.2,
-        )
+        # predictor: atom species and positions only
+        x = torch.cat([atomic_numbers, pos], dim=1)
+        
+        if self.predict_alpha_beta:
+            # predict alpha and beta matrices jointly as separate vectors
+            data_object = Data(
+                dataset_name="qmugs",
+                natoms=natoms,
+                pos=pos,
+                cell=cell, # not needed
+                pbc=pbc, # not needed
+                edge_index=None,
+                edge_attr=None,
+                atomic_numbers=atomic_numbers,
+                chemical_composition=chemical_composition,
+                smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
+                x=x,
+                alpha_density_matrix=Da.flatten(),
+                beta_density_matrix=Db.flatten(),
+                alpha_density_mask=alpha_density_mask.flatten(),
+                beta_density_mask=beta_density_mask.flatten(),
+                # auxiliary inputs
+                density_matrix_dim=density_matrix_dim,
+                chembl_id=chembl_id,
+                conformer_id=conformer_id,
+                natoms_int=natoms_int,
+                charge=charge,
+                multiplicity=multiplicity,
+                graph_attr=graph_attr,
+            )
+            data_object.y = torch.cat((data_object.alpha_density_matrix, data_object.beta_density_matrix))
+            data_object.y_mask = torch.cat((data_object.alpha_density_mask, data_object.beta_density_mask))
+            data_object.y_test_mask = torch.cat((alpha_density_test_mask.flatten(), beta_density_test_mask.flatten()))
+            
+        else:
+            # predict the full density matrix only
+            data_object = Data(
+                dataset_name="qmugs",
+                natoms=natoms,
+                pos=pos,
+                cell=cell, # not needed
+                pbc=pbc, # not needed
+                edge_index=None,
+                edge_attr=None,
+                atomic_numbers=atomic_numbers,
+                chemical_composition=chemical_composition,
+                smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
+                x=x,
+                density_matrix=D_tot,
+                density_mask=density_mask,
+                # auxiliary inputs
+                density_matrix_dim=density_matrix_dim,
+                chembl_id=chembl_id,
+                conformer_id=conformer_id,
+                natoms_int=natoms_int,
+                charge=charge,
+                multiplicity=multiplicity,
+                graph_attr=graph_attr,
+            )
+            data_object.y = data_object.density_matrix
+            data_object.y_mask = data_object.density_mask
+            data_object.y_test_mask = density_test_mask
 
-        x = torch.cat([atomic_numbers, pos], dim=1) # atomic numbers + geometry only
-
-        data_object = Data(
-            dataset_name="qmugs",
-            natoms=natoms,
-            pos=pos,
-            cell=cell, # not needed
-            pbc=pbc, # not needed
-            edge_index=None,
-            edge_attr=None,
-            atomic_numbers=atomic_numbers,
-            chemical_composition=chemical_composition,
-            smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
-            x=x,
-            density_matrix=D_tot,
-            # auxiliary inputs
-            chembl_id=chembl_id,
-            graph_attr=graph_attr,
-        )
-        data_object.y = data_object.density_matrix
-        data_object.y_mask = density_mask
-
+        # apply graph transforms
         data_object = self.radius_graph(data_object)
         data_object = transform_coordinates(data_object)
-
         data_object.edge_shifts = torch.zeros(
             (data_object.edge_index.size(1), 3), dtype=torch.float32
         )
-
+        
         if self.graphgps_transform is not None:
             data_object = self.graphgps_transform(data_object)
 
@@ -405,6 +450,12 @@ class QMugsDataset(AbstractBaseDataset):
             perc_load=perc_load,
             perc_train=perc_train
         )
+
+        # distributed loading
+        if self.dist:
+            trainset_ids = trainset_ids[self.rank :: self.world_size]
+            valset_ids = valset_ids[self.rank :: self.world_size]
+            testset_ids = testset_ids[self.rank :: self.world_size]
 
         # helper loader
         def _load_from_id_list(id_list, res_list, pbar):
@@ -455,6 +506,217 @@ class QMugsDataset(AbstractBaseDataset):
         }
 
         return trainset, valset, testset, split_sizes
+
+
+    def load_and_split_dataset_pickle_streaming(
+        self,
+        basedir,
+        comm,
+        perc_load: float = 1.0,
+        perc_train: float = 0.8,
+        use_subdir: bool = True,
+        nmax_persubdir: int = 10_000,
+        compute_pna_deg: bool = True,
+        verbosity: int = 2,
+        log_every: int = 100,
+    ):
+        '''load, split, and stream QMugs dataset directly to pickle files'''
+
+        rank = comm.Get_rank()
+        world_size = comm.Get_size()
+
+        # log config
+        log("[START] Streaming QMugs pickle preprocessing", rank=0)
+        log(f"[INFO] Output pickle directory: {basedir}", rank=0)
+        log(f"[INFO] perc_load={perc_load}, perc_train={perc_train}, world_size={world_size}", rank=0)
+
+        # generate train/val/test split indices for all molecules
+        trainset_ids, valset_ids, testset_ids = self._train_val_test_ids(
+            perc_load=perc_load,
+            perc_train=perc_train,
+        )
+
+        # shard indices across MPI ranks
+        if self.dist:
+            trainset_ids = trainset_ids[rank::world_size]
+            valset_ids = valset_ids[rank::world_size]
+            testset_ids = testset_ids[rank::world_size]
+        
+        log(
+            f"[INFO] Rank {rank}: assigned molecules "
+            f"train={len(trainset_ids)}, val={len(valset_ids)}, test={len(testset_ids)}"
+        )
+
+        def _count_conformers(id_list):
+            '''count conformers contained in a list of molecule IDs'''
+            n = 0
+            for chembl_id in id_list:
+                wfn_dir = self.molecule_dirs[chembl_id]["wfn_dir"]
+                n += len([
+                    f for f in os.listdir(wfn_dir)
+                    if os.path.isfile(os.path.join(wfn_dir, f))
+                ])
+            return n
+
+        def _update_deg_hist(deg_hist, data_object):
+            '''update running pna degree histogram'''
+            deg = torch.bincount(
+                data_object.edge_index[1],
+                minlength=data_object.num_nodes,
+            ).cpu()
+            local_hist = torch.bincount(deg)
+
+            if deg_hist.numel() < local_hist.numel():
+                tmp = torch.zeros(local_hist.numel(), dtype=torch.long)
+                tmp[:deg_hist.numel()] = deg_hist
+                deg_hist = tmp
+
+            deg_hist[:local_hist.numel()] += local_hist
+            return deg_hist
+
+        def _write_split(label, id_list, attrs=None):
+            '''stream a single dataset split to pickle files'''
+
+            # determine local and global graph counts
+            local_n = _count_conformers(id_list)
+            ns = comm.allgather(local_n)
+            noffset = sum(ns[:rank])
+            ntotal = sum(ns)
+
+            log(
+                f"[START] Streaming split={label}: "
+                f"global_graphs={ntotal}, local_graphs_rank0={ns[0] if len(ns) > 0 else 0}", 
+                rank=0,
+            )
+
+            log(f"[INFO] Rank {rank}: split={label}, local_graphs={local_n}, global_offset={noffset}")
+
+            # write metadata file once
+            if rank == 0:
+                os.makedirs(basedir, exist_ok=True)
+                with open(os.path.join(basedir, f"{label}-meta.pkl"), "wb") as f:
+                    pickle.dump(None, f)
+                    pickle.dump(None, f)
+                    pickle.dump(ntotal, f)
+                    pickle.dump(use_subdir, f)
+                    pickle.dump(nmax_persubdir, f)
+                    pickle.dump(attrs if attrs is not None else {}, f)
+
+            comm.Barrier()
+
+            deg_hist = torch.zeros(0, dtype=torch.long)
+
+            local_i = 0
+
+            # iterate over assigned molecules
+            pbar = iterate_tqdm(
+                id_list,
+                verbosity,
+                total=len(id_list),
+                desc=f"Streaming {label} molecules",
+            )
+
+            for chembl_id in pbar:
+                wfn_dir = self.molecule_dirs[chembl_id]["wfn_dir"]
+                sdf_dir = self.molecule_dirs[chembl_id]["sdf_dir"]
+
+                # iterate over conformers belonging to the molecule
+                for filename in sorted(os.listdir(wfn_dir)):
+                    wfn_path = os.path.join(wfn_dir, filename)
+                    if not os.path.isfile(wfn_path):
+                        continue
+
+                    conf_id = filename.split(".")[0][-2:]
+                    sdf_path = os.path.join(sdf_dir, f"conf_{conf_id}.sdf")
+
+                    # construct graph object
+                    data_object = self._mol_to_graph(
+                        wfn_path=wfn_path,
+                        sdf_path=sdf_path,
+                    )
+                    global_i = noffset + local_i
+
+                    # determine pickle output path
+                    if use_subdir:
+                        subdir = os.path.join(basedir, str(global_i // nmax_persubdir))
+                        os.makedirs(subdir, exist_ok=True)
+                        fname = os.path.join(subdir, f"{label}-{global_i}.pkl")
+                    else:
+                        fname = os.path.join(basedir, f"{label}-{global_i}.pkl")
+                    
+                    # write graph to pickle
+                    with open(fname, "wb") as f:
+                        pickle.dump(data_object, f)
+
+                    # update pna degree histogram using training graphs only
+                    if compute_pna_deg and label == "trainset":
+                        deg_hist = _update_deg_hist(deg_hist, data_object)
+
+                    local_i += 1
+
+                    # periodic progress logging
+                    if log_every is not None and log_every > 0 and local_i % log_every == 0:
+                        log(f"[INFO] Rank {rank}: split={label}, wrote {local_i}/{local_n} local graphs")
+                    
+                    # immediately release memory for current graph
+                    del data_object
+                    gc.collect()
+            
+            log(f"[DONE] Rank {rank}: split={label}, wrote {local_i} local graphs")
+            log(f"[DONE] Streaming split={label}", rank=0)
+
+            return deg_hist
+        
+        # stream each dataset split
+        local_deg_hist = _write_split("trainset", trainset_ids)
+
+        _write_split("valset", valset_ids)
+        _write_split("testset", testset_ids)
+
+        # reduce pna degree histogram across all MPI ranks
+        local_max_deg = torch.tensor([local_deg_hist.numel()], dtype=torch.long)
+        dist.all_reduce(local_max_deg, op=dist.ReduceOp.MAX)
+
+        padded_deg_hist = torch.zeros(int(local_max_deg.item()), dtype=torch.long)
+        padded_deg_hist[:local_deg_hist.numel()] = local_deg_hist
+        dist.all_reduce(padded_deg_hist, op=dist.ReduceOp.SUM)
+
+        pna_deg = padded_deg_hist.numpy()
+
+        # update metadata with global PNA degree histogram
+        if rank == 0:
+            meta_path = os.path.join(basedir, "trainset-meta.pkl")
+            with open(meta_path, "rb") as f:
+                minmax_node_feature = pickle.load(f)
+                minmax_graph_feature = pickle.load(f)
+                ntotal = pickle.load(f)
+                meta_use_subdir = pickle.load(f)
+                meta_nmax_persubdir = pickle.load(f)
+                attrs = pickle.load(f)
+
+            attrs["pna_deg"] = pna_deg
+
+            with open(meta_path, "wb") as f:
+                pickle.dump(minmax_node_feature, f)
+                pickle.dump(minmax_graph_feature, f)
+                pickle.dump(ntotal, f)
+                pickle.dump(meta_use_subdir, f)
+                pickle.dump(meta_nmax_persubdir, f)
+                pickle.dump(attrs, f)
+
+        comm.Barrier()
+
+        # gather global conformer counts across all MPI ranks
+        train_global = sum(comm.allgather(_count_conformers(trainset_ids)))
+        val_global = sum(comm.allgather(_count_conformers(valset_ids)))
+        test_global = sum(comm.allgather(_count_conformers(testset_ids)))
+
+        return {
+            "pna_deg": pna_deg,
+            "train_num_conformers": train_global,
+            "val_num_conformers": val_global,
+            "test_num_conformers": test_global,
+        }
         
         
     def len(self):
@@ -464,315 +726,613 @@ class QMugsDataset(AbstractBaseDataset):
         return self.dataset[idx]
 
 
-# runs trianing
-if __name__ == "__main__":
+# ----------------------------------------------------------------------------------------------------
+# QMugs inference class (with pretrained model)
 
+class QMugsInference:
+    '''wrapper for running QMugs density matrix inference'''
+
+    def __init__(
+        self,
+        model_dir,
+        checkpoint_path=None,
+    ):
+        # dir and path setup
+        self.model_dir = model_dir
+        self._find_checkpoint(checkpoint_path)
+        self._load_config()
+        self._load_model()
+    
     # ----------------------------------------------------------------------------------------------------
-    # args
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--sampling", type=float, help="sampling ratio", default=None)
-    parser.add_argument(
-        "--preonly",
-        action="store_true",
-        help="preprocess only (no training)",
-    )
-    parser.add_argument(
-        "--inputfile", help="input config file", type=str, default="qmugs_densmat.json"
-    )
-    parser.add_argument("--ddstore", action="store_true", help="ddstore dataset")
-    parser.add_argument("--ddstore_width", type=int, help="ddstore width", default=None)
-    parser.add_argument("--log", help="log name")
-    parser.add_argument("--batch_size", type=int, help="batch_size", default=None)
-    parser.add_argument("--num_epoch", type=int, help="number of epochs to train", default=None)
-    parser.add_argument("--everyone", action="store_true", help="gptimer")
-    parser.add_argument("--modelname", help="model name")
-    parser.add_argument(
-        "--precision",
-        type=str,
-        choices=["fp32", "fp64", "bf16"],
-        default=None,
-        help="Override precision; defaults to fp32 when not set",
-    )
+    # initialization
+    
+    def _find_checkpoint(self, checkpoint_path=None):
+        '''return path to model checkpoint'''
 
-    parser.add_argument("--perc_load", type=float, help="percentage of all molecules in dataset to load", default=0.0001)
-    parser.add_argument("--perc_train", type=float, help="percentage of loaded moledules to assign to train set", default=0.8)
-
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--adios",
-        help="Adios dataset",
-        action="store_const",
-        dest="format",
-        const="adios",
-    )
-    group.add_argument(
-        "--pickle",
-        help="Pickle dataset",
-        action="store_const",
-        dest="format",
-        const="pickle",
-    )
-    parser.set_defaults(format="pickle") # not sure how ADIOS2 works on Perlmutter
-    args = parser.parse_args()
-
-    # ----------------------------------------------------------------------------------------------------
-    # set up names, files, logs
-    dirpwd = os.path.dirname(os.path.abspath(__file__))
-    input_filename = os.path.join(dirpwd, args.inputfile)
-
-    # read config files
-    with open(input_filename, 'r') as f:
-        config = json.load(f)
-    with open(os.path.join(dirpwd, 'utils/download_data.json'), 'r') as f:
-        download_config = json.load(f)
+        # return checkpoint file path if provided
+        if checkpoint_path is not None:
+            if os.path.isabs(checkpoint_path):
+                self.checkpoint_path = checkpoint_path
+            else:
+                self.checkpoint_path = os.path.join(self.model_dir, checkpoint_path)
+            if not os.path.isfile(self.checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
         
-    dataset_dir = download_config.get('data_dir', './dataset')    
-    verbosity = config["Verbosity"]["level"]
-    padding_dim = int((QMugsDataset.max_padded_density_matrix_dimension)**2)
-    
-    # set up features
-    graph_feature_names = ['density_matrix']
-    graph_feature_dims = [padding_dim]
-    node_feature_names = ['atomic_number', 'cartesian_coordinates']
-    node_feature_dims = [1, 3]
-    
-    # variables of interest configs
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+        # get last available checkpoint if no checkpoint path provided
+        else: 
+            candidates = sorted(glob.glob(os.path.join(self.model_dir, "*.pk")))
+            if len(candidates) == 0:
+                raise FileNotFoundError(f"No .pk checkpoint files found in {self.model_dir}")
+            
+            self.checkpoint_path = candidates[-1]
 
-    # ensure consistent padded matrix dimensions
-    assert (var_config["output_dim"][0] == padding_dim)
 
-    # reset batch size and epochs if specified
-    if args.batch_size is not None:
-        config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
-    if args.num_epoch is not None: 
-        config["NeuralNetwork"]["Training"]["num_epoch"] = args.num_epoch
-    
-    comm_size, rank = hydragnn.utils.distributed.setup_ddp()
-    comm = MPI.COMM_WORLD
+    def _load_config(self):
+        '''loads config file for the specified pretrained model'''
+        config_path = os.path.join(self.model_dir, "config.json")
+        self.config_path = config_path
 
-    # logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"%(levelname)s (rank {rank}): %(message)s",
-        datefmt="%H:%M:%S"
-    )
-    log_name = "QMugs" if args.log is None else args.log
-    hydragnn.utils.print.setup_log(log_name)
-    writer = hydragnn.utils.model.get_summary_writer(log_name)
-    
-    log("Command: {0}\n".format(" ".join([x for x in sys.argv])), rank=0)
-    log(f'Random seed used for run: {random_state}')
+        if not os.path.isfile(config_path):
+            raise FileNotFoundError(f"config.json not found in {self.model_dir}")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        self.config = config
 
-    # ----------------------------------------------------------------------------------------------------
-    # load data and perform splitting
-    modelname = "QMugs" if args.modelname is None else args.modelname
-    if args.preonly:
-        
-        # initialize dataset object
-        dataset_object = QMugsDataset(
-            config=config,
-            download_config=download_config,
-            graphgps_transform=None,
-            energy_per_atom=False,
-            dist=True,
-            pad_density_matrix=True,
+
+    def _load_model(self):
+        '''loads the specified pretrained model'''
+
+        # resolve precision
+        precision_str = self.config["NeuralNetwork"]["Training"].get("precision", "fp32")
+        precision, param_dtype, _ = resolve_precision(precision=precision_str)
+        self.param_dtype = param_dtype
+        self.precision = precision
+        torch.set_default_dtype(param_dtype)
+
+        # device
+        device = get_device()
+        self.device = device
+        autocast_ctx, _ = get_autocast_and_scaler(precision=precision)
+        self.autocast_ctx = autocast_ctx
+
+        # declare model
+        self.model = hydragnn.models.create.create_model_config(
+            config=self.config["NeuralNetwork"],
+            verbosity=self.config["Verbosity"]["level"],
         )
 
-        # load and split locally downloaded and extracted data
-        start = time.perf_counter()
-        trainset, valset, testset, split_sizes = dataset_object.load_and_split_dataset(
-            perc_load=args.perc_load, 
-            perc_train=args.perc_train,
+        # load state dict
+        checkpoint = torch.load(self.checkpoint_path, map_location=device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        clean_state = OrderedDict(
+            (k[len("module."):] if k.startswith("module.") else k, v)
+            for k, v in state_dict.items()
         )
-        end = time.perf_counter()
+        missing, unexpected = self.model.load_state_dict(clean_state, strict=False)
+        if missing:
+            log(f"[WARNING] missing keys when loading model: {missing}", rank=0)
+        if unexpected:
+            log(f"[WARNING] unexpected keys when loading model: {unexpected}", rank=0)
 
-        log(f'Split sizes: {json.dumps(split_sizes, indent=4)}')
-        log(f'Time for dataset loading + splitting (without accounting for object initialization): {end-start}')
+        # load model
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False) # freeze parameters
+        self.model = self.model.to(dtype=param_dtype, device=device)
+    
+    ######################################################################################################
+    # DEFUNCT
+    # ----------------------------------------------------------------------------------------------------
+    # naive inference without streaming
 
-        deg = gather_deg(trainset)
-        config["pna_deg"] = deg
+    def run_inference(
+        self, 
+        dataset,
+        evaluate=True,
+        criterions=['mse', 'mae', 'smooth_l1', 'rmse'],
+        return_numpy_matrices=True,
+    ):
+        '''
+        runs inference naively with model on preloaded dataset.
+        suitable only for very small test sets. for larger datasets, use run_streaming_inference().
+        '''
 
-        setnames = ["trainset", "valset", "testset"]
+        max_size = QMugsDataset.max_padded_density_matrix_dimension # max padding size
 
-        # adios 
-        if args.format == "adios":
-            fname = os.path.join(
-                dataset_dir, "%s.bp" % modelname
-            )
-            adwriter = AdiosWriter(fname, comm)
-            adwriter.add("trainset", trainset)
-            adwriter.add("valset", valset)
-            adwriter.add("testset", testset)
-            adwriter.add_global("pna_deg", deg)
-            adwriter.save()
+        # run inference
+        all_pred = []
+        all_true = []
+        loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        for batch in loader:
+            batch = batch.to(self.device)
+
+            with torch.no_grad():
+                pred = self.model(batch)
+
+                # total density matrix prediction
+                if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
+                    pred_batch = pred[0].reshape(-1, max_size, max_size)
+                    true_batch = batch.density_matrix.reshape(-1, max_size, max_size)
+                    dims_batch = batch.density_matrix_dim
+                else:
+                    raise NotImplementedError
+
+                # unpad
+                for raw_pred_mat, raw_true_mat, dim in zip(
+                    pred_batch,
+                    true_batch,
+                    dims_batch,
+                ):
+                    assert (raw_pred_mat.shape == raw_true_mat.shape)
+                    assert (raw_pred_mat.shape[0] == max_size)
+
+                    dim = int(dim.item())
+                    pred_mat = raw_pred_mat[:dim, :dim]
+                    true_mat = raw_true_mat[:dim, :dim]
+
+                    all_pred.append(pred_mat)
+                    all_true.append(true_mat)
         
-        # pickle
-        elif args.format == "pickle":
-            basedir = os.path.join(dataset_dir, "%s.pickle" % modelname)
-            attrs = {"pna_deg": deg}
-            SimplePickleWriter(
-                trainset,
-                basedir,
-                "trainset",
-                use_subdir=True,
-                attrs=attrs,
-            )
-            SimplePickleWriter(
-                valset,
-                basedir,
-                "valset",
-                use_subdir=True,
-            )
-            SimplePickleWriter(
-                testset,
-                basedir,
-                "testset",
-                use_subdir=True,
-            )
-        log(f'Saved trainset, testset, valset to {basedir}\n')
-        sys.exit(0)
+        # evaluate
+        evaluation = {}
+        if evaluate:
+            # iterate through all specified criterions
+            for criterion in criterions:
+                losses = []
+                loss_function = loss_function_selection(criterion)
+
+                # compute losses
+                for pred_mat, true_mat in zip(all_pred, all_true):
+                    losses.append(loss_function(pred_mat, true_mat))
+                loss_mean = torch.stack(losses).mean()
+                loss_std = torch.stack(losses).std()
+
+                # save results
+                evaluation[criterion] = {
+                    'mean': loss_mean.item(),
+                    'std': loss_std.item(),
+                    'values': [l.item() for l in losses],
+                }  
+
+        # return results
+        if return_numpy_matrices:
+            all_pred_numpy = [pred_mat.detach().cpu().numpy() for pred_mat in all_pred]
+            all_true_numpy = [true_mat.detach().cpu().numpy() for true_mat in all_true]
+            return all_pred_numpy, all_true_numpy, evaluation            
+
+        else: 
+            return all_pred, all_true, evaluation
+
+        ######################################################################################################
+    
 
     # ----------------------------------------------------------------------------------------------------
-    # load preprocessed data
+    # helpers for more optimized inference with streaming across MPI ranks
 
-    tr.initialize()
-    tr.disable()
-    timer = Timer('load_data')
-    timer.start()
+    def _init_streaming_metric_state(self, criterions):
+        '''initialize local streaming metric accumulators'''
 
-    # adios
-    if args.format == "adios":
-        assert AdiosDataset is not None, "ADIOS support not available"
-        log("Adios load")
-        assert not (args.shmem and args.ddstore), "Cannot use both ddstore and shmem"
-        opt = {
-            "preload": False,
-            "shmem": args.shmem,
-            "ddstore": args.ddstore,
-            "ddstore_width": args.ddstore_width,
+        state = {
+            'count': 0,
+
+            # loss metrics usable in training
+            'losses': {
+                criterion: {
+                    'sum': 0.0,
+                    'sumsq': 0.0,
+                }
+                for criterion in criterions
+            },
+
+            # density matrix constraint metrics
+            'trace_error': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+            'hermitian_error': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+            'minimum_eigenvalue': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+            'negative_eigenvalue_count': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+
+            # other reconstruction metrics
+            'r2_per_matrix': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+            'relative_frobenius_error': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
+            'cosine_similarity': {
+                'sum': 0.0,
+                'sumsq': 0.0,
+            },
         }
-        fname = os.path.join(dataset_dir, "%s.bp" % modelname)
-        trainset = AdiosDataset(fname, "trainset", comm, **opt, var_config=var_config)
-        valset = AdiosDataset(fname, "valset", comm, **opt, var_config=var_config)
-        testset = AdiosDataset(fname, "testset", comm, **opt, var_config=var_config)
+
+        return state
+
+
+    def _update_scalar_metric(self, state, name, value):
+        '''update one scalar metric accumulator'''
+
+        state[name]['sum'] += value
+        state[name]['sumsq'] += value * value
+
+
+    def _update_streaming_metric_state(
+        self,
+        state,
+        pred_mat,
+        true_mat,
+        batch,
+        batch_index,
+        criterions,
+        save_per_matrix_metrics=False,
+        per_matrix_metrics=None, # persisted dict of per matrix metrics
+    ):
+        '''update local streaming metrics from one unpadded matrix pair'''
+
+        # increment local sample count
+        state['count'] += 1
+
+        # store per matrix quantities if requested
+        record = None
+        if save_per_matrix_metrics:
+            record = {
+                'chembl_id': batch.chembl_id[batch_index],
+                'conformer_id': batch.conformer_id[batch_index],
+                'density_matrix_dim': int(batch.density_matrix_dim[batch_index].item()),
+                'natoms': int(batch.natoms_int[batch_index].item()),
+                'charge': int(batch.charge[batch_index].item()),
+                'multiplicity': int(batch.multiplicity[batch_index].item()),
+            }
+
+        # reconstruction losses available to train on
+        for criterion in criterions:
+            value = _loss_value(
+                pred_mat=pred_mat,
+                true_mat=true_mat,
+                criterion=criterion,
+            )
+
+            state['losses'][criterion]['sum'] += value
+            state['losses'][criterion]['sumsq'] += value * value
+
+            if save_per_matrix_metrics:
+                record[criterion] = value
+
+        # ----------------------------------------------------------------------------------------------------
+        # trace conservation
+        trace_error, trace_pred, trace_true = _trace_error(
+            pred_mat=pred_mat,
+            true_mat=true_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='trace_error',
+            value=trace_error,
+        )
+
+        if save_per_matrix_metrics:
+            record['trace_error'] = trace_error
+            record['predicted_trace'] = trace_pred
+            record['true_trace'] = trace_true
+
+        # ----------------------------------------------------------------------------------------------------
+        # hermitianity
+        hermitian_error = _hermitian_error(
+            pred_mat=pred_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='hermitian_error',
+            value=hermitian_error,
+        )
+
+        if save_per_matrix_metrics:
+            record['hermitian_error'] = hermitian_error
+
+        # ----------------------------------------------------------------------------------------------------
+        # positive semidefinite metrics
+        min_eigenvalue, negative_eigenvalue_count = _psd_metrics(
+            pred_mat=pred_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='minimum_eigenvalue',
+            value=min_eigenvalue,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='negative_eigenvalue_count',
+            value=float(negative_eigenvalue_count),
+        )
+
+        if save_per_matrix_metrics:
+            record['minimum_eigenvalue'] = min_eigenvalue
+            record['negative_eigenvalue_count'] = negative_eigenvalue_count
+
+        # ----------------------------------------------------------------------------------------------------
+        # per matrix R2
+        r2_per_matrix = _r2_per_matrix(
+            pred_mat=pred_mat,
+            true_mat=true_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='r2_per_matrix',
+            value=r2_per_matrix,
+        )
+
+        if save_per_matrix_metrics:
+            record['r2_per_matrix'] = r2_per_matrix
+
+        # ----------------------------------------------------------------------------------------------------
+        # relative frobenius erorr
+        relative_frobenius_error = _relative_frobenius_error(
+            pred_mat=pred_mat,
+            true_mat=true_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='relative_frobenius_error',
+            value=relative_frobenius_error,
+        )
+
+        if save_per_matrix_metrics:
+            record['relative_frobenius_error'] = relative_frobenius_error
+
+        # ----------------------------------------------------------------------------------------------------
+        # cosine similarity of matrices as flattened vectors
+        cosine_similarity = _cosine_similarity(
+            pred_mat=pred_mat,
+            true_mat=true_mat,
+        )
+        self._update_scalar_metric(
+            state=state,
+            name='cosine_similarity',
+            value=cosine_similarity,
+        )
+
+        # ----------------------------------------------------------------------------------------------------
+
+        if save_per_matrix_metrics:
+            record['cosine_similarity'] = cosine_similarity
+
+            # save record for downstream analysis
+            per_matrix_metrics.append(record)
+
+
+    def _finalize_streaming_metric_state(self, state):
+        '''finalize local streaming metrics as mean and standard deviation'''
+
+        count = state['count']
+        if count == 0:
+            raise ValueError('Cannot finalize streaming metrics with zero samples')
+
+        results = {}
+
+        # finalize reconstruction lossess
+        for criterion, values in state['losses'].items():
+            mean = values['sum'] / count
+            var = max(values['sumsq'] / count - mean * mean, 0.0)
+            results[criterion] = {
+                'mean': mean,
+                'std': var ** 0.5,
+            }
+
+        # finalize density matrix metrics
+        for name in [
+            'trace_error',
+            'hermitian_error',
+            'minimum_eigenvalue',
+            'negative_eigenvalue_count',
+            'r2_per_matrix',
+            'relative_frobenius_error',
+            'cosine_similarity',
+        ]:
+            mean = state[name]['sum'] / count
+            var = max(state[name]['sumsq'] / count - mean * mean, 0.0)
+            results[name] = {
+                'mean': mean,
+                'std': var ** 0.5,
+            }
+
+        results['count'] = count
+
+        return results
     
-    # pickle
-    elif args.format == "pickle":
-        log("Pickle load")
-        basedir = os.path.join(dataset_dir, "%s.pickle" % modelname)
-        trainset = SimplePickleDataset(
-            basedir=basedir, label="trainset", var_config=var_config
-        )
-        valset = SimplePickleDataset(
-            basedir=basedir, label="valset", var_config=var_config
-        )
-        testset = SimplePickleDataset(
-            basedir=basedir, label="testset", var_config=var_config
-        )
-        pna_deg = trainset.pna_deg
-        if args.ddstore:
-            opt = {"ddstore_width": args.ddstore_width}
-            trainset = DistDataset(trainset, "trainset", comm, **opt)
-            valset = DistDataset(valset, "valset", comm, **opt)
-            testset = DistDataset(testset, "testset", comm, **opt)
-            trainset.pna_deg = pna_deg
-    else:
-        raise NotImplementedError("No supported format: %s" % (args.format))
-
-    log(
-        "trainset, valset, testset size: %d %d %d"
-        % (len(trainset), len(valset), len(testset))
-    )
-
-    if args.ddstore:
-        os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
-        os.environ["HYDRAGNN_USE_ddstore"] = "1"
-    
-    # get data loaders
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
-        trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
-    )
-
-    config = hydragnn.utils.input_config_parsing.update_config(
-        config, train_loader, val_loader, test_loader
-    )
-
-    comm.Barrier()
-
-    # LINE BELOW THROWS DIMENSION MISMATCH ERROR
-    # if output dimension is not invariant and not specified in the config and script
-    hydragnn.utils.input_config_parsing.save_config(config, log_name)
-
-    timer.stop()
-
     # ----------------------------------------------------------------------------------------------------
-    # train
+    # inference with streaming across MPI ranks
 
-    precision = args.precision.lower() if args.precision is not None else "fp32"
-    config["NeuralNetwork"]["Training"]["precision"] = precision
+    def run_streaming_inference(
+        self,
+        dataset,
+        evaluate=True,
+        criterions=['mse', 'mae', 'smooth_l1', 'rmse'],
+        return_numpy_matrices=False,
+        save_per_matrix_metrics=False,
+        batch_size=1,
+    ):
+        '''runs inference with model on preloaded or lazy dataset'''
 
-    model = hydragnn.models.create_model_config(
-        config=config["NeuralNetwork"],
-        verbosity=verbosity,
-    )
+        # disable matrix storage for streaming inference
+        if return_numpy_matrices:
+            raise NotImplementedError('return_numpy_matrices=True is disabled for streaming inference')
 
-    learning_rate = config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, min_lr=0.00001
-    )
+        inference_start_time = time.time()
+        max_size = QMugsDataset.max_padded_density_matrix_dimension
 
-    model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
-    )
+        # initialize local metric accumulators
+        streaming_state = None
+        if evaluate:
+            streaming_state = self._init_streaming_metric_state(criterions=criterions)
+        per_matrix_metrics = []
 
-    # Print details of neural network architecture
-    print_model(model)
+        # lazy dataloader
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
 
-    hydragnn.utils.model.load_existing_model_config(
-        model, config["NeuralNetwork"]["Training"], optimizer=optimizer
-    )
+        # run inference
+        for batch in loader:
+            batch = batch.to(self.device)
 
-    hydragnn.train.train_validate_test(
-        model,
-        optimizer,
-        train_loader,
-        val_loader,
-        test_loader,
-        writer,
-        scheduler,
-        config["NeuralNetwork"],
-        log_name,
-        verbosity,
-        create_plots=False,
-        compute_grad_energy=config["NeuralNetwork"]["Architecture"].get(
-            "enable_interatomic_potential", False
-        ),
-        precision=precision,
-    )
+            with torch.no_grad():
+                with self.autocast_ctx:
+                    pred = self.model(batch)
 
-    hydragnn.utils.model.save_model(model, optimizer, log_name)
-    hydragnn.utils.profiling_and_tracing.print_timers(verbosity)
-    if writer is not None:
-        writer.close()
+                # total density matrix prediction
+                if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
+                    pred_batch = pred[0].reshape(-1, max_size, max_size)
+                    true_batch = batch.density_matrix.reshape(-1, max_size, max_size)
+                    dims_batch = batch.density_matrix_dim
+                else:
+                    raise NotImplementedError
 
-    if tr.has("GPTLTracer"):
-        import gptl4py as gp
+                # postprocess matrices
+                for batch_index, (raw_pred_mat, raw_true_mat, dim) in enumerate(zip(
+                    pred_batch,
+                    true_batch,
+                    dims_batch,
+                )):
+                    assert(raw_pred_mat.shape == raw_true_mat.shape)
+                    assert(raw_pred_mat.shape[0] == max_size)
 
-        eligible = rank if args.everyone else 0
-        if rank == eligible:
-            gp.pr_file(os.path.join("logs", log_name, "gp_timing.p%d" % rank))
-        gp.pr_summary_file(os.path.join("logs", log_name, "gp_timing.summary"))
-        gp.finalize()
+                    # unpad matrices to original size
+                    dim = int(dim.item())
+                    pred_mat = raw_pred_mat[:dim, :dim]
+                    true_mat = raw_true_mat[:dim, :dim]
 
-    dist.destroy_process_group()
-    sys.exit(0)
+                    # evaluate and update streaming metrics
+                    if evaluate:
+                        self._update_streaming_metric_state(
+                            state=streaming_state,
+                            pred_mat=pred_mat,
+                            true_mat=true_mat,
+                            batch=batch,
+                            batch_index=batch_index,
+                            criterions=criterions,
+                            save_per_matrix_metrics=save_per_matrix_metrics,
+                            per_matrix_metrics=per_matrix_metrics,
+                        )
 
-    # ----------------------------------------------------------------------------------------------------
+                    # release matrices from memory
+                    del pred_mat
+                    del true_mat
+
+            del batch
+            del pred
+
+        # finalize metrics
+        evaluation = {}
+        if evaluate:
+            evaluation = self._finalize_streaming_metric_state(state=streaming_state)
+
+        inference_time = time.time() - inference_start_time
+        evaluation['inference_time'] = inference_time
+
+        return evaluation, per_matrix_metrics
+
+
+# ----------------------------------------------------------------------------------------------------
+# wrappers for per matrix reconstruction metrics
+
+def _as_numpy_density_matrix(mat):
+    '''convert a torch tensor or numpy array density matrix to a CPU numpy array'''
+    if torch.is_tensor(mat):
+        return mat.detach().cpu().numpy()
+    return np.asarray(mat)
+
+
+def _loss_value(pred_mat, true_mat, criterion):
+    '''wrapper for per matrix scalar reconstruction metric'''
+    loss_function = loss_function_selection(criterion)
+    loss = loss_function(pred_mat, true_mat)
+    return float(loss.detach().cpu().item() if torch.is_tensor(loss) else loss)
+
+
+def _trace_error(pred_mat, true_mat, eps=1e-12):
+    '''Absolute relative trace error for one matrix pair'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+    true_np = _as_numpy_density_matrix(true_mat)
+
+    trace_pred = float(np.trace(pred_np))
+    trace_true = float(np.trace(true_np))
+    value = abs((trace_pred - trace_true) / (trace_true + eps))
+
+    return value, trace_pred, trace_true
+
+
+def _hermitian_error(pred_mat, eps=1e-12):
+    '''relative Frobenius-norm hermitianity violation'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+
+    numerator = np.linalg.norm(pred_np - pred_np.T, ord="fro")
+    denominator = np.linalg.norm(pred_np, ord="fro") + eps
+
+    return float(numerator / denominator)
+
+
+def _psd_metrics(pred_mat):
+    '''minimum eigenvalue and number of negative eigenvalues of the symmetrized prediction'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+
+    sym_pred = 0.5 * (pred_np + pred_np.T)
+    eigvals = np.linalg.eigvalsh(sym_pred)
+
+    min_eigenvalue = float(np.min(eigvals))
+    negative_eigenvalue_count = int(np.sum(eigvals < 0.0))
+
+    return min_eigenvalue, negative_eigenvalue_count
+
+
+def _r2_per_matrix(pred_mat, true_mat, eps=1e-12):
+    '''per matrix R2 score'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+    true_np = _as_numpy_density_matrix(true_mat)
+
+    pred_flat = pred_np.ravel()
+    true_flat = true_np.ravel()
+
+    ss_res = np.sum((true_flat - pred_flat) ** 2)
+    ss_tot = np.sum((true_flat - np.mean(true_flat)) ** 2)
+
+    return float(1.0 - ss_res / (ss_tot + eps))
+
+
+def _relative_frobenius_error(pred_mat, true_mat, eps=1e-12):
+    '''relative frobenius error'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+    true_np = _as_numpy_density_matrix(true_mat)
+
+    numerator = np.linalg.norm(pred_np - true_np, ord="fro")
+    denominator = np.linalg.norm(true_np, ord="fro") + eps
+
+    return float(numerator / denominator)
+
+
+def _cosine_similarity(pred_mat, true_mat, eps=1e-12):
+    '''cosine similarity between flattened matrices'''
+    pred_np = _as_numpy_density_matrix(pred_mat)
+    true_np = _as_numpy_density_matrix(true_mat)
+
+    pred_flat = pred_np.ravel()
+    true_flat = true_np.ravel()
+
+    numerator = np.dot(pred_flat, true_flat)
+    denominator = np.linalg.norm(pred_flat) * np.linalg.norm(true_flat) + eps
+
+    return float(numerator / denominator)
+
+# ----------------------------------------------------------------------------------------------------

@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -A m4828
-#SBATCH -J HydraGNN-QMugs-Train
-#SBATCH -o job-%j.out
-#SBATCH -e job-%j.out
-#SBATCH -t 24:00:00
+#SBATCH -J QMugs-EDA
+#SBATCH -o eda-job-%j.out
+#SBATCH -e eda-job-%j.out
+#SBATCH -t 00:30:00
 #SBATCH -C cpu
-#SBATCH -q regular
-#SBATCH --nodes=2
+#SBATCH -q debug
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH -c 32
 
@@ -17,11 +17,11 @@ function cmd() {
 
 # --- Paths (override with environment variables if needed) ---
 HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/.conda/envs/.venv}
+VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
 EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
 
 # --- Perlmutter module + conda setup ---
-module reset
+# module reset
 ml nersc-default/1.0 || true
 ml conda/Miniforge3-24.11.3-0 || ml conda/Miniforge3-24.7.1-0
 
@@ -94,7 +94,7 @@ export HYDRAGNN_MASTER_ADDR=$MASTER_ADDR
 export HYDRAGNN_MASTER_PORT=$MASTER_PORT
 
 # FSDP knobs (for multi-dataset, set HYDRAGNN_USE_FSDP=0)
-export HYDRAGNN_USE_FSDP=1
+export HYDRAGNN_USE_FSDP=0
 export HYDRAGNN_FSDP_VERSION=2
 export HYDRAGNN_FSDP_STRATEGY=SHARD_GRAD_OP
 
@@ -106,5 +106,4 @@ fi
 cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/eda.py" \
-    --get_densmat_info \
-    --miniters=1000
+    --plot_matrix_size_histogram

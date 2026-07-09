@@ -35,14 +35,58 @@ def pad_density_matrix(density_matrix: np.ndarray, max_size: int):
     return padded
 
 
+def unpad_density_matrix(padded_density_matrix: np.ndarray, original_size: int):
+    '''unpads previously padded density matrix to original_size'''
+    N = padded_density_matrix.shape[0]
+    if N < original_size:
+        print(f"[WARNING] Padded density matrix of size {N} is smaller than original size {original_size}")
+        return padded_density_matrix
+
+    unpadded = padded_density_matrix[:original_size, :original_size]
+    return unpadded
+
+
+def get_density_matrix_upper_tr(density_matrix: np.ndarray):
+    '''returns the upper triangle of a density matrix'''
+    pass
+
+def get_density_matrix_from_upper_tr(density_matrix_upper_tr: np.ndarray):
+    '''given the upper triangle of a density matrix, mirrors it and returns the full matrix'''
+    pass
+
+
+# ----------------------------------------------------------------------------------------------------
+# density matrix postprocessing and downstream analysis
+
+
+
+# ----------------------------------------------------------------------------------------------------
+# masking
+
 def get_density_matrix_mask(
     wfn: psi4.core.Wavefunction,
     rng, # np.random.default_rng(random_state)
-    mask_method: str = 'unif_atoms',
+    mask_method: str = None,
     debug: bool = False,
     **kwargs,
 ):
-    '''returns binary mask for density matrix'''
+    '''
+    Returns binary mask for density matrix
+
+    Arguments
+    ---------
+    mask_method : str
+        This specifies the method of masking. Options are:
+        - 'unif_entries': uniformly masks out a specified percentage of entries
+        - 'unif_atoms': uniformly masks out a specified percentage of blocks corresponding to atom pairs
+
+    **kwargs
+    --------
+    perc_entries_masked : float
+        If mask_method = 'unif_entries', this is the percentage of entries masked out
+    perc_atom_pairs_masked : float
+        If mask_method = 'unif_atoms', this is the percentage of atom pair blocks masked out
+    '''
 
     # extract density matrix
     Da = wfn.Da().np
@@ -124,11 +168,17 @@ def get_density_matrix_mask(
         mask[(upper[1], upper[0])] = upper_mask
     
     # ...nothing else implemented
+    elif mask_method is None:
+        raise ValueError("Please specify a masking method, either 'unif_entries' or 'unif_atoms'")
+
     else:
         raise NotImplementedError
     
     # ensure mask is symmetric
     assert np.array_equal(mask, mask.T)
+
+    # ensure mask is right dimensions
+    assert Da.shape == mask.shape
 
     return mask, atoms_masked_dict
 
@@ -156,56 +206,6 @@ def plot_density_matrix_mask(
     plt.tight_layout()
     plt.savefig(out_name, dpi=300, bbox_inches="tight")
     plt.close()
-
-
-# ----------------------------------------------------------------------------------------------------
-# psi4 postprocess wrappers
-
-def psi4_wfn_from_prediction(
-    input_data_object,
-    pred_alpha_density_matrix,
-    pred_beta_density_matrix,
-):
-    '''get psi4.core.Wavefunction object with predicted density matrix, given the data object input to HydraGNN'''
-    
-    # extract props from data object
-    atomic_numbers = input_data_object.atomic_numbers.detach().cpu().numpy().astype(np.int32).ravel()
-    pos = input_data_object.pos.detach().cpu().numpy()
-    charge = int(input_data_object.charge.detach().cpu().item())
-    multiplicity = int(input_data_object.multiplicity.detach().cpu().item())
-
-    # reshape density matrices
-    Da = pred_alpha_density_matrix.reshape(2002, 2002).detach().cpu().numpy()
-    Db = pred_beta_density_matrix.reshape(2002, 2002).detach().cpu().numpy()
-    original_dim = int(input_data_object.density_matrix_dim.detach().cpu().item())
-    Da = Da[:original_dim, :original_dim]
-    Db = Db[:original_dim, :original_dim]
-
-    # build mol object
-    mol = psi4.core.Molecule.from_arrays(
-        geom=pos,
-        elez=atomic_numbers,
-        units='Angstrom',
-        molecular_charge=charge,
-        molecular_multiplicity=multiplicity,
-    )
-
-    # build basis and wfn
-    basis = psi4.core.BasisSet.build(mol, 'ORBITAL', 'def2-svp')
-    wfn = psi4.core.Wavefunction.build(mol, basis)
-
-    # add density matrices
-    Da = psi4.core.Matrix.from_array(Da.copy())
-    Db = psi4.core.Matrix.from_array(Db.copy())
-
-    wfn.Da().copy(Da)
-    wfn.Db().copy(Db)
-
-    return wfn
-
-
-# ----------------------------------------------------------------------------------------------------
-# loss function components for density matrix learning
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -332,7 +332,7 @@ def build_xyz_grid_by_num_points(
 
 
 # ----------------------------------------------------------------------------------------------------
-# distance measures between density matrices
+# distance measures between density matrices (UNUSED RIGHT NOW)
 
 def frobenius_dist(D1, D2, S1, S2, normalize=True):
     '''frobenius norm induced distance'''
@@ -365,7 +365,7 @@ if __name__ == "__main__":
 
     dirpwd = os.path.dirname(os.path.abspath(__file__))
 
-    wfn = psi4.core.Wavefunction.from_file('/pscratch/sd/w/wxrderek/qmugs/wfns/wfns_73/CHEMBL105792/wfn_conf_00.npy')
+    wfn = psi4.core.Wavefunction.from_file('/pscratch/sd/w/wxrderek/qmugs/wfns/wfns_15/CHEMBL1592087/wfn_conf_00.npy')
     rng = np.random.default_rng(0)
 
     mask, atoms_masked_dict = get_density_matrix_mask(
@@ -375,6 +375,7 @@ if __name__ == "__main__":
         perc_entries_masked=0.2,
         perc_atom_pairs_masked=0.1,
     )
+    print(mask.shape)
 
     print(atoms_masked_dict)
     plot_density_matrix_mask(
@@ -382,3 +383,6 @@ if __name__ == "__main__":
         mask=mask,
         out_name=os.path.join(dirpwd, 'densmat.png')
     )
+
+    mask_padded = pad_density_matrix(density_matrix=mask, max_size=2002)
+    print(mask_padded.shape)

@@ -846,7 +846,7 @@ class Base(Module):
             return outputs, outputs_var
         return outputs
 
-    def loss(self, pred, value, head_index):
+    def loss(self, pred, value, head_index, mask=None):
         var = None
         if self.var_output:
             var = pred[1]
@@ -854,7 +854,7 @@ class Base(Module):
         if self.ilossweights_nll == 1:
             return self.loss_nll(pred, value, head_index, var=var)
         elif self.ilossweights_hyperp == 1:
-            return self.loss_hpweighted(pred, value, head_index, var=var)
+            return self.loss_hpweighted(pred, value, head_index, mask=mask, var=var)
 
     def loss_nll(self, pred, value, head_index, var=None):
         # negative log likelihood loss
@@ -885,6 +885,12 @@ class Base(Module):
             head_pre = pred[ihead]
             pred_shape = head_pre.shape
             head_val = value[head_index[ihead]]
+
+            # ########
+            # print("==================== val shape BEFORE reshape:", head_val.shape)
+            # print("==================== pred shape BEFORE reshape:", head_pre.shape)
+            # ######
+
             value_shape = head_val.shape
             if pred_shape != value_shape:
                 head_val = torch.reshape(head_val, pred_shape)
@@ -896,10 +902,22 @@ class Base(Module):
 
                 # mask
                 if mask is not None:
+
                     head_mask = mask[head_index[ihead]]
                     mask_shape = head_mask.shape
+
+                    # ########
+                    # print("==================== val shape after reshape:", head_val.shape)
+                    # print("==================== pred shape after reshape:", head_pre.shape)
+                    # print("==================== mask shape BEFORE reshape:", head_mask.shape)
+                    # ########
+
                     if pred_shape != mask_shape:
                         head_mask = torch.reshape(head_mask, pred_shape).bool()
+                    
+                    # ########
+                    # print("==================== mask shape after reshape:", head_mask.shape)
+                    # ########
                     
                     head_loss = self.loss_function(
                         head_pre[head_mask],

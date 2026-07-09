@@ -614,10 +614,15 @@ def update_predicted_values(
         A Data object representing a structure that has atoms.
     """
     output_feature = []
+    output_mask = []
+    output_test_mask = []
     data.y_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
+    data.y_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
+    data.y_test_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
     for item in range(len(type)):
         if type[item] == "graph":
             index_counter_global_y = sum(graph_feature_dim[: index[item]])
+
             feat_ = torch.reshape(
                 data.y[
                     index_counter_global_y : index_counter_global_y
@@ -625,6 +630,33 @@ def update_predicted_values(
                 ],
                 (graph_feature_dim[index[item]], 1),
             )
+            
+            # process mask as needed
+            if getattr(data, 'y_mask', None) is not None:
+                mask_ = torch.reshape(
+                    data.y_mask[
+                        index_counter_global_y : index_counter_global_y
+                        + graph_feature_dim[index[item]]
+                    ],
+                    (graph_feature_dim[index[item]], 1),
+                )
+            
+                output_mask.append(mask_)
+                data.y_mask_loc[0, item + 1] = data.y_mask_loc[0, item] + mask_.shape[0] * mask_.shape[1]
+            
+            # process test mask as needed
+            if getattr(data, 'y_test_mask', None) is not None:
+                test_mask_ = torch.reshape(
+                    data.y_test_mask[
+                        index_counter_global_y : index_counter_global_y
+                        + graph_feature_dim[index[item]]
+                    ],
+                    (graph_feature_dim[index[item]], 1),
+                )
+            
+                output_test_mask.append(test_mask_)
+                data.y_test_mask_loc[0, item + 1] = data.y_test_mask_loc[0, item] + test_mask_.shape[0] * test_mask_.shape[1]
+
             # after the global features are spanned, we need to iterate over the nodal features
             # to do so, the counter of the nodal features need to start from the last value of counter for the graph nodel feature
         elif type[item] == "node":
@@ -642,6 +674,12 @@ def update_predicted_values(
             raise ValueError("Unknown output type", type[item])
         output_feature.append(feat_)
         data.y_loc[0, item + 1] = data.y_loc[0, item] + feat_.shape[0] * feat_.shape[1]
+    
+    if getattr(data, 'y_mask', None) is not None: 
+        data.y_mask = torch.cat(output_mask, 0)
+    if getattr(data, 'y_test_mask', None) is not None: 
+        data.y_test_mask = torch.cat(output_test_mask, 0)
+    
     data.y = torch.cat(output_feature, 0)
 
 

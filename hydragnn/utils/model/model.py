@@ -52,13 +52,13 @@ def loss_function_selection(loss_function_string: str):
     elif loss_function_string == "mae":
         return torch.nn.functional.l1_loss
     elif loss_function_string == "smooth_l1":
-        return torch.nn.SmoothL1Loss
+        return torch.nn.functional.smooth_l1_loss
     elif loss_function_string == "rmse":
         return lambda x, y: torch.sqrt(torch.nn.functional.mse_loss(x, y))
     elif loss_function_string == "GaussianNLLLoss":
         return torch.nn.GaussianNLLLoss()
     else:
-        ImportError
+        raise ImportError()
 
 
 def multitask_optim_state_dict(model, optimizer):

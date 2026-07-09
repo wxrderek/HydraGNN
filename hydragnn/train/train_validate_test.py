@@ -195,6 +195,7 @@ def train_validate_test(
     verbosity=0,
     plot_init_solution=True,
     plot_hist_solution=False,
+    skip_prediction_plots=False,
     create_plots=False,
     use_deepspeed=False,
     compute_grad_energy=False,
@@ -271,7 +272,9 @@ def train_validate_test(
         )
         visualizer.num_nodes_plot()
 
-    if create_plots and plot_init_solution:  # visualizing of initial conditions
+    plot_predictions = create_plots and not skip_prediction_plots
+
+    if plot_predictions and plot_init_solution:  # visualizing of initial conditions
         _, _, true_values, predicted_values = test(
             test_loader,
             model,
@@ -363,7 +366,7 @@ def train_validate_test(
             verbosity,
             num_tasks=num_tasks,
             reduce_ranks=True,
-            return_samples=plot_hist_solution,
+            return_samples=plot_hist_solution and not skip_prediction_plots,
             compute_grad_energy=compute_grad_energy,
             precision=precision,
         )
@@ -401,7 +404,7 @@ def train_validate_test(
         task_loss_test[epoch, :] = test_taskserr
 
         ###tracking the solution evolving with training
-        if plot_hist_solution:
+        if plot_hist_solution and not skip_prediction_plots:
             visualizer.create_scatter_plots(
                 true_values,
                 predicted_values,
@@ -447,37 +450,39 @@ def train_validate_test(
         task_loss_val = reduce_values_ranks(task_loss_val)
         task_loss_test = reduce_values_ranks(task_loss_test)
 
-        # At the end of training phase, do the one test run for visualizer to get latest predictions
-        test_loss, test_taskserr, true_values, predicted_values = test(
-            test_loader,
-            model,
-            verbosity,
-            precision=precision,
-            compute_grad_energy=compute_grad_energy,
-            num_tasks=num_tasks,
-        )
-
-        ##output predictions with unit/not normalized
-        if config["Variables_of_interest"]["denormalize_output"]:
-            true_values, predicted_values = output_denormalize(
-                config["Variables_of_interest"]["y_minmax"],
-                true_values,
-                predicted_values,
+        if plot_predictions:
+            # At the end of training phase, do the one test run for visualizer to get latest predictions
+            test_loss, test_taskserr, true_values, predicted_values = test(
+                test_loader,
+                model,
+                verbosity,
+                precision=precision,
+                compute_grad_energy=compute_grad_energy,
+                num_tasks=num_tasks,
             )
+
+            ##output predictions with unit/not normalized
+            if config["Variables_of_interest"]["denormalize_output"]:
+                true_values, predicted_values = output_denormalize(
+                    config["Variables_of_interest"]["y_minmax"],
+                    true_values,
+                    predicted_values,
+                )
 
     _, rank = get_comm_size_and_rank()
     if create_plots and rank == 0:
         ######result visualization######
-        visualizer.create_plot_global(
-            true_values,
-            predicted_values,
-            output_names=output_names,
-        )
-        visualizer.create_scatter_plots(
-            true_values,
-            predicted_values,
-            output_names=output_names,
-        )
+        if plot_predictions:
+            visualizer.create_plot_global(
+                true_values,
+                predicted_values,
+                output_names=output_names,
+            )
+            visualizer.create_scatter_plots(
+                true_values,
+                predicted_values,
+                output_names=output_names,
+            )
         ######plot loss history#####
         visualizer.plot_history(
             total_loss_train,
@@ -733,7 +738,9 @@ def train(
                 # Perform forward pass and backward pass under autocast
                 with autocast_context:
                     pred = model(data)
-                    loss, tasks_loss = model.module.loss(pred, data.y, head_index)
+                    mask = getattr(data, 'y_mask', None)
+                    # mask = data.y_mask
+                    loss, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
             if trace_level > 0:
                 tr.start("forward_sync", **syncopt)
                 MPI.COMM_WORLD.Barrier()
@@ -848,7 +855,9 @@ def validate(
             with autocast_context:
                 head_index = get_head_indices(model, data)
                 pred = model(data)
-                error, tasks_loss = model.module.loss(pred, data.y, head_index)
+                mask = getattr(data, 'y_mask', None)
+                # mask = data.y_mask
+                error, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
         error = error.detach()
         if torch.is_tensor(tasks_loss):
             tasks_loss = tasks_loss.detach()
@@ -929,7 +938,9 @@ def test(
             with autocast_context:
                 head_index = get_head_indices(model, data)
                 pred = model(data)
-                error, tasks_loss = model.module.loss(pred, data.y, head_index)
+                # mask = data.y_test_mask
+                mask = getattr(data, 'y_test_mask', None)
+                error, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
         ## FIXME: temporary
         if int(os.getenv("HYDRAGNN_DUMP_TESTDATA", "0")) == 1:
             if model.module.var_output:

@@ -846,7 +846,16 @@ class Base(Module):
             return outputs, outputs_var
         return outputs
 
-    def loss(self, pred, value, head_index, mask=None):
+    def loss(
+        self,
+        pred,
+        value,
+        head_index,
+        mask=None,
+        mask_loc=None,
+        target_dim=None,
+        use_padding_mask=False,
+    ):
         var = None
         if self.var_output:
             var = pred[1]
@@ -854,7 +863,16 @@ class Base(Module):
         if self.ilossweights_nll == 1:
             return self.loss_nll(pred, value, head_index, var=var)
         elif self.ilossweights_hyperp == 1:
-            return self.loss_hpweighted(pred, value, head_index, mask=mask, var=var)
+            return self.loss_hpweighted(
+                pred,
+                value,
+                head_index,
+                mask=mask,
+                mask_loc=mask_loc,
+                target_dim=target_dim,
+                use_padding_mask=use_padding_mask,
+                var=var,
+            )
 
     def loss_nll(self, pred, value, head_index, var=None):
         # negative log likelihood loss
@@ -877,7 +895,157 @@ class Base(Module):
 
         return nll_loss, tasks_mseloss, []
 
-    def loss_hpweighted(self, pred, value, head_index, mask=None, var=None):
+    # ----------------------------------------------------------------------------------------------------
+    # new graph-level target masking treatment (Derek)
+
+    def _compact_target_indices(
+        self,
+        head_dim,
+        compact_length,
+        target_dim,
+        device,
+    ):
+        """Return padded-vector indices corresponding to one compact graph target."""
+
+        if target_dim is not None:
+            target_dim = int(target_dim.item())
+
+            # head_dim is the padded graph output length, e.g. N_pad**2 for density matrices.
+            full_matrix_dim = int(head_dim ** 0.5)
+
+            if (
+                full_matrix_dim * full_matrix_dim == head_dim
+                and target_dim * target_dim == compact_length
+            ):
+                # compact mask has shape (n_basis, n_basis), but target has shape (N_pad, N_pad).
+                row_indices = torch.arange(target_dim, device=device).reshape(-1, 1)
+                col_indices = torch.arange(target_dim, device=device).reshape(1, -1)
+
+                # row-major indices select the physical upper-left block inside the padded target.
+                return (row_indices * full_matrix_dim + col_indices).reshape(-1)
+
+            if target_dim == compact_length:
+                # 1D graph target: compact mask corresponds to the first target_dim vector entries.
+                return torch.arange(target_dim, device=device)
+
+        if compact_length > head_dim:
+            raise ValueError("Compact mask has more entries than the corresponding graph output")
+
+        # 1D graph target without an auxiliary target dimension.
+        return torch.arange(compact_length, device=device)
+
+    def _compact_or_padding_mask_loss(
+        self,
+        head_pre,
+        head_val,
+        ihead,
+        mask=None,
+        mask_loc=None,
+        target_dim=None,
+        use_padding_mask=False,
+    ):
+        """Compute loss for compact graph masks or reconstructed padding masks."""
+
+        if not use_padding_mask:
+            # Return to the legacy dense-mask path unless the provided mask is compact.
+            if mask is None or mask_loc is None or mask.numel() == head_val.numel():
+                return None
+
+        if head_pre.dim() != 2:
+            raise ValueError("Compact masks are supported only for graph-level outputs")
+
+        # head_pre and head_val have shape (batch_size, head_dim) for graph-level outputs.
+        batch_size = head_pre.shape[0]
+        head_dim = head_pre.shape[1]
+        device = head_pre.device
+
+        # compact mask entries for all samples are concatenated into one 1D vector.
+        mask_flat = None if mask is None else mask.reshape(-1).bool()
+
+        if mask_loc is not None:
+            mask_loc = mask_loc.to(device=device, dtype=torch.int64)
+            if mask_loc.dim() == 1:
+                mask_loc = mask_loc.reshape(1, -1)
+            if mask_loc.shape[0] != batch_size:
+                raise ValueError("mask_loc batch dimension does not match predictions")
+
+            # mask_loc stores per-sample, per-head offsets; batching concatenates sample masks.
+            mask_sample_size = mask_loc[:, -1]
+            mask_sample_start = torch.cumsum(mask_sample_size, dim=0) - mask_sample_size
+        elif not use_padding_mask:
+            return None
+
+        target_dim_flat = None
+        if target_dim is not None:
+            # For QMugs, target_dim is n_basis for each molecule in the batch.
+            target_dim_flat = target_dim.reshape(-1).to(device=device)
+            if target_dim_flat.shape[0] != batch_size:
+                raise ValueError("target_dim batch dimension does not match predictions")
+
+        selected_pred = []
+        selected_val = []
+        for isample in range(batch_size):
+            sample_target_dim = None if target_dim_flat is None else target_dim_flat[isample]
+
+            if mask_flat is not None:
+                # Extract the compact mask for this sample and this output head.
+                mask_start = int((mask_sample_start[isample] + mask_loc[isample, ihead]).item())
+                mask_end = int((mask_sample_start[isample] + mask_loc[isample, ihead + 1]).item())
+                sample_mask = mask_flat[mask_start:mask_end]
+                compact_length = sample_mask.numel()
+            else:
+                # Reconstruct the unpadded physical size when no explicit test mask is stored.
+                full_matrix_dim = int(head_dim ** 0.5)
+                if (
+                    sample_target_dim is not None
+                    and full_matrix_dim * full_matrix_dim == head_dim
+                ):
+                    compact_length = int(sample_target_dim.item()) ** 2
+                elif sample_target_dim is not None:
+                    compact_length = int(sample_target_dim.item())
+                else:
+                    compact_length = head_dim
+                sample_mask = None
+
+            # Map compact entries to indices in the padded graph output vector.
+            target_indices = self._compact_target_indices(
+                head_dim=head_dim,
+                compact_length=compact_length,
+                target_dim=sample_target_dim,
+                device=device,
+            )
+            if sample_mask is not None:
+                if sample_mask.numel() != target_indices.numel():
+                    raise ValueError("Compact mask length does not match selected target entries")
+
+                # Apply the explicit compact mask inside the unpadded physical region.
+                target_indices = target_indices[sample_mask]
+
+            # Store selected entries; samples may have different n_basis and mask sizes.
+            selected_pred.append(head_pre[isample, target_indices])
+            selected_val.append(head_val[isample, target_indices])
+
+        # Loss is computed over all selected scalar entries from all samples in the batch.
+        selected_pred = torch.cat(selected_pred, dim=0)
+        selected_val = torch.cat(selected_val, dim=0)
+        if selected_pred.numel() == 0:
+            raise ValueError("Mask selected zero graph-target entries")
+
+        return self.loss_function(selected_pred, selected_val)
+
+    # ----------------------------------------------------------------------------------------------------
+
+    def loss_hpweighted(
+        self,
+        pred,
+        value,
+        head_index,
+        mask=None,
+        mask_loc=None,
+        target_dim=None,
+        use_padding_mask=False,
+        var=None,
+    ):
         # weights for different tasks as hyper-parameters
         tot_loss = 0
         tasks_loss = []
@@ -901,7 +1069,23 @@ class Base(Module):
                 ), "Expecting var for GaussianNLLLoss, but got None"
 
                 # mask
-                if mask is not None:
+                compact_loss = None
+                if self.head_type[ihead] == "graph":
+                    compact_loss = self._compact_or_padding_mask_loss(
+                        head_pre=head_pre,
+                        head_val=head_val,
+                        ihead=ihead,
+                        mask=mask,
+                        mask_loc=mask_loc,
+                        target_dim=target_dim,
+                        use_padding_mask=use_padding_mask,
+                    )
+
+                if compact_loss is not None:
+                    tot_loss += compact_loss * self.loss_weights[ihead]
+                    tasks_loss.append(compact_loss)
+
+                elif mask is not None:
 
                     head_mask = mask[head_index[ihead]]
                     mask_shape = head_mask.shape
@@ -913,7 +1097,8 @@ class Base(Module):
                     # ########
 
                     if pred_shape != mask_shape:
-                        head_mask = torch.reshape(head_mask, pred_shape).bool()
+                        head_mask = torch.reshape(head_mask, pred_shape)
+                    head_mask = head_mask.bool()
                     
                     # ########
                     # print("==================== mask shape after reshape:", head_mask.shape)

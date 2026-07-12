@@ -739,8 +739,17 @@ def train(
                 with autocast_context:
                     pred = model(data)
                     mask = getattr(data, 'y_mask', None)
-                    # mask = data.y_mask
-                    loss, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
+                    mask_loc = getattr(data, 'y_mask_loc', None)
+                    # QMugs density_matrix_dim has shape (batch_size,) after batching
+                    target_dim = getattr(data, 'density_matrix_dim', None)
+                    loss, tasks_loss = model.module.loss(
+                        pred,
+                        data.y,
+                        head_index=head_index,
+                        mask=mask,
+                        mask_loc=mask_loc,
+                        target_dim=target_dim,
+                    )
             if trace_level > 0:
                 tr.start("forward_sync", **syncopt)
                 MPI.COMM_WORLD.Barrier()
@@ -856,8 +865,17 @@ def validate(
                 head_index = get_head_indices(model, data)
                 pred = model(data)
                 mask = getattr(data, 'y_mask', None)
-                # mask = data.y_mask
-                error, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
+                mask_loc = getattr(data, 'y_mask_loc', None)
+                # QMugs density_matrix_dim has shape (batch_size,) after batching
+                target_dim = getattr(data, 'density_matrix_dim', None)
+                error, tasks_loss = model.module.loss(
+                    pred,
+                    data.y,
+                    head_index=head_index,
+                    mask=mask,
+                    mask_loc=mask_loc,
+                    target_dim=target_dim,
+                )
         error = error.detach()
         if torch.is_tensor(tasks_loss):
             tasks_loss = tasks_loss.detach()
@@ -938,9 +956,20 @@ def test(
             with autocast_context:
                 head_index = get_head_indices(model, data)
                 pred = model(data)
-                # mask = data.y_test_mask
                 mask = getattr(data, 'y_test_mask', None)
-                error, tasks_loss = model.module.loss(pred, data.y, head_index=head_index, mask=mask)
+                mask_loc = getattr(data, 'y_test_mask_loc', None)
+                # If y_test_mask is absent, QMugs test loss uses density_matrix_dim to ignore padding
+                target_dim = getattr(data, 'density_matrix_dim', None)
+                use_padding_mask = mask is None and target_dim is not None
+                error, tasks_loss = model.module.loss(
+                    pred,
+                    data.y,
+                    head_index=head_index,
+                    mask=mask,
+                    mask_loc=mask_loc,
+                    target_dim=target_dim,
+                    use_padding_mask=use_padding_mask,
+                )
         ## FIXME: temporary
         if int(os.getenv("HYDRAGNN_DUMP_TESTDATA", "0")) == 1:
             if model.module.var_output:

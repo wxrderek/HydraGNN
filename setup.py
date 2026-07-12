@@ -35,10 +35,10 @@ def get_install_requires():
     requirements.extend(parse_requirements("requirements-base.txt"))
 
     # Read PyTorch requirements
-    requirements.extend(parse_requirements("requirements-torch.txt"))
+    # requirements.extend(parse_requirements("requirements-torch.txt"))
 
     # Read PyTorch Geometric requirements
-    requirements.extend(parse_requirements("requirements-pyg.txt"))
+    # requirements.extend(parse_requirements("requirements-pyg.txt"))
 
     return requirements
 

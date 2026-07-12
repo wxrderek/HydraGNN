@@ -616,6 +616,28 @@ def update_predicted_values(
     output_feature = []
     output_mask = []
     output_test_mask = []
+    raw_y_mask = getattr(data, 'y_mask', None)
+    raw_y_mask_loc = getattr(data, 'y_mask_loc', None)
+    raw_y_test_mask = getattr(data, 'y_test_mask', None)
+    raw_y_test_mask_loc = getattr(data, 'y_test_mask_loc', None)
+    compact_y_mask = raw_y_mask is not None and raw_y_mask.numel() != data.y.numel()
+    compact_y_test_mask = raw_y_test_mask is not None and raw_y_test_mask.numel() != data.y.numel()
+    if compact_y_mask and raw_y_mask_loc is None:
+        if len(type) != 1 or type[0] != "graph":
+            raise ValueError("Compact graph-level y_mask requires y_mask_loc for multi-head outputs")
+        raw_y_mask_loc = torch.tensor(
+            [[0, raw_y_mask.numel()]], dtype=torch.int64, device=data.x.device
+        )
+    if compact_y_test_mask and raw_y_test_mask_loc is None:
+        if len(type) != 1 or type[0] != "graph":
+            raise ValueError("Compact graph-level y_test_mask requires y_test_mask_loc for multi-head outputs")
+        raw_y_test_mask_loc = torch.tensor(
+            [[0, raw_y_test_mask.numel()]], dtype=torch.int64, device=data.x.device
+        )
+    if raw_y_mask_loc is not None:
+        raw_y_mask_loc = raw_y_mask_loc.to(device=data.x.device, dtype=torch.int64).reshape(1, -1)
+    if raw_y_test_mask_loc is not None:
+        raw_y_test_mask_loc = raw_y_test_mask_loc.to(device=data.x.device, dtype=torch.int64).reshape(1, -1)
     data.y_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
     data.y_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
     data.y_test_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
@@ -632,27 +654,39 @@ def update_predicted_values(
             )
             
             # process mask as needed
-            if getattr(data, 'y_mask', None) is not None:
-                mask_ = torch.reshape(
-                    data.y_mask[
-                        index_counter_global_y : index_counter_global_y
-                        + graph_feature_dim[index[item]]
-                    ],
-                    (graph_feature_dim[index[item]], 1),
-                )
+            if raw_y_mask is not None:
+                if compact_y_mask:
+                    mask_start = int(raw_y_mask_loc[0, item].item())
+                    mask_end = int(raw_y_mask_loc[0, item + 1].item())
+                    # compact graph mask has shape (n_mask_entries, 1), with n_mask_entries <= graph_feature_dim
+                    mask_ = torch.reshape(raw_y_mask.reshape(-1)[mask_start:mask_end], (-1, 1))
+                else:
+                    mask_ = torch.reshape(
+                        raw_y_mask[
+                            index_counter_global_y : index_counter_global_y
+                            + graph_feature_dim[index[item]]
+                        ],
+                        (graph_feature_dim[index[item]], 1),
+                    )
             
                 output_mask.append(mask_)
                 data.y_mask_loc[0, item + 1] = data.y_mask_loc[0, item] + mask_.shape[0] * mask_.shape[1]
             
             # process test mask as needed
-            if getattr(data, 'y_test_mask', None) is not None:
-                test_mask_ = torch.reshape(
-                    data.y_test_mask[
-                        index_counter_global_y : index_counter_global_y
-                        + graph_feature_dim[index[item]]
-                    ],
-                    (graph_feature_dim[index[item]], 1),
-                )
+            if raw_y_test_mask is not None:
+                if compact_y_test_mask:
+                    test_mask_start = int(raw_y_test_mask_loc[0, item].item())
+                    test_mask_end = int(raw_y_test_mask_loc[0, item + 1].item())
+                    # compact graph test mask has shape (n_mask_entries, 1)
+                    test_mask_ = torch.reshape(raw_y_test_mask.reshape(-1)[test_mask_start:test_mask_end], (-1, 1))
+                else:
+                    test_mask_ = torch.reshape(
+                        raw_y_test_mask[
+                            index_counter_global_y : index_counter_global_y
+                            + graph_feature_dim[index[item]]
+                        ],
+                        (graph_feature_dim[index[item]], 1),
+                    )
             
                 output_test_mask.append(test_mask_)
                 data.y_test_mask_loc[0, item + 1] = data.y_test_mask_loc[0, item] + test_mask_.shape[0] * test_mask_.shape[1]
@@ -660,6 +694,8 @@ def update_predicted_values(
             # after the global features are spanned, we need to iterate over the nodal features
             # to do so, the counter of the nodal features need to start from the last value of counter for the graph nodel feature
         elif type[item] == "node":
+            if compact_y_mask or compact_y_test_mask:
+                raise ValueError("Compact masks are supported only for graph-level outputs")
             index_counter_nodal_y = sum(node_feature_dim[: index[item]])
             feat_ = torch.reshape(
                 data.x[
@@ -675,9 +711,9 @@ def update_predicted_values(
         output_feature.append(feat_)
         data.y_loc[0, item + 1] = data.y_loc[0, item] + feat_.shape[0] * feat_.shape[1]
     
-    if getattr(data, 'y_mask', None) is not None: 
+    if raw_y_mask is not None: 
         data.y_mask = torch.cat(output_mask, 0)
-    if getattr(data, 'y_test_mask', None) is not None: 
+    if raw_y_test_mask is not None: 
         data.y_test_mask = torch.cat(output_test_mask, 0)
     
     data.y = torch.cat(output_feature, 0)

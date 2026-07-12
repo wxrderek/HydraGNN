@@ -54,9 +54,6 @@ except ImportError:
 
 from qmugs import (
     QMugsDataset,
-    NUM_MOLECULES,
-    NUM_CONFORMERS,
-    BOHR_PER_ANGSTROM,
 )
 
 # ----------------------------------------------------------------------------------------------------
@@ -101,6 +98,17 @@ if __name__ == "__main__":
 
     parser.add_argument("--perc_load", type=float, help="percentage of all molecules in dataset to load", default=0.0001)
     parser.add_argument("--perc_train", type=float, help="percentage of loaded moledules to assign to train set", default=0.8)
+    parser.add_argument(
+        "--max_density_matrix_size",
+        type=int,
+        help="maximum density matrix dimension allowed in sampled molecules",
+        default=None,
+    )
+    parser.add_argument(
+        "--update_max_padded_dimension",
+        action="store_true",
+        help="set the padded density matrix dimension to max_density_matrix_size",
+    )
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -133,10 +141,22 @@ if __name__ == "__main__":
         
     dataset_dir = download_config.get('data_dir', './dataset')    
     verbosity = config["Verbosity"]["level"]
+
+    if args.update_max_padded_dimension:
+        if args.max_density_matrix_size is None:
+            raise ValueError(
+                "--update_max_padded_dimension requires --max_density_matrix_size"
+            )
+        QMugsDataset.max_padded_density_matrix_dimension = args.max_density_matrix_size
+
     padding_dim = int((QMugsDataset.max_padded_density_matrix_dimension)**2)
     
     # set up features
     var_config = config["NeuralNetwork"]["Variables_of_interest"]
+
+    if args.update_max_padded_dimension:
+        var_config["output_dim"] = [padding_dim] * len(var_config["output_names"])
+
     if var_config["output_names"] == ['density_matrix']:
         graph_feature_names = ['density_matrix']
         graph_feature_dims = [padding_dim]
@@ -161,7 +181,7 @@ if __name__ == "__main__":
     mask_output_loss = var_config.get("mask_output_loss", None)
 
     # ensure consistent padded matrix dimensions
-    assert (var_config["output_dim"][0] == padding_dim)
+    assert all(output_dim == padding_dim for output_dim in var_config["output_dim"])
 
     # reset batch size and epochs if specified
     if args.batch_size is not None:
@@ -217,6 +237,8 @@ if __name__ == "__main__":
                 comm=comm,
                 perc_load=args.perc_load,
                 perc_train=args.perc_train,
+                max_density_matrix_size=args.max_density_matrix_size,
+                update_max_padded_dimension=args.update_max_padded_dimension,
                 use_subdir=True,
                 nmax_persubdir=10_000,
                 compute_pna_deg=True,
@@ -237,6 +259,8 @@ if __name__ == "__main__":
             trainset, valset, testset, split_sizes = dataset_object.load_and_split_dataset(
                 perc_load=args.perc_load, 
                 perc_train=args.perc_train,
+                max_density_matrix_size=args.max_density_matrix_size,
+                update_max_padded_dimension=args.update_max_padded_dimension,
             )
             end = time.perf_counter()
 

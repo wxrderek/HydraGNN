@@ -80,9 +80,11 @@ export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
 export BATCH_SIZE=32
 export NUM_EPOCH=5
+export MAX_DENSITY_MATRIX_SIZE=800
+export UPDATE_MAX_PADDED_DIMENSION=1
 
 export HYDRAGNN_DDSTORE_METHOD=1
-export HYDRAGNN_CUSTOM_DATALOADER=1
+export HYDRAGNN_CUSTOM_DATALOADER=0
 
 # Distributed rendezvous for torch/c10d
 MASTER_HOST=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
@@ -105,15 +107,25 @@ if [ "$TASK_PARALLEL" = "1" ]; then
     TASK_PARALLEL_ARG="--task_parallel"
 fi
 
-cmd srun -N$SLURM_JOB_NUM_NODES -n1 -c32 --ntasks-per-node=1 -l --kill-on-bad-exit=1 \
+SIZE_AWARE_ARGS=()
+if [ -n "${MAX_DENSITY_MATRIX_SIZE:-}" ]; then
+    SIZE_AWARE_ARGS+=(--max_density_matrix_size="$MAX_DENSITY_MATRIX_SIZE")
+fi
+if [ "$UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
+    SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
+fi
+
+cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=1 -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
-    --log=qmugs-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION-TP$TASK_PARALLEL --everyone \
+    --log=qmugs-pre-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION --everyone \
     --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
     --perc_load=0.01 \
     --perc_train=0.8 \
+    "${SIZE_AWARE_ARGS[@]}" \
     --preonly \
+    --streaming_preonly \
     --modelname="QMugs001"

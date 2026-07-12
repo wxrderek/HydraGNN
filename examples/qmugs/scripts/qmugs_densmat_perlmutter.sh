@@ -84,27 +84,11 @@ export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
 export BATCH_SIZE=32
 export NUM_EPOCH=5
+# export MAX_DENSITY_MATRIX_SIZE=800
+export UPDATE_MAX_PADDED_DIMENSION=0
 
 export HYDRAGNN_DDSTORE_METHOD=1
-export HYDRAGNN_CUSTOM_DATALOADER=1
-
-# Dataset ordering matches gfm_deephyper_multi_all_mpnn.py multi_model_list
-# export datadir0=Alexandria
-# export datadir1=ANI1x
-# export datadir2=MPTrj
-# export datadir3=OC2020
-# export datadir4=OC2022
-# export datadir5=OC25
-# export datadir6=ODAC23
-# export datadir7=OMat24
-# export datadir8=OMol25
-# export datadir9=OMol25-neutral
-# export datadir10=OMol25-non-neutral
-# export datadir11=OPoly2026
-# export datadir12=Nabla2DFT
-# export datadir13=QCML
-# export datadir14=QM7X
-# export datadir15=transition1x
+export HYDRAGNN_CUSTOM_DATALOADER=0
 
 # Single-dataset default (same as Frontier script). For multi-dataset, use the full list.
 MULTI_MODEL_LIST=$datadir0
@@ -131,14 +115,23 @@ if [ "$TASK_PARALLEL" = "1" ]; then
     TASK_PARALLEL_ARG="--task_parallel"
 fi
 
+SIZE_AWARE_ARGS=()
+if [ -n "${MAX_DENSITY_MATRIX_SIZE:-}" ]; then
+    SIZE_AWARE_ARGS+=(--max_density_matrix_size="$MAX_DENSITY_MATRIX_SIZE")
+fi
+if [ "$UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
+    SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
+fi
+
 cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 --gpus-per-task=1 --gpu-bind=none -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
-    --log=qmugs-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION-TP$TASK_PARALLEL --everyone \
+    --log=qmugs-train-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION--everyone \
     --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
     --perc_load=0.01 \
     --perc_train=0.8 \
+    "${SIZE_AWARE_ARGS[@]}" \
     --modelname="QMugs001"

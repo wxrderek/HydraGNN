@@ -26,7 +26,7 @@
           "num_sharedlayers": 2,
           "dim_sharedlayers": 50,
           "num_headlayers": 2,
-          "dim_headlayers": [50, 25]
+          "dim_headlayers": [50, 100]
         }
       },
       "task_weights": [1.0]
@@ -52,6 +52,7 @@
     "Training": {
       "num_epoch": 5,
       "EarlyStopping": true,
+      "Checkpoint": true,
       "perc_train": 0.8,
       "batch_size": 32,
       "continue": 0,

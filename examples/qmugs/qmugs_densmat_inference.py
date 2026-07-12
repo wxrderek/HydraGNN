@@ -5,6 +5,7 @@ from mpi4py import MPI
 import argparse
 import time
 import glob
+import importlib.util
 
 import random
 import numpy as np
@@ -50,161 +51,383 @@ except ImportError:
 
 from qmugs import QMugsDataset, QMugsInference
 
-# ----------------------------------------------------------------------------------------------------
-# setup logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format=f"%(levelname)s : %(message)s",
-    datefmt="%H:%M:%S"
-)
-log_name = "QMugs_inference"
-hydragnn.utils.print.setup_log(log_name)
-writer = hydragnn.utils.model.get_summary_writer(log_name)
+def _load_figs_main():
+    '''load figs.py without ambiguity from the figs/ package directory'''
 
-log("Command: {0}\n".format(" ".join([x for x in sys.argv])), rank=0)
-log(f'Random seed used for run: {random_state}', rank=0)
-
-# ----------------------------------------------------------------------------------------------------
-# additional evaluation criteria
-
-def evaluate_matrix_constraints(all_pred, all_true, eps=1e-12):
-    '''metrics for evaluating constraints on predicted density matrices'''
-
-     # validate input and convert to numpy
-    assert len(all_pred) == len(all_true)
-    if torch.is_tensor(all_pred[0]):
-        all_pred = [pred_mat.detach().cpu().numpy() for pred_mat in all_pred]
-    if torch.is_tensor(all_true[0]):
-        all_true = [true_mat.detach().cpu().numpy() for true_mat in all_true]
-
-    trace_errors = []
-    trace_comp = []
-    hermitian_errors = []
-    min_eigenvalues = []
-    num_negative_eigenvalues = []
-
-    for pred_mat, true_mat in zip(all_pred, all_true):
-        assert pred_mat.shape == true_mat.shape
-
-        # relative trace error
-        trace_error = (np.trace(pred_mat) - np.trace(true_mat)) / (np.trace(true_mat) + eps)
-        trace_errors.append(float(abs(trace_error)))
-        trace_comp.append([float(np.trace(pred_mat)), float(np.trace(true_mat))])
-
-        # hermitianity error in relative frobenius norm
-        hermitian_error = np.linalg.norm(pred_mat - pred_mat.T, ord="fro") / (np.linalg.norm(pred_mat, ord="fro") + eps)
-        hermitian_errors.append(float(hermitian_error))
-
-        # PSD violation
-        eigvals = np.linalg.eigvalsh((pred_mat + pred_mat.T) / 2)
-        min_eigenvalues.append(float(np.min(eigvals)))
-
-        negative = eigvals[eigvals < 0.0]
-        num_negative_eigenvalues.append(int(len(negative)))
+    # figs.py and the figs/ helper directory share a name, so load by path
+    figs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "figs.py")
+    spec = importlib.util.spec_from_file_location("qmugs_figs_main", figs_path)
+    figs_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(figs_module)
+    return figs_module.main
 
 
-    return {
-        "trace_error": {
-            "mean": float(np.mean(trace_errors)),
-            "std": float(np.std(trace_errors)),
-            "values": trace_errors,
-            "trace_comp": trace_comp,
-        },
+def _figs_sample_mode(args):
+    '''return the selected figure sampling mode'''
 
-        "hermitian_error": {
-            "mean": float(np.mean(hermitian_errors)),
-            "std": float(np.std(hermitian_errors)),
-            "values": hermitian_errors,
-        },
+    # random molecule sampling is the default when neither flag is passed
+    if args.figs_smallest_molecules:
+        return "smallest_molecules"
+    if args.figs_best_conformers:
+        return "best_conformers"
+    return "random_molecules"
 
-        "minimum_eigenvalue": {
-            "mean": float(np.mean(min_eigenvalues)),
-            "std": float(np.std(min_eigenvalues)),
-            "values": min_eigenvalues,
-        },
 
-        "negative_eigenvalue_count": {
-            "mean": float(np.mean(num_negative_eigenvalues)),
-            "std": float(np.std(num_negative_eigenvalues)),
-            "values": num_negative_eigenvalues,
-        },
+def _pre_mpi_rank():
+    '''infer rank before distributed setup is initialized'''
+
+    # use common launcher rank variables, falling back to single-process rank zero
+    for rank_name in ['SLURM_PROCID', 'PMI_RANK', 'OMPI_COMM_WORLD_RANK', 'RANK']:
+        rank_value = os.environ.get(rank_name)
+        if rank_value is not None:
+            return int(rank_value)
+
+    return 0
+
+
+def _save_inference_run_config(args, random_state: int):
+    '''save run-defining inference configuration before inference starts'''
+
+    if _pre_mpi_rank() != 0:
+        return None
+
+    log_dir = os.path.join("logs", args.log)
+    os.makedirs(log_dir, exist_ok=True)
+    output_path = os.path.join(log_dir, "inference_run_config.json")
+
+    psi4_version = None
+    if 'psi4' in globals():
+        psi4_version = getattr(psi4, '__version__', None)
+
+    # only store configs that define this inference task
+    inference_config = {
+        'model_dir': args.model_dir,
+        'checkpoint_path': args.checkpoint_path,
+        'basedir': args.basedir,
+        'qmugs_data_dir': args.qmugs_data_dir,
+        'artifacts_dir': args.artifacts_dir,
+        'log': args.log,
+        'batch_size': args.batch_size,
+        'run_downstream_calculation': args.run_downstream_calculation,
+        'downstream_calculations': args.downstream_calculations,
+        'run_downstream_prediction': args.run_downstream_prediction,
+        'downstream_predictions': args.downstream_predictions,
+        'electron_density_method': args.electron_density_method,
+        'cubeprop_grid_spacing': args.cubeprop_grid_spacing,
+        'cubeprop_num_grid_points': args.cubeprop_num_grid_points,
+        'manual_density_padding_angstrom': args.manual_density_padding_angstrom,
+        'manual_density_spacing_angstrom': args.manual_density_spacing_angstrom,
+        'manual_density_num_grid_points': args.manual_density_num_grid_points,
+        'manual_density_block_size': args.manual_density_block_size,
+        # figure settings are saved so standalone plotting can reproduce the run
+        'run_figs': args.run_figs,
+        'run_sample_figs': args.run_sample_figs,
+        'run_electron_density_figs': args.run_electron_density_figs,
+        'run_dipole_figs': args.run_dipole_figs,
+        'figs_sample_mode': _figs_sample_mode(args),
+        'figs_num_random_molecules': args.figs_num_random_molecules,
+        'figs_num_best_conformers': args.figs_num_best_conformers,
+        'figs_num_smallest_molecules': args.figs_num_smallest_molecules,
+        'figs_seed': args.figs_seed,
+        'figs_density_point_filter': args.figs_density_point_filter,
+        'figs_density_top_percentile': args.figs_density_top_percentile,
+        'figs_density_absolute_cutoff': args.figs_density_absolute_cutoff,
+        'figs_density_max_points': args.figs_density_max_points,
+        'figs_density_isosurface_percentile': args.figs_density_isosurface_percentile,
+        'figs_density_isosurface_absolute_level': args.figs_density_isosurface_absolute_level,
+        'figs_show_3d_axes': args.figs_show_3d_axes,
+        'figs_hide_legend': args.figs_hide_legend,
+        'figs_matrix_pool_size': args.figs_matrix_pool_size,
+        'figs_metrics_max_natoms': args.figs_metrics_max_natoms,
+        'figs_metrics_max_density_matrix_dim': args.figs_metrics_max_density_matrix_dim,
+        'figs_metrics_natoms_bin_size': args.figs_metrics_natoms_bin_size,
+        'figs_metrics_density_matrix_dim_bin_size': args.figs_metrics_density_matrix_dim_bin_size,
     }
 
-
-def evaluate_matrix_reconstruction(all_pred, all_true, eps=1e-12):
-    '''other reconstruction metrics'''
-
-    # validate input and convert to numpy
-    assert len(all_pred) == len(all_true)
-    if torch.is_tensor(all_pred[0]):
-        all_pred = [pred_mat.detach().cpu().numpy() for pred_mat in all_pred]
-    if torch.is_tensor(all_true[0]):
-        all_true = [true_mat.detach().cpu().numpy() for true_mat in all_true]
-
-    # flatten matrices and concatenate across full dataset
-    y_pred = np.concatenate([mat.ravel() for mat in all_pred])
-    y_true = np.concatenate([mat.ravel() for mat in all_true])
-
-    # compute global R2
-    ss_res_global = np.sum((y_true - y_pred) ** 2)
-    ss_tot_global = np.sum((y_true - np.mean(y_true)) ** 2)
-    r2_global = 1.0 - ss_res_global / (ss_tot_global + eps)
-
-    # compute other metrics
-    r2_per_matrix = []
-    relative_frobenius_errors = []
-    cosine_similarities = []
-
-    for pred_mat, true_mat in zip(all_pred, all_true):
-        assert pred_mat.shape == true_mat.shape
-
-        pred_flat = pred_mat.ravel()
-        true_flat = true_mat.ravel()
-
-        # R2 per matrix
-        ss_res = np.sum((true_flat - pred_flat) ** 2)
-        ss_tot = np.sum((true_flat - np.mean(true_flat)) ** 2)
-        r2 = 1.0 - ss_res / (ss_tot + eps)
-        r2_per_matrix.append(float(r2))
-
-        # relative frobenius error
-        frob_rel = np.linalg.norm(pred_mat - true_mat, ord="fro") / (np.linalg.norm(true_mat, ord="fro") + eps)
-        relative_frobenius_errors.append(float(frob_rel))
-
-        # cosine similarity between flattened matrices
-        cosine = np.dot(pred_flat, true_flat) / ((np.linalg.norm(pred_flat) * np.linalg.norm(true_flat)) + eps)
-        cosine_similarities.append(float(cosine))
-
-    return {
-        "r2_global": float(r2_global),
-
-        "r2_per_matrix": {
-            "mean": float(np.mean(r2_per_matrix)),
-            "std": float(np.std(r2_per_matrix)),
-            "values": r2_per_matrix,
-        },
-
-        "relative_frobenius_error": {
-            "mean": float(np.mean(relative_frobenius_errors)),
-            "std": float(np.std(relative_frobenius_errors)),
-            "values": relative_frobenius_errors,
-        },
-
-        "cosine_similarity": {
-            "mean": float(np.mean(cosine_similarities)),
-            "std": float(np.std(cosine_similarities)),
-            "values": cosine_similarities,
-        },
+    run_config = {
+        'command': " ".join(sys.argv),
+        'argv': list(sys.argv),
+        'timestamp_utc': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        'cwd': os.getcwd(),
+        'random_state': random_state,
+        'python_executable': sys.executable,
+        'python_version': sys.version,
+        'torch_version': torch.__version__,
+        'psi4_version': psi4_version,
+        'inference_config': inference_config,
     }
 
-# ----------------------------------------------------------------------------------------------------
+    with open(output_path, "w") as f:
+        json.dump(run_config, f, indent=4)
+
+    return output_path
+
 
 if __name__ == "__main__":
 
-    model_dir = "/global/homes/w/wxrderek/HydraGNN/logs/qmugs-55245318-NN2-PM-FSDP0-V2-TP0"
-    checkpoint_path = "qmugs-55245318-NN2-PM-FSDP0-V2-TP0_epoch_65.pk"
-    basedir = "/pscratch/sd/w/wxrderek/qmugs/QMugs01.pickle"
+    # ----------------------------------------------------------------------------------------------------
+    # args
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        required=True,
+        help="directory containing model config and checkpoint files",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="checkpoint filename relative to model_dir, or absolute checkpoint path",
+    )
+    parser.add_argument(
+        "--basedir",
+        type=str,
+        required=True,
+        help="preprocessed pickle dataset directory",
+    )
+    parser.add_argument(
+        "--qmugs_data_dir",
+        type=str,
+        default=None,
+        help="QMugs raw data directory containing tarball_assignment.csv and wfns/",
+    )
+    parser.add_argument(
+        "--artifacts_dir",
+        type=str,
+        default=None,
+        help="directory for downstream calculation artifacts such as cubeprop files",
+    )
+    parser.add_argument("--log", help="log name", default="QMugs_inference")
+    parser.add_argument("--batch_size", type=int, help="batch size", default=1)
+    parser.add_argument(
+        "--run_downstream_calculation",
+        action="store_true",
+        help="run requested downstream physics calculations during inference",
+    )
+    parser.add_argument(
+        "--downstream_calculations",
+        nargs="*",
+        default=None,
+        help="downstream physics calculations to run, e.g. dipole_moment electron_density",
+    )
+    parser.add_argument(
+        "--electron_density_method",
+        choices=["cubeprop", "manual_ao"],
+        default="cubeprop",
+        help="method for downstream electron density calculations",
+    )
+    parser.add_argument(
+        "--cubeprop_grid_spacing",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Psi4 cubeprop grid spacing in bohr; provide one value or three axis values",
+    )
+    parser.add_argument(
+        "--cubeprop_num_grid_points",
+        type=int,
+        nargs="+",
+        default=None,
+        help="target number of cubeprop grid points; provide one value or three axis values",
+    )
+    parser.add_argument(
+        "--manual_density_padding_angstrom",
+        type=float,
+        default=3.0,
+        help="manual AO density grid padding around molecular bounding box in angstrom",
+    )
+    parser.add_argument(
+        "--manual_density_spacing_angstrom",
+        type=float,
+        nargs="+",
+        default=None,
+        help="manual AO density grid spacing in angstrom; provide one value or three axis values",
+    )
+    parser.add_argument(
+        "--manual_density_num_grid_points",
+        type=int,
+        nargs="+",
+        default=None,
+        help="manual AO density grid point count; provide one value or three axis values",
+    )
+    parser.add_argument(
+        "--manual_density_block_size",
+        type=int,
+        default=2000,
+        help="number of grid points per block for manual AO density evaluation",
+    )
+    parser.add_argument(
+        "--run_downstream_prediction",
+        action="store_true",
+        help="run requested downstream ML predictions during inference",
+    )
+    parser.add_argument(
+        "--downstream_predictions",
+        nargs="*",
+        default=None,
+        help="downstream ML predictions to run, e.g. dipole_moment",
+    )
+    parser.add_argument(
+        "--run_figs",
+        action="store_true",
+        help="run figure generation after inference metrics are written",
+    )
+    # sampled figures rerun inference on a small subset after streaming inference
+    parser.add_argument(
+        "--run_sample_figs",
+        action="store_true",
+        help="rerun inference on sampled conformers and plot sampled density matrix figures",
+    )
+    parser.add_argument(
+        "--run_electron_density_figs",
+        action="store_true",
+        help="plot electron density isosurfaces for sampled conformers",
+    )
+    parser.add_argument(
+        "--run_dipole_figs",
+        action="store_true",
+        help="plot dipole moment arrows for sampled conformers",
+    )
+    figs_sample_group = parser.add_mutually_exclusive_group()
+    figs_sample_group.add_argument(
+        "--figs_random_molecules",
+        action="store_true",
+        help="sample random molecules for figure generation",
+    )
+    figs_sample_group.add_argument(
+        "--figs_best_conformers",
+        action="store_true",
+        help="sample conformers with lowest per-matrix RMSE for figure generation",
+    )
+    figs_sample_group.add_argument(
+        "--figs_smallest_molecules",
+        action="store_true",
+        help="sample molecules with the fewest atoms for figure generation",
+    )
+    parser.add_argument(
+        "--figs_num_random_molecules",
+        type=int,
+        default=5,
+        help="number of random molecules to sample for figures",
+    )
+    parser.add_argument(
+        "--figs_num_best_conformers",
+        type=int,
+        default=10,
+        help="number of lowest-RMSE conformers to sample for figures",
+    )
+    parser.add_argument(
+        "--figs_num_smallest_molecules",
+        type=int,
+        default=10,
+        help="number of smallest molecules by atom count to sample for figures",
+    )
+    parser.add_argument(
+        "--figs_seed",
+        type=int,
+        default=random_state,
+        help="random seed for figure sampling",
+    )
+    parser.add_argument(
+        "--figs_density_point_filter",
+        choices=["top_percentile", "absolute_cutoff", "max_points"],
+        default="top_percentile",
+        help="method used to select density grid points for figure point clouds",
+    )
+    parser.add_argument(
+        "--figs_density_top_percentile",
+        type=float,
+        default=99.0,
+        help="percentile cutoff for density point cloud figures",
+    )
+    parser.add_argument(
+        "--figs_density_absolute_cutoff",
+        type=float,
+        default=1.0e-4,
+        help="absolute cutoff for density point cloud figures",
+    )
+    parser.add_argument(
+        "--figs_density_max_points",
+        type=int,
+        default=5000,
+        help="maximum number of points in each density point cloud figure",
+    )
+    parser.add_argument(
+        "--figs_density_isosurface_percentile",
+        type=float,
+        default=99.0,
+        help="percentile level used for density isosurface figures",
+    )
+    parser.add_argument(
+        "--figs_density_isosurface_absolute_level",
+        type=float,
+        default=None,
+        help="absolute density level for isosurface figures; overrides percentile when provided",
+    )
+    parser.add_argument(
+        "--figs_show_3d_axes",
+        action="store_true",
+        help="show 3D axis grid and labels behind molecule visualizations",
+    )
+    parser.add_argument(
+        "--figs_hide_legend",
+        action="store_true",
+        help="hide legends on molecule, density, and dipole visualizations",
+    )
+    parser.add_argument(
+        "--figs_matrix_pool_size",
+        type=int,
+        default=1,
+        help="average-pooling block size for sampled density matrix heatmaps",
+    )
+    parser.add_argument(
+        "--figs_metrics_max_natoms",
+        type=float,
+        default=None,
+        help="maximum atom count included in metric-by-size plots",
+    )
+    parser.add_argument(
+        "--figs_metrics_max_density_matrix_dim",
+        type=float,
+        default=None,
+        help="maximum density matrix dimension included in metric-by-size plots",
+    )
+    parser.add_argument(
+        "--figs_metrics_natoms_bin_size",
+        type=float,
+        default=None,
+        help="atom-count bin size for metric-by-size plots",
+    )
+    parser.add_argument(
+        "--figs_metrics_density_matrix_dim_bin_size",
+        type=float,
+        default=None,
+        help="density-matrix-dimension bin size for metric-by-size plots",
+    )
+    args = parser.parse_args()
+
+    # validate data dir
+    if args.qmugs_data_dir is None:
+        args.qmugs_data_dir = os.path.dirname(os.path.abspath(args.basedir))
+    if args.artifacts_dir is None:
+        args.artifacts_dir = os.path.join("logs", args.log, "artifacts")
+    args.artifacts_dir = os.path.abspath(args.artifacts_dir)
+
+    # save run-defining config before validation, distributed setup, data loading, or inference
+    run_config_path = _save_inference_run_config(
+        args=args,
+        random_state=random_state,
+    )
+
+    # validate grid config inputs
+    if args.cubeprop_grid_spacing is not None and args.cubeprop_num_grid_points is not None:
+        raise ValueError("Specify only one of --cubeprop_grid_spacing or --cubeprop_num_grid_points")
+    if args.manual_density_spacing_angstrom is not None and args.manual_density_num_grid_points is not None:
+        raise ValueError("Specify only one of --manual_density_spacing_angstrom or --manual_density_num_grid_points")
 
     # ----------------------------------------------------------------------------------------------------
     # distributed setup
@@ -213,19 +436,42 @@ if __name__ == "__main__":
     comm = MPI.COMM_WORLD
     world_size = comm.Get_size()
     rank = comm.Get_rank()
+
+    # ----------------------------------------------------------------------------------------------------
+    # setup logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(levelname)s (rank {rank}): %(message)s",
+        datefmt="%H:%M:%S"
+    )
+    log_name = args.log
+    hydragnn.utils.print.setup_log(log_name)
+    writer = hydragnn.utils.model.get_summary_writer(log_name)
+
+    log("Command: {0}\n".format(" ".join([x for x in sys.argv])), rank=0)
+    log(f'Random seed used for run: {random_state}', rank=0)
+    log(f'Artifacts directory: {args.artifacts_dir}', rank=0)
+    if run_config_path is not None:
+        log(f'Inference run config: {run_config_path}', rank=0)
     
     # ----------------------------------------------------------------------------------------------------
     # load pretrained model
 
-    log(f"[START] Loading HydraGNN pretrained model from {checkpoint_path}", rank=0)
+    checkpoint_log_name = (
+        args.checkpoint_path
+        if args.checkpoint_path is not None
+        else "latest .pk checkpoint in model_dir"
+    )
+    log(f"[START] Loading HydraGNN pretrained model from {checkpoint_log_name}", rank=0)
     pretrained_model = QMugsInference(
-        model_dir=model_dir,
-        checkpoint_path=checkpoint_path,
+        model_dir=args.model_dir,
+        checkpoint_path=args.checkpoint_path,
     )
     config = pretrained_model.config
     var_config = config["NeuralNetwork"]["Variables_of_interest"]
 
-    log(f"[DONE] Loaded HydraGNN pretrained model from {checkpoint_path}", rank=0)
+    log(f"[DONE] Loaded HydraGNN pretrained model from {pretrained_model.checkpoint_path}", rank=0)
 
     # ----------------------------------------------------------------------------------------------------
     # load data
@@ -234,7 +480,7 @@ if __name__ == "__main__":
 
     # open pickle metadata without preloading graph objects
     testset_meta = SimplePickleDataset(
-        basedir=basedir,
+        basedir=args.basedir,
         label="testset",
         preload=False,
         var_config=var_config,
@@ -245,7 +491,7 @@ if __name__ == "__main__":
 
     # create rank-local lazy dataset view
     testset = SimplePickleDataset(
-        basedir=basedir,
+        basedir=args.basedir,
         label="testset",
         subset=local_subset,
         preload=False,
@@ -269,7 +515,20 @@ if __name__ == "__main__":
         evaluate=True,
         return_numpy_matrices=False,
         save_per_matrix_metrics=True,
-        batch_size=1,
+        batch_size=args.batch_size,
+        run_downstream_calculation=args.run_downstream_calculation,
+        downstream_calculations=args.downstream_calculations,
+        qmugs_data_dir=args.qmugs_data_dir,
+        artifacts_dir=args.artifacts_dir,
+        electron_density_method=args.electron_density_method,
+        cubeprop_grid_spacing=args.cubeprop_grid_spacing,
+        cubeprop_num_grid_points=args.cubeprop_num_grid_points,
+        manual_density_padding_angstrom=args.manual_density_padding_angstrom,
+        manual_density_spacing_angstrom=args.manual_density_spacing_angstrom,
+        manual_density_num_grid_points=args.manual_density_num_grid_points,
+        manual_density_block_size=args.manual_density_block_size,
+        run_downstream_prediction=args.run_downstream_prediction,
+        downstream_predictions=args.downstream_predictions,
     )
 
     # ----------------------------------------------------------------------------------------------------
@@ -318,12 +577,23 @@ if __name__ == "__main__":
     # gather per matrix metrics from all MPI ranks
     all_per_matrix_metrics = comm.gather(per_matrix_metrics, root=0)
 
-    # save combined per-matrix metrics on rank 0
+    # save metrics on rank 0
     if rank == 0:
         combined_per_matrix_metrics = []
         for rank_metrics in all_per_matrix_metrics:
             combined_per_matrix_metrics.extend(rank_metrics)
 
+        # save global metrics
+        global_output_path = os.path.join(
+            "logs",
+            log_name,
+            "global_evaluation_metrics.json",
+        )
+
+        with open(global_output_path, "w") as f:
+            json.dump(global_evaluation, f, indent=4)
+
+        # save per matrix metrics
         output_path = os.path.join(
             "logs",
             log_name,
@@ -336,5 +606,41 @@ if __name__ == "__main__":
     # log final metrics on rank 0
     if rank == 0:
         log(json.dumps(global_evaluation, indent=4), rank=0)
+
+    # ensure all ranks have finished writing and reducing before rank 0 makes figures
+    comm.Barrier()
+
+    if args.run_figs and rank == 0:
+        log("[START] Generating inference figures", rank=0)
+        figs_main = _load_figs_main()
+        # plotting is outside streaming inference and uses saved per-matrix JSONs
+        figs_main(
+            log_dir=os.path.abspath(os.path.join("logs", log_name)),
+            artifacts_dir=args.artifacts_dir,
+            run_sample_visuals=args.run_sample_figs,
+            run_electron_density_visuals=args.run_electron_density_figs,
+            run_dipole_visuals=args.run_dipole_figs,
+            sample_mode=_figs_sample_mode(args),
+            num_random_molecules=args.figs_num_random_molecules,
+            num_best_conformers=args.figs_num_best_conformers,
+            num_smallest_molecules=args.figs_num_smallest_molecules,
+            seed=args.figs_seed,
+            density_point_filter=args.figs_density_point_filter,
+            density_top_percentile=args.figs_density_top_percentile,
+            density_absolute_cutoff=args.figs_density_absolute_cutoff,
+            density_max_points=args.figs_density_max_points,
+            density_isosurface_percentile=args.figs_density_isosurface_percentile,
+            density_isosurface_absolute_level=args.figs_density_isosurface_absolute_level,
+            show_3d_axes=args.figs_show_3d_axes,
+            show_legend=not args.figs_hide_legend,
+            matrix_pool_size=args.figs_matrix_pool_size,
+            metrics_max_natoms=args.figs_metrics_max_natoms,
+            metrics_max_density_matrix_dim=args.figs_metrics_max_density_matrix_dim,
+            metrics_natoms_bin_size=args.figs_metrics_natoms_bin_size,
+            metrics_density_matrix_dim_bin_size=args.figs_metrics_density_matrix_dim_bin_size,
+        )
+        log("[DONE] Generated inference figures", rank=0)
+
+    comm.Barrier()
 
     dist.destroy_process_group()

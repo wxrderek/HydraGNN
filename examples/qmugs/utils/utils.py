@@ -21,7 +21,7 @@ NUM_CONFORMERS = 1992984
 BOHR_TO_ANGSTROM = 0.52917721092
 
 # ----------------------------------------------------------------------------------------------------
-# density matrix preprocessing
+# density matrix processing
 
 def pad_density_matrix(density_matrix: np.ndarray, max_size: int):
     '''pads density matrix with 0's to match max_size'''
@@ -53,11 +53,6 @@ def get_density_matrix_upper_tr(density_matrix: np.ndarray):
 def get_density_matrix_from_upper_tr(density_matrix_upper_tr: np.ndarray):
     '''given the upper triangle of a density matrix, mirrors it and returns the full matrix'''
     pass
-
-
-# ----------------------------------------------------------------------------------------------------
-# density matrix postprocessing and downstream analysis
-
 
 
 # ----------------------------------------------------------------------------------------------------

@@ -41,6 +41,15 @@ from rdkit import Chem
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
+from utils.inference_utils import (
+    assert_same_cube_grid,
+    electron_density_from_density_matrix,
+    read_cubeprops,
+    write_cubeprops,
+    wavefunction_from_total_density_matrix,
+    dipole_moment_from_density_matrix,
+)
+
 try:
     import psi4
     psi4.core.be_quiet()
@@ -54,7 +63,8 @@ transform_coordinates = Distance(norm=False, cat=False)
 NUM_MOLECULES = 665911
 NUM_CONFORMERS = 1992984
 
-BOHR_PER_ANGSTROM = 0.52917721092
+BOHR_TO_ANGSTROM = 0.52917721092
+DIPOLE_AU_TO_DEBYE = 2.541746473
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -214,6 +224,7 @@ class QMugsDataset(AbstractBaseDataset):
 
         # save original density matrix dimension
         density_matrix_dim = torch.tensor(int(Da.shape[0]), dtype=torch.int32)
+        density_matrix_dim_int = int(density_matrix_dim.item())
 
         # check if density matrix is too big for padding
         if D_tot.shape[0] > self.__class__.max_padded_density_matrix_dimension:
@@ -230,6 +241,12 @@ class QMugsDataset(AbstractBaseDataset):
             else: 
                 D_tot = self._pad_density_matrix(D_tot.copy())
                 D_tot = torch.from_numpy(D_tot).to(torch.float32)
+        else:
+            if self.predict_alpha_beta:
+                Da = torch.from_numpy(Da.copy()).to(torch.float32)
+                Db = torch.from_numpy(Db.copy()).to(torch.float32)
+            else:
+                D_tot = torch.from_numpy(D_tot.copy()).to(torch.float32)
 
         # charge and multiplicity
         charge = torch.tensor(
@@ -297,47 +314,32 @@ class QMugsDataset(AbstractBaseDataset):
                 )
             # mask out the padded region only
             else:
-                alpha_density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
-                beta_density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
-            
-            # for test set, mask out only the padded region
-            alpha_density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
-            beta_density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
-            
-            # pad mask to correct dimension
-            alpha_density_mask = self._pad_density_matrix(alpha_density_mask)
-            beta_density_mask = self._pad_density_matrix(beta_density_mask)
-            alpha_density_test_mask = self._pad_density_matrix(alpha_density_test_mask)
-            beta_density_test_mask = self._pad_density_matrix(beta_density_test_mask)
+                alpha_density_mask = np.ones((density_matrix_dim_int, density_matrix_dim_int), dtype=bool)
+                beta_density_mask = np.ones((density_matrix_dim_int, density_matrix_dim_int), dtype=bool)
 
-            alpha_density_mask = torch.from_numpy(alpha_density_mask).to(torch.float32)
-            beta_density_mask = torch.from_numpy(beta_density_mask).to(torch.float32)
-            alpha_density_test_mask = torch.from_numpy(alpha_density_test_mask).to(torch.float32)
-            beta_density_test_mask = torch.from_numpy(beta_density_test_mask).to(torch.float32)
+            # store compact masks with shape (n_basis, n_basis), not padded to (2002, 2002)
+            assert alpha_density_mask.shape == (density_matrix_dim_int, density_matrix_dim_int)
+            assert beta_density_mask.shape == (density_matrix_dim_int, density_matrix_dim_int)
+            alpha_density_mask = torch.from_numpy(alpha_density_mask).to(torch.bool)
+            beta_density_mask = torch.from_numpy(beta_density_mask).to(torch.bool)
         
         else:
             # mask total density
             if self.mask:
                 density_mask = self._get_density_matrix_mask(
-                wfn=psi4_wfn,
-                rng=rng,
-                mask_method=self.mask_method,
-                perc_entries_masked = self.mask_config.get('perc_entries_masked', 0.2),
-                perc_atom_pairs_masked = self.mask_config.get('perc_atom_pairs_masked', 0.2),
-            )
+                    wfn=psi4_wfn,
+                    rng=rng,
+                    mask_method=self.mask_method,
+                    perc_entries_masked=self.mask_config.get('perc_entries_masked', 0.2),
+                    perc_atom_pairs_masked=self.mask_config.get('perc_atom_pairs_masked', 0.2),
+                )
             # mask out the padded region only
             else: 
-                density_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
+                density_mask = np.ones((density_matrix_dim_int, density_matrix_dim_int), dtype=bool)
 
-            # for test set, mask out only the padded region
-            density_test_mask = np.ones((density_matrix_dim, density_matrix_dim), dtype=bool)
-            
-            # pad mask to correct dimension
-            density_mask = self._pad_density_matrix(density_mask)
-            density_test_mask = self._pad_density_matrix(density_test_mask)
-
-            density_mask = torch.from_numpy(density_mask).to(torch.float32)
-            density_test_mask = torch.from_numpy(density_test_mask).to(torch.float32)
+            # store compact mask with shape (n_basis, n_basis), not padded to (2002, 2002)
+            assert density_mask.shape == (density_matrix_dim_int, density_matrix_dim_int)
+            density_mask = torch.from_numpy(density_mask).to(torch.bool)
         
 
         # ----------------------------------------------------------------------------------------------------
@@ -347,6 +349,11 @@ class QMugsDataset(AbstractBaseDataset):
         x = torch.cat([atomic_numbers, pos], dim=1)
         
         if self.predict_alpha_beta:
+            density_target = torch.cat((Da.flatten(), Db.flatten()))
+            density_target_mask = torch.cat(
+                (alpha_density_mask.flatten(), beta_density_mask.flatten())
+            )
+
             # predict alpha and beta matrices jointly as separate vectors
             data_object = Data(
                 dataset_name="qmugs",
@@ -360,22 +367,23 @@ class QMugsDataset(AbstractBaseDataset):
                 chemical_composition=chemical_composition,
                 smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
                 x=x,
-                alpha_density_matrix=Da.flatten(),
-                beta_density_matrix=Db.flatten(),
-                alpha_density_mask=alpha_density_mask.flatten(),
-                beta_density_mask=beta_density_mask.flatten(),
+                y=density_target,
+                y_mask=density_target_mask,
                 # auxiliary inputs
                 density_matrix_dim=density_matrix_dim,
                 chembl_id=chembl_id,
                 conformer_id=conformer_id,
+                wfn_path=wfn_path,
                 natoms_int=natoms_int,
                 charge=charge,
                 multiplicity=multiplicity,
                 graph_attr=graph_attr,
             )
-            data_object.y = torch.cat((data_object.alpha_density_matrix, data_object.beta_density_matrix))
-            data_object.y_mask = torch.cat((data_object.alpha_density_mask, data_object.beta_density_mask))
-            data_object.y_test_mask = torch.cat((alpha_density_test_mask.flatten(), beta_density_test_mask.flatten()))
+            # y_mask_loc records compact per-head mask offsets: (1, 3) for alpha and beta heads
+            data_object.y_mask_loc = torch.tensor(
+                [[0, density_matrix_dim_int ** 2, 2 * density_matrix_dim_int ** 2]],
+                dtype=torch.int64,
+            )
             
         else:
             # predict the full density matrix only
@@ -391,20 +399,24 @@ class QMugsDataset(AbstractBaseDataset):
                 chemical_composition=chemical_composition,
                 smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
                 x=x,
-                density_matrix=D_tot,
-                density_mask=density_mask,
+                y=D_tot, # y has shape (2002, 2002) when padding is enabled
+                y_mask=density_mask, # y_mask has compact shape (n_basis, n_basis), not padded
                 # auxiliary inputs
                 density_matrix_dim=density_matrix_dim,
                 chembl_id=chembl_id,
                 conformer_id=conformer_id,
+                wfn_path=wfn_path,
                 natoms_int=natoms_int,
                 charge=charge,
                 multiplicity=multiplicity,
                 graph_attr=graph_attr,
             )
-            data_object.y = data_object.density_matrix
-            data_object.y_mask = data_object.density_mask
-            data_object.y_test_mask = density_test_mask
+            
+            # y_mask_loc records compact mask offsets: (1, 2) for one density-matrix head
+            data_object.y_mask_loc = torch.tensor(
+                [[0, density_matrix_dim_int ** 2]],
+                dtype=torch.int64,
+            )
 
         # apply graph transforms
         data_object = self.radius_graph(data_object)
@@ -419,11 +431,92 @@ class QMugsDataset(AbstractBaseDataset):
         return data_object
 
 
-    def _train_val_test_ids(self, perc_load: float = 1.0, perc_train: float = 0.8):
+    def _density_matrix_sizes_from_eda(self):
+        '''load density matrix sizes from the EDA output file'''
+
+        eda_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'eda',
+            'densmat_eda.json',
+        )
+        if not os.path.isfile(eda_path):
+            raise FileNotFoundError(
+                f'Density matrix EDA file not found: {eda_path}'
+            )
+
+        with open(eda_path, 'r', encoding='utf-8') as f:
+            densmat_eda = json.load(f)
+
+        density_matrix_sizes = densmat_eda.get('sizes', None)
+        if not isinstance(density_matrix_sizes, dict):
+            raise ValueError(
+                f"Density matrix EDA file {eda_path} must contain a dictionary under key 'sizes'"
+            )
+
+        return density_matrix_sizes
+
+
+    def _filter_ids_by_density_matrix_size(self, all_ids, max_density_matrix_size: int):
+        '''return molecule IDs whose density matrix size is at most the requested size'''
+
+        if max_density_matrix_size <= 0:
+            raise ValueError('max_density_matrix_size must be a positive integer')
+
+        density_matrix_sizes = self._density_matrix_sizes_from_eda()
+
+        filtered_ids = []
+        for chembl_id in all_ids:
+            if chembl_id not in density_matrix_sizes:
+                log(
+                    f"[WARNING] Missing density matrix size for molecule {chembl_id}; "
+                    "skipping this molecule during size-aware sampling",
+                    rank=0,
+                )
+                continue
+
+            try:
+                density_matrix_size = int(density_matrix_sizes[chembl_id])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'Density matrix size for molecule {chembl_id} must be an integer'
+                ) from exc
+
+            if density_matrix_size <= max_density_matrix_size:
+                filtered_ids.append(chembl_id)
+
+        if len(filtered_ids) == 0:
+            raise ValueError(
+                f'No molecules have density matrix size <= {max_density_matrix_size}'
+            )
+
+        return filtered_ids
+
+
+    def _update_max_padded_density_matrix_dimension(self, max_density_matrix_size: int):
+        '''update the class-level padded density matrix dimension'''
+
+        if max_density_matrix_size <= 0:
+            raise ValueError('max_density_matrix_size must be a positive integer')
+
+        self.__class__.max_padded_density_matrix_dimension = max_density_matrix_size
+
+
+    def _train_val_test_ids(
+        self,
+        perc_load: float = 1.0,
+        perc_train: float = 0.8,
+        max_density_matrix_size: int = None,
+    ):
         '''return list of chembl_id's of molecules to load'''
 
         # sample subset of chembl_id's of molecules to load for task
         all_ids = list(self.molecule_dirs.keys()).copy()
+        if max_density_matrix_size is not None:
+            all_ids = self._filter_ids_by_density_matrix_size(
+                all_ids=all_ids,
+                max_density_matrix_size=max_density_matrix_size,
+            )
+
         num_molecules_to_load = max(1, int(len(all_ids) * perc_load))
         molecules_to_load = random.sample(all_ids, num_molecules_to_load)
 
@@ -442,13 +535,19 @@ class QMugsDataset(AbstractBaseDataset):
     def load_and_split_dataset(self, 
         perc_load: float = 1.0, 
         perc_train: float = 0.8,
+        max_density_matrix_size: int = None,
+        update_max_padded_dimension: bool = False,
     ):
         '''load and split data, with splitting done per molecule, not per conformer'''
+
+        if update_max_padded_dimension and max_density_matrix_size is not None:
+            self._update_max_padded_density_matrix_dimension(max_density_matrix_size=max_density_matrix_size)
 
         # get chembl_id's for train, val, test sets
         trainset_ids, valset_ids, testset_ids = self._train_val_test_ids(
             perc_load=perc_load,
-            perc_train=perc_train
+            perc_train=perc_train,
+            max_density_matrix_size=max_density_matrix_size,
         )
 
         # distributed loading
@@ -514,6 +613,8 @@ class QMugsDataset(AbstractBaseDataset):
         comm,
         perc_load: float = 1.0,
         perc_train: float = 0.8,
+        max_density_matrix_size: int = None,
+        update_max_padded_dimension: bool = False,
         use_subdir: bool = True,
         nmax_persubdir: int = 10_000,
         compute_pna_deg: bool = True,
@@ -525,15 +626,25 @@ class QMugsDataset(AbstractBaseDataset):
         rank = comm.Get_rank()
         world_size = comm.Get_size()
 
+        if update_max_padded_dimension and max_density_matrix_size is not None:
+            self._update_max_padded_density_matrix_dimension(
+                max_density_matrix_size=max_density_matrix_size,
+            )
+
         # log config
         log("[START] Streaming QMugs pickle preprocessing", rank=0)
         log(f"[INFO] Output pickle directory: {basedir}", rank=0)
-        log(f"[INFO] perc_load={perc_load}, perc_train={perc_train}, world_size={world_size}", rank=0)
+        log(
+            f"[INFO] perc_load={perc_load}, perc_train={perc_train}, "
+            f"max_density_matrix_size={max_density_matrix_size}, world_size={world_size}",
+            rank=0,
+        )
 
         # generate train/val/test split indices for all molecules
         trainset_ids, valset_ids, testset_ids = self._train_val_test_ids(
             perc_load=perc_load,
             perc_train=perc_train,
+            max_density_matrix_size=max_density_matrix_size,
         )
 
         # shard indices across MPI ranks
@@ -739,6 +850,7 @@ class QMugsInference:
     ):
         # dir and path setup
         self.model_dir = model_dir
+        self._qmugs_archive_maps = {}
         self._find_checkpoint(checkpoint_path)
         self._load_config()
         self._load_model()
@@ -820,6 +932,7 @@ class QMugsInference:
             p.requires_grad_(False) # freeze parameters
         self.model = self.model.to(dtype=param_dtype, device=device)
     
+
     ######################################################################################################
     # DEFUNCT
     # ----------------------------------------------------------------------------------------------------
@@ -852,7 +965,7 @@ class QMugsInference:
                 # total density matrix prediction
                 if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
                     pred_batch = pred[0].reshape(-1, max_size, max_size)
-                    true_batch = batch.density_matrix.reshape(-1, max_size, max_size)
+                    true_batch = batch.y.reshape(-1, max_size, max_size)
                     dims_batch = batch.density_matrix_dim
                 else:
                     raise NotImplementedError
@@ -903,8 +1016,579 @@ class QMugsInference:
         else: 
             return all_pred, all_true, evaluation
 
-        ######################################################################################################
+    ######################################################################################################
+
+    # ----------------------------------------------------------------------------------------------------
+    # inference with streaming across MPI ranks
+
+    def run_streaming_inference(
+        self,
+        dataset,
+        evaluate=True,
+        criterions=['mse', 'mae', 'smooth_l1', 'rmse'],
+        return_numpy_matrices=False,
+        save_per_matrix_metrics=False,
+        batch_size=1,
+        # downstream calculations
+        run_downstream_calculation=False,
+        downstream_calculations=None,
+        qmugs_data_dir: str = None,
+        artifacts_dir: str = None,
+        # electron density related configs
+        electron_density_method: str = 'cubeprop',
+        cubeprop_grid_spacing=None,
+        cubeprop_num_grid_points=None,
+        manual_density_padding_angstrom: float = 3.0,
+        manual_density_spacing_angstrom=None,
+        manual_density_num_grid_points=None,
+        manual_density_block_size: int = 2000,
+        # downstream predictions
+        run_downstream_prediction=False,
+        downstream_predictions=None,
+        # logging
+        verbosity: int = 2,
+        log_every: int = 100,
+    ):
+        '''runs inference with model on preloaded or lazy dataset'''
+
+        log("[START] Inference initiated", rank=0)
+
+        # disable matrix storage for streaming inference
+        if return_numpy_matrices:
+            raise NotImplementedError('return_numpy_matrices=True is disabled for streaming inference')
+
+        downstream_calculations = downstream_calculations or []
+        downstream_predictions = downstream_predictions or []
+        
+        if run_downstream_calculation and not evaluate:
+            raise ValueError("run_downstream_calculation=True requires evaluate=True")
+        if run_downstream_calculation and len(downstream_calculations) == 0:
+            raise ValueError("run_downstream_calculation=True requires at least one downstream calculation")
+        if run_downstream_prediction:
+            self.run_downstream_predictions(downstream_predictions=downstream_predictions)
+
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        inference_start_time = time.time()
+        max_size = QMugsDataset.max_padded_density_matrix_dimension
+
+        # initialize local metric accumulators
+        streaming_state = None
+        if evaluate:
+            streaming_state = self._init_streaming_metric_state(criterions=criterions)
+        per_matrix_metrics = []
+
+        # lazy dataloader
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        try:
+            local_num_batches = len(loader)
+        except TypeError:
+            local_num_batches = None
+        local_num_batches_label = local_num_batches if local_num_batches is not None else "unknown"
+        log(
+            f"[START] Streaming inference: rank={rank}, "
+            f"local_batches={local_num_batches_label}, batch_size={batch_size}",
+        )
+
+        # run inference
+        pbar = iterate_tqdm(
+            loader,
+            verbosity,
+            total=local_num_batches,
+            desc=f"Streaming inference rank {rank}",
+        )
+        local_batch_count = 0
+        local_matrix_count = 0
+        for batch in pbar:
+            local_batch_count += 1
+            batch = batch.to(self.device)
+
+            with torch.no_grad():
+                with self.autocast_ctx:
+                    pred = self.model(batch)
+
+                # total density matrix prediction
+                if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
+                    pred_batch = pred[0].reshape(-1, max_size, max_size)
+                    true_batch = batch.y.reshape(-1, max_size, max_size)
+                    dims_batch = batch.density_matrix_dim
+                else:
+                    raise NotImplementedError
+
+                # postprocess matrices
+                for batch_index, (raw_pred_mat, raw_true_mat, dim) in enumerate(zip(
+                    pred_batch,
+                    true_batch,
+                    dims_batch,
+                )):
+                    assert(raw_pred_mat.shape == raw_true_mat.shape)
+                    assert(raw_pred_mat.shape[0] == max_size)
+
+                    # unpad matrices to original size
+                    dim = int(dim.item())
+                    pred_mat = raw_pred_mat[:dim, :dim]
+                    true_mat = raw_true_mat[:dim, :dim]
+                    local_matrix_count += 1
+
+                    downstream_metric_values = None
+                    downstream_record_values = None
+                    if run_downstream_calculation:
+                        downstream_metric_values, downstream_record_values = self.run_downstream_calculations(
+                            downstream_calculations=downstream_calculations,
+                            pred_mat=pred_mat,
+                            true_mat=true_mat,
+                            batch=batch,
+                            batch_index=batch_index,
+                            qmugs_data_dir=qmugs_data_dir,
+                            artifacts_dir=artifacts_dir,
+                            electron_density_method=electron_density_method,
+                            cubeprop_grid_spacing=cubeprop_grid_spacing,
+                            cubeprop_num_grid_points=cubeprop_num_grid_points,
+                            manual_density_padding_angstrom=manual_density_padding_angstrom,
+                            manual_density_spacing_angstrom=manual_density_spacing_angstrom,
+                            manual_density_num_grid_points=manual_density_num_grid_points,
+                            manual_density_block_size=manual_density_block_size,
+                        )
+
+                    # evaluate and update streaming metrics
+                    if evaluate:
+                        self._update_streaming_metric_state(
+                            state=streaming_state,
+                            pred_mat=pred_mat,
+                            true_mat=true_mat,
+                            batch=batch,
+                            batch_index=batch_index,
+                            criterions=criterions,
+                            save_per_matrix_metrics=save_per_matrix_metrics,
+                            per_matrix_metrics=per_matrix_metrics,
+                            downstream_metric_values=downstream_metric_values,
+                            downstream_record_values=downstream_record_values,
+                        )
+
+                    # release matrices from memory
+                    del pred_mat
+                    del true_mat
+
+            del batch
+            del pred
+
+            # periodic progress logging
+            if log_every is not None and log_every > 0 and local_batch_count % log_every == 0:
+                log(
+                    f"[INFO] Rank {rank}: streaming inference processed "
+                    f"{local_batch_count}/{local_num_batches_label} batches, "
+                    f"{local_matrix_count} matrices"
+                )
+
+        # finalize metrics
+        evaluation = {}
+        if evaluate:
+            evaluation = self._finalize_streaming_metric_state(state=streaming_state)
+
+        inference_time = time.time() - inference_start_time
+        evaluation['inference_time'] = inference_time
+        log(
+            f"[DONE] Rank {rank}: streaming inference processed "
+            f"{local_batch_count} batches, {local_matrix_count} matrices "
+            f"in {inference_time:.2f} seconds"
+        )
+
+        return evaluation, per_matrix_metrics
     
+
+    # ----------------------------------------------------------------------------------------------------
+    # downstream calculations
+
+    def run_downstream_dipole_moment_calculation(
+        self,
+        pred_mat,
+        true_mat,
+        batch,
+        batch_index,
+        qmugs_data_dir: str = None,
+    ):
+        '''compute true and predicted dipole moments for one conformer'''
+
+        # only total density matrix predictions are supported
+        if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] != ['density_matrix']:
+            raise NotImplementedError(
+                "Downstream dipole moment calculations currently require total density matrix predictions"
+            )
+
+        # load stored ground truth Psi4 wavefunction
+        wfn_path = self._resolve_wfn_path(
+            batch=batch,
+            batch_index=batch_index,
+            qmugs_data_dir=qmugs_data_dir,
+        )
+        if not os.path.isfile(wfn_path):
+            raise FileNotFoundError(f"Psi4 wavefunction file not found: {wfn_path}")
+
+        psi4_wfn = psi4.core.Wavefunction.from_file(wfn_path)
+
+        # Convert to float64 for contraction with Psi4 double precision AO integrals.
+        pred_np = _as_numpy_density_matrix(pred_mat).astype(np.float64, copy=False) # (n_basis, n_basis)
+        true_np = _as_numpy_density_matrix(true_mat).astype(np.float64, copy=False) # (n_basis, n_basis)
+        assert pred_np.shape == true_np.shape
+
+        n_basis = int(psi4_wfn.basisset().nbf())
+        assert pred_np.shape == (n_basis, n_basis)
+        assert true_np.shape == (n_basis, n_basis)
+
+        # true and predicted dipoles use same geometry and basis
+        true_dipole_au, true_nuclear_dipole_au, true_electronic_dipole_au = dipole_moment_from_density_matrix(
+            density_matrix=true_np,
+            psi4_wfn=psi4_wfn,
+        ) # (3,)
+        pred_dipole_au, pred_nuclear_dipole_au, pred_electronic_dipole_au = dipole_moment_from_density_matrix(
+            density_matrix=pred_np,
+            psi4_wfn=psi4_wfn,
+        ) # (3,)
+
+        dipole_error_au = pred_dipole_au - true_dipole_au # (3,)
+        dipole_euclideian_error_au = np.linalg.norm(dipole_error_au)
+
+        eps = 1e-12
+        true_dipole_norm_au = np.linalg.norm(true_dipole_au)
+        pred_dipole_norm_au = np.linalg.norm(pred_dipole_au)
+        true_dipole_range_au = np.max(true_dipole_au) - np.min(true_dipole_au)
+        true_dipole_unit = true_dipole_au / (true_dipole_norm_au + eps) # (3,)
+        pred_dipole_unit = pred_dipole_au / (pred_dipole_norm_au + eps) # (3,)
+
+        # cosine similarity of true and predicted dipole vectors
+        dipole_cosine_similarity = np.dot(
+            pred_dipole_au,
+            true_dipole_au,
+        ) / (pred_dipole_norm_au * true_dipole_norm_au + eps)
+
+        # RMSE over vector components, normalized by range of true components
+        dipole_rmse_au = np.sqrt(np.mean(dipole_error_au ** 2))
+        dipole_range_normalized_rmse = dipole_rmse_au / (true_dipole_range_au + eps)
+
+        # RMSE between unit-normalized dipole vectors
+        dipole_unit_vector_rmse = np.sqrt(np.mean(
+            (pred_dipole_unit - true_dipole_unit) ** 2
+        ))
+
+        # absolute error in vector magnitude, normalized by true magnitude
+        dipole_relative_magnitude_error = abs(
+            pred_dipole_norm_au - true_dipole_norm_au
+        ) / (true_dipole_norm_au + eps)
+
+        # scalar metrics for streaming aggregation
+        metric_values = {
+            'dipole_moment_absolute_component_error_x_au': abs(dipole_error_au[0]),
+            'dipole_moment_absolute_component_error_y_au': abs(dipole_error_au[1]),
+            'dipole_moment_absolute_component_error_z_au': abs(dipole_error_au[2]),
+            'dipole_euclideian_error_au': dipole_euclideian_error_au,
+            'dipole_moment_cosine_similarity': dipole_cosine_similarity,
+            'dipole_moment_rmse': dipole_rmse_au,
+            'dipole_moment_range_normalized_rmse': dipole_range_normalized_rmse,
+            'dipole_moment_unit_vector_rmse': dipole_unit_vector_rmse,
+            'dipole_moment_relative_magnitude_error': dipole_relative_magnitude_error,
+        }
+
+        # per molecule values for downstream debugging
+        record_values = {
+            'wfn_path': wfn_path,
+            'true_dipole_au': true_dipole_au.tolist(),
+            'predicted_dipole_au': pred_dipole_au.tolist(),
+            'dipole_error_au': dipole_error_au.tolist(),
+            'true_nuclear_dipole_au': true_nuclear_dipole_au.tolist(),
+            'predicted_nuclear_dipole_au': pred_nuclear_dipole_au.tolist(),
+            'true_electronic_dipole_au': true_electronic_dipole_au.tolist(),
+            'predicted_electronic_dipole_au': pred_electronic_dipole_au.tolist(),
+        }
+
+        return metric_values, record_values
+
+
+    def run_downstream_electron_density_calculation(
+        self,
+        pred_mat,
+        true_mat,
+        batch,
+        batch_index,
+        qmugs_data_dir: str = None,
+        artifacts_dir: str = None,
+        cubeprop_grid_spacing=None,
+        cubeprop_num_grid_points=None,
+        electron_density_method: str = 'cubeprop',
+        manual_density_padding_angstrom: float = 3.0,
+        manual_density_spacing_angstrom=None,
+        manual_density_num_grid_points=None,
+        manual_density_block_size: int = 2000,
+    ):
+        '''compute true and predicted electron density grid metrics for one conformer'''
+
+        # only total density matrix predictions are supported
+        if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] != ['density_matrix']:
+            raise NotImplementedError("Downstream electron density calculations currently require total density matrix predictions")
+        
+        # validate method
+        electron_density_method = str(electron_density_method).strip().lower()
+        if electron_density_method not in ['cubeprop', 'manual_ao']:
+            raise ValueError(f"Unknown electron density method: {electron_density_method}")
+        if electron_density_method == 'cubeprop' and artifacts_dir is None:
+            raise ValueError("Downstream electron density calculations require artifacts_dir")
+        if cubeprop_grid_spacing is not None and cubeprop_num_grid_points is not None:
+            raise ValueError("Specify only one of cubeprop_grid_spacing or cubeprop_num_grid_points")
+        
+        if artifacts_dir is not None:
+            artifacts_dir = os.path.abspath(artifacts_dir)
+
+        # load stored ground truth Psi4 wavefunction
+        wfn_path = self._resolve_wfn_path(
+            batch=batch,
+            batch_index=batch_index,
+            qmugs_data_dir=qmugs_data_dir,
+        )
+        if not os.path.isfile(wfn_path):
+            raise FileNotFoundError(f"Psi4 wavefunction file not found: {wfn_path}")
+
+        true_wfn = psi4.core.Wavefunction.from_file(wfn_path)
+
+        # Convert to float64 for Psi4 double precision density matrices.
+        pred_np = _as_numpy_density_matrix(pred_mat).astype(np.float64, copy=False) # (n_basis, n_basis)
+        true_np = _as_numpy_density_matrix(true_mat).astype(np.float64, copy=False) # (n_basis, n_basis)
+       
+        n_basis = int(true_wfn.basisset().nbf())
+        assert pred_np.shape == true_np.shape
+        assert true_np.shape == (n_basis, n_basis)
+
+        molecule_dir = None
+        true_cube_paths = []
+        pred_cube_paths = []
+        
+        # use Psi4 cubeprops
+        if electron_density_method == 'cubeprop':
+            # predicted Psi4 wavefunction uses the same molecule and def2-SVP basis
+            pred_wfn = wavefunction_from_total_density_matrix(
+                reference_wfn=true_wfn,
+                total_density_matrix=pred_np,
+                wfn_path=wfn_path,
+            )
+
+            # unique artifact paths prevent cubeprop filename collisions across ranks
+            chembl_id = str(self._get_batch_attr_value(
+                batch=batch,
+                name='chembl_id',
+                batch_index=batch_index,
+            ))
+            conformer_id = str(self._get_batch_attr_value(
+                batch=batch,
+                name='conformer_id',
+                batch_index=batch_index,
+            ))
+
+            rank = int(os.environ.get('SLURM_PROCID', os.environ.get('PMI_RANK', '0')))
+            molecule_dir = os.path.join(
+                artifacts_dir,
+                'cubeprops',
+                f'rank_{rank}',
+                f'{chembl_id}_conf_{conformer_id}',
+                'electron_density',
+            )
+
+            true_cube_dir = os.path.join(molecule_dir, 'true')
+            pred_cube_dir = os.path.join(molecule_dir, 'predicted')
+            cubeprop_grid_config = None
+            if cubeprop_grid_spacing is not None:
+                cubeprop_grid_config = {'spacing': cubeprop_grid_spacing}
+            elif cubeprop_num_grid_points is not None:
+                cubeprop_grid_config = {'num_grid_points': cubeprop_num_grid_points}
+
+            # cubeprop evaluates density from the wavefunction density matrices on its default cube grid
+            write_cubeprops(
+                psi4_wfn=true_wfn,
+                cube_dir=true_cube_dir,
+                cubeprop_names=['density'],
+                grid_config=cubeprop_grid_config,
+            )
+            write_cubeprops(
+                psi4_wfn=pred_wfn,
+                cube_dir=pred_cube_dir,
+                cubeprop_names=['density'],
+                grid_config=cubeprop_grid_config,
+            )
+
+            # read true and predicted density values from the written cube files
+            true_cubeprops = read_cubeprops(
+                cube_dir=true_cube_dir,
+                cubeprop_names=['density'],
+            )
+            pred_cubeprops = read_cubeprops(
+                cube_dir=pred_cube_dir,
+                cubeprop_names=['density'],
+            )
+
+            true_density = true_cubeprops['density']['values'] # (n_x, n_y, n_z)
+            true_cube_metadata = true_cubeprops['density']['metadata']
+            true_cube_paths = true_cubeprops['density']['paths']
+            pred_density = pred_cubeprops['density']['values'] # (n_x, n_y, n_z)
+            pred_cube_metadata = pred_cubeprops['density']['metadata']
+            pred_cube_paths = pred_cubeprops['density']['paths']
+
+            assert_same_cube_grid(
+                first_cube_metadata=true_cube_metadata,
+                second_cube_metadata=pred_cube_metadata,
+            )
+        
+        else:
+            # manual AO path evaluates rho(r) = phi(r)^T P phi(r) directly
+            true_density, true_cube_metadata = electron_density_from_density_matrix(
+                density_matrix=true_np,
+                psi4_wfn=true_wfn,
+                padding_angstrom=manual_density_padding_angstrom,
+                spacing_angstrom=manual_density_spacing_angstrom,
+                num_grid_points=manual_density_num_grid_points,
+                block_size=manual_density_block_size,
+            ) # (n_x, n_y, n_z)
+            pred_density, pred_cube_metadata = electron_density_from_density_matrix(
+                density_matrix=pred_np,
+                psi4_wfn=true_wfn,
+                padding_angstrom=manual_density_padding_angstrom,
+                spacing_angstrom=manual_density_spacing_angstrom,
+                num_grid_points=manual_density_num_grid_points,
+                block_size=manual_density_block_size,
+            ) # (n_x, n_y, n_z)
+
+            assert_same_cube_grid(
+                first_cube_metadata=true_cube_metadata,
+                second_cube_metadata=pred_cube_metadata,
+            )
+        assert pred_density.shape == true_density.shape
+
+        # voxelwise density errors on the common cube grid
+        density_error = pred_density - true_density # (n_x, n_y, n_z)
+        abs_density_error = np.abs(density_error) # (n_x, n_y, n_z)
+        squared_density_error = density_error ** 2 # (n_x, n_y, n_z)
+
+        eps = 1e-12
+        voxel_volume = float(true_cube_metadata['voxel_volume'])
+        true_density_range = float(np.max(true_density) - np.min(true_density))
+        true_density_integral = float(np.sum(true_density) * voxel_volume)
+        pred_density_integral = float(np.sum(pred_density) * voxel_volume)
+
+        # scalar metrics for streaming aggregation
+        mean_absolute_voxel_grid_error = float(np.mean(abs_density_error))
+        mean_squared_voxel_grid_error = float(np.mean(squared_density_error))
+        root_mean_squared_voxel_grid_error = float(np.sqrt(mean_squared_voxel_grid_error))
+        range_normalized_rmse = root_mean_squared_voxel_grid_error / (true_density_range + eps)
+        true_density_l2_integral = float(np.sqrt(np.sum(true_density ** 2) * voxel_volume))
+        integrated_l2_error = float(
+            np.sqrt(np.sum(squared_density_error) * voxel_volume) / (true_density_l2_integral + eps)
+        )
+        absolute_fractional_error = float(
+            np.sum(abs_density_error) * voxel_volume / (true_density_integral + eps)
+        )
+
+        metric_values = {
+            'electron_density_mean_absolute_voxel_grid_error': mean_absolute_voxel_grid_error,
+            'electron_density_mean_squared_voxel_grid_error': mean_squared_voxel_grid_error,
+            'electron_density_root_mean_squared_voxel_grid_error': root_mean_squared_voxel_grid_error,
+            'electron_density_range_normalized_rmse': range_normalized_rmse,
+            'electron_density_integrated_l2_error': integrated_l2_error,
+            'electron_density_absolute_fractional_error': absolute_fractional_error,
+        }
+
+        # per molecule values for downstream debugging
+        record_values = {
+            'electron_density_method': electron_density_method,
+            'electron_density_wfn_path': wfn_path,
+            'electron_density_artifact_dir': molecule_dir,
+            'electron_density_true_cube_paths': true_cube_paths,
+            'electron_density_predicted_cube_paths': pred_cube_paths,
+            'electron_density_grid_shape': list(true_cube_metadata['grid_shape']),
+            'electron_density_voxel_volume_au3': voxel_volume,
+            'electron_density_true_integral': true_density_integral,
+            'electron_density_predicted_integral': pred_density_integral,
+        }
+
+        return metric_values, record_values
+
+
+    # ----------------------------------------------------------------------------------------------------
+    # downstream predictions
+
+
+    # ----------------------------------------------------------------------------------------------------
+    # downstream task wrappers
+
+    def run_downstream_calculations(
+        self,
+        downstream_calculations,
+        pred_mat,
+        true_mat,
+        batch,
+        batch_index,
+        qmugs_data_dir: str = None,
+        artifacts_dir: str = None,
+        # electron density related configs
+        electron_density_method: str = 'cubeprop',
+        cubeprop_grid_spacing=None,
+        cubeprop_num_grid_points=None,
+        manual_density_padding_angstrom: float = 3.0,
+        manual_density_spacing_angstrom=None,
+        manual_density_num_grid_points=None,
+        manual_density_block_size: int = 2000,
+    ):
+        '''run requested downstream physics calculations for one conformer'''
+
+        metric_values = {}
+        record_values = {}
+
+        # run each requested downstream physics task
+        for calculation in downstream_calculations:
+            if calculation == 'dipole_moment':
+                log("[INFO] Running downstream dipole moment calculations", rank=0)
+                calculation_metrics, calculation_record = self.run_downstream_dipole_moment_calculation(
+                    pred_mat=pred_mat,
+                    true_mat=true_mat,
+                    batch=batch,
+                    batch_index=batch_index,
+                    qmugs_data_dir=qmugs_data_dir,
+                )
+            elif calculation == 'electron_density':
+                log("[INFO] Running downstream electron density calculations", rank=0)
+                calculation_metrics, calculation_record = self.run_downstream_electron_density_calculation(
+                    pred_mat=pred_mat,
+                    true_mat=true_mat,
+                    batch=batch,
+                    batch_index=batch_index,
+                    qmugs_data_dir=qmugs_data_dir,
+                    artifacts_dir=artifacts_dir,
+                    electron_density_method=electron_density_method,
+                    cubeprop_grid_spacing=cubeprop_grid_spacing,
+                    cubeprop_num_grid_points=cubeprop_num_grid_points,
+                    manual_density_padding_angstrom=manual_density_padding_angstrom,
+                    manual_density_spacing_angstrom=manual_density_spacing_angstrom,
+                    manual_density_num_grid_points=manual_density_num_grid_points,
+                    manual_density_block_size=manual_density_block_size,
+                )
+            else:
+                raise NotImplementedError(f"Unknown downstream calculation: {calculation}")
+
+            metric_values.update(calculation_metrics)
+            record_values.update(calculation_record)
+
+        return metric_values, record_values
+
+
+    def run_downstream_predictions(self, downstream_predictions):
+        '''raise for requested downstream ML predictions until they are implemented'''
+
+        if downstream_predictions is None or len(downstream_predictions) == 0:
+            raise ValueError("run_downstream_prediction=True requires at least one downstream prediction")
+
+        # downstream ML predictions are a reserved interface for future work
+        raise NotImplementedError(
+            f"Downstream ML predictions are not implemented yet: {downstream_predictions}"
+        )
+
 
     # ----------------------------------------------------------------------------------------------------
     # helpers for more optimized inference with streaming across MPI ranks
@@ -955,9 +1639,25 @@ class QMugsInference:
                 'sum': 0.0,
                 'sumsq': 0.0,
             },
+
+            # downstream calculation metrics
+            'downstream_metric_names': [],
         }
 
         return state
+
+
+    def _ensure_streaming_metric(self, state, name):
+        '''add a scalar metric accumulator if it has not been initialized'''
+
+        if name in state:
+            return
+
+        state[name] = {
+            'sum': 0.0,
+            'sumsq': 0.0,
+        }
+        state['downstream_metric_names'].append(name)
 
 
     def _update_scalar_metric(self, state, name, value):
@@ -977,6 +1677,8 @@ class QMugsInference:
         criterions,
         save_per_matrix_metrics=False,
         per_matrix_metrics=None, # persisted dict of per matrix metrics
+        downstream_metric_values=None,
+        downstream_record_values=None,
     ):
         '''update local streaming metrics from one unpadded matrix pair'''
 
@@ -1107,6 +1809,30 @@ class QMugsInference:
         if save_per_matrix_metrics:
             record['cosine_similarity'] = cosine_similarity
 
+        # ----------------------------------------------------------------------------------------------------
+        # downstream calculation metrics
+        if downstream_metric_values is not None:
+            for name, value in downstream_metric_values.items():
+                value = float(value)
+                self._ensure_streaming_metric(
+                    state=state,
+                    name=name,
+                )
+                self._update_scalar_metric(
+                    state=state,
+                    name=name,
+                    value=value,
+                )
+
+                if save_per_matrix_metrics:
+                    record[name] = value
+
+        if save_per_matrix_metrics and downstream_record_values is not None:
+            record.update(downstream_record_values)
+
+        # ----------------------------------------------------------------------------------------------------
+
+        if save_per_matrix_metrics:
             # save record for downstream analysis
             per_matrix_metrics.append(record)
 
@@ -1146,103 +1872,105 @@ class QMugsInference:
                 'std': var ** 0.5,
             }
 
+        # finalize downstream calculation metrics
+        for name in state['downstream_metric_names']:
+            mean = state[name]['sum'] / count
+            var = max(state[name]['sumsq'] / count - mean * mean, 0.0)
+            results[name] = {
+                'mean': mean,
+                'std': var ** 0.5,
+            }
+
         results['count'] = count
 
         return results
-    
-    # ----------------------------------------------------------------------------------------------------
-    # inference with streaming across MPI ranks
 
-    def run_streaming_inference(
-        self,
-        dataset,
-        evaluate=True,
-        criterions=['mse', 'mae', 'smooth_l1', 'rmse'],
-        return_numpy_matrices=False,
-        save_per_matrix_metrics=False,
-        batch_size=1,
-    ):
-        '''runs inference with model on preloaded or lazy dataset'''
 
-        # disable matrix storage for streaming inference
-        if return_numpy_matrices:
-            raise NotImplementedError('return_numpy_matrices=True is disabled for streaming inference')
+    def _get_batch_attr_value(self, batch, name, batch_index):
+        '''return one graph-level attribute from a PyG batch'''
 
-        inference_start_time = time.time()
-        max_size = QMugsDataset.max_padded_density_matrix_dimension
+        # PyG stores string attributes as lists after batching
+        value = getattr(batch, name)
+        if isinstance(value, (list, tuple)):
+            return value[batch_index]
 
-        # initialize local metric accumulators
-        streaming_state = None
-        if evaluate:
-            streaming_state = self._init_streaming_metric_state(criterions=criterions)
-        per_matrix_metrics = []
+        # tensor attributes are indexed by batch position
+        if torch.is_tensor(value):
+            if value.dim() == 0:
+                return value.item()
+            return value[batch_index].item()
 
-        # lazy dataloader
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
+        return value
+
+
+    def _load_qmugs_archive_map(self, qmugs_data_dir: str):
+        '''load the CHEMBL ID to wavefunction archive map for QMugs'''
+
+        # cache archive lookup by QMugs data directory
+        qmugs_data_dir = os.path.abspath(qmugs_data_dir)
+        if qmugs_data_dir in self._qmugs_archive_maps:
+            return self._qmugs_archive_maps[qmugs_data_dir]
+
+        # old pickled datasets need tarball_assignment.csv to infer paths
+        tarball_path = os.path.join(qmugs_data_dir, 'tarball_assignment.csv')
+        if not os.path.isfile(tarball_path):
+            raise FileNotFoundError(
+                f"Cannot infer wfn_path because tarball_assignment.csv was not found: {tarball_path}"
+            )
+
+        # map CHEMBL ID to wavefunction archive directory
+        tarball_assignment = pd.read_csv(tarball_path)
+        archive_map = {}
+        for _, row in tarball_assignment.iterrows():
+            archive_map[row['chembl_id']] = row['archive_name'].split('.')[0]
+
+        self._qmugs_archive_maps[qmugs_data_dir] = archive_map
+        return archive_map
+
+
+    def _resolve_wfn_path(self, batch, batch_index, qmugs_data_dir: str = None):
+        '''return the Psi4 wavefunction path for one batched conformer'''
+
+        # use stored path for newly preprocessed datasets
+        if hasattr(batch, 'wfn_path'):
+            wfn_path = self._get_batch_attr_value(
+                batch=batch,
+                name='wfn_path',
+                batch_index=batch_index,
+            )
+            if wfn_path is not None and str(wfn_path) != '':
+                return str(wfn_path)
+
+        # fall back to QMugs directory conventions for old datasets
+        if qmugs_data_dir is None:
+            raise ValueError(
+                "Cannot infer wfn_path for an old pickle dataset without qmugs_data_dir"
+            )
+
+        # identify molecule and conformer in the batch
+        chembl_id = str(self._get_batch_attr_value(
+            batch=batch,
+            name='chembl_id',
+            batch_index=batch_index,
+        ))
+        conformer_id = str(self._get_batch_attr_value(
+            batch=batch,
+            name='conformer_id',
+            batch_index=batch_index,
+        )).zfill(2)
+
+        # construct canonical wavefunction file path
+        archive_map = self._load_qmugs_archive_map(qmugs_data_dir=qmugs_data_dir)
+        if chembl_id not in archive_map:
+            raise KeyError(f"CHEMBL ID {chembl_id} not found in tarball_assignment.csv")
+
+        return os.path.join(
+            qmugs_data_dir,
+            'wfns',
+            archive_map[chembl_id],
+            chembl_id,
+            f'wfn_conf_{conformer_id}.npy',
         )
-
-        # run inference
-        for batch in loader:
-            batch = batch.to(self.device)
-
-            with torch.no_grad():
-                with self.autocast_ctx:
-                    pred = self.model(batch)
-
-                # total density matrix prediction
-                if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
-                    pred_batch = pred[0].reshape(-1, max_size, max_size)
-                    true_batch = batch.density_matrix.reshape(-1, max_size, max_size)
-                    dims_batch = batch.density_matrix_dim
-                else:
-                    raise NotImplementedError
-
-                # postprocess matrices
-                for batch_index, (raw_pred_mat, raw_true_mat, dim) in enumerate(zip(
-                    pred_batch,
-                    true_batch,
-                    dims_batch,
-                )):
-                    assert(raw_pred_mat.shape == raw_true_mat.shape)
-                    assert(raw_pred_mat.shape[0] == max_size)
-
-                    # unpad matrices to original size
-                    dim = int(dim.item())
-                    pred_mat = raw_pred_mat[:dim, :dim]
-                    true_mat = raw_true_mat[:dim, :dim]
-
-                    # evaluate and update streaming metrics
-                    if evaluate:
-                        self._update_streaming_metric_state(
-                            state=streaming_state,
-                            pred_mat=pred_mat,
-                            true_mat=true_mat,
-                            batch=batch,
-                            batch_index=batch_index,
-                            criterions=criterions,
-                            save_per_matrix_metrics=save_per_matrix_metrics,
-                            per_matrix_metrics=per_matrix_metrics,
-                        )
-
-                    # release matrices from memory
-                    del pred_mat
-                    del true_mat
-
-            del batch
-            del pred
-
-        # finalize metrics
-        evaluation = {}
-        if evaluate:
-            evaluation = self._finalize_streaming_metric_state(state=streaming_state)
-
-        inference_time = time.time() - inference_start_time
-        evaluation['inference_time'] = inference_time
-
-        return evaluation, per_matrix_metrics
 
 
 # ----------------------------------------------------------------------------------------------------

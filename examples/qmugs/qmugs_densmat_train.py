@@ -89,6 +89,12 @@ if __name__ == "__main__":
     parser.add_argument("--everyone", action="store_true", help="gptimer")
     parser.add_argument("--modelname", help="model name")
     parser.add_argument(
+        "--artifacts_dir",
+        type=str,
+        default=None,
+        help="directory for preprocessing artifacts such as promolecular density matrices",
+    )
+    parser.add_argument(
         "--precision",
         type=str,
         choices=["fp32", "fp64", "bf16"],
@@ -149,24 +155,52 @@ if __name__ == "__main__":
             )
         QMugsDataset.max_padded_density_matrix_dimension = args.max_density_matrix_size
 
-    padding_dim = int((QMugsDataset.max_padded_density_matrix_dimension)**2)
-    
+    # N_pad already reflects any --update_max_padded_dimension override above
+    N_pad = QMugsDataset.max_padded_density_matrix_dimension
+
     # set up features
     var_config = config["NeuralNetwork"]["Variables_of_interest"]
+
+    # determine the task variant from the configured output names
+    if var_config["output_names"] == ['density_matrix']:
+        predict_alpha_beta = False
+        density_matrix_delta = False
+        upper_triangle = False
+    elif var_config["output_names"] == ['density_matrix_delta']:
+        predict_alpha_beta = False
+        density_matrix_delta = True
+        upper_triangle = False
+    elif var_config["output_names"] == ['density_matrix_uptr']:
+        predict_alpha_beta = False
+        density_matrix_delta = False
+        upper_triangle = True
+    elif var_config["output_names"] == ['density_matrix_delta_uptr']:
+        predict_alpha_beta = False
+        density_matrix_delta = True
+        upper_triangle = True
+    elif var_config["output_names"] == ['alpha_density_matrix', 'beta_density_matrix']:
+        predict_alpha_beta = True
+        density_matrix_delta = False
+        upper_triangle = False
+    else:
+        raise ValueError("Unknown configuration in 'Variables_of_interest' for density matrix learning task")
+
+    # the padded head length is T(N_pad) = N_pad(N_pad+1)/2 for upper-triangle targets, else N_pad**2
+    if upper_triangle:
+        padding_dim = int(N_pad * (N_pad + 1) // 2)
+    else:
+        padding_dim = int(N_pad ** 2)
+
+    graph_feature_names = list(var_config["output_names"])
+    graph_feature_dims = [padding_dim] * len(var_config["output_names"])
 
     if args.update_max_padded_dimension:
         var_config["output_dim"] = [padding_dim] * len(var_config["output_names"])
 
-    if var_config["output_names"] == ['density_matrix']:
-        graph_feature_names = ['density_matrix']
-        graph_feature_dims = [padding_dim]
-        predict_alpha_beta = False
-    elif var_config["output_names"] == ['alpha_density_matrix', 'beta_density_matrix']:
-        graph_feature_names = ['alpha_density_matrix', 'beta_density_matrix']
-        graph_feature_dims = [padding_dim, padding_dim]
-        predict_alpha_beta = True
-    else:
-        raise ValueError("Unknown configuration in 'Variables_of_interest' for density matrix learning task")
+    if density_matrix_delta and args.preonly and args.artifacts_dir is None:
+        raise ValueError("--artifacts_dir is required for delta density matrix preprocessing")
+    if density_matrix_delta and args.format != "pickle":
+        raise NotImplementedError("delta density matrix learning is implemented only for pickle datasets")
     
     node_feature_names = ['atomic_number', 'cartesian_coordinates']
     node_feature_dims = [1, 3]
@@ -222,6 +256,9 @@ if __name__ == "__main__":
             pad_density_matrix=True,
             mask_output_loss=mask_output_loss,
             predict_alpha_beta=predict_alpha_beta,
+            density_matrix_delta=density_matrix_delta,
+            upper_triangle=upper_triangle,
+            artifacts_dir=args.artifacts_dir,
         )
 
         if args.streaming_preonly:

@@ -4,10 +4,10 @@
     },
     "NeuralNetwork": {
     "Architecture": {
-      "mpnn_type": "EGNN",
+      "mpnn_type": "PAINN",
       "enable_interatomic_potential": false,
       "equivariance": true,
-      "max_neighbours": 50,
+      "max_neighbours": 7,
       "num_gaussians": 50,
       "num_filters": 50,
       "envelope_exponent": 5,
@@ -18,15 +18,16 @@
       "num_before_skip": 1,
       "num_radial": 6,
       "num_spherical": 7,
-      "radius": 5.0,
-      "hidden_dim": 200,
-      "num_conv_layers": 4,
+      "radius": 7.0,
+      "hidden_dim": 400,
+      "num_conv_layers": 6,
+      "graph_pooling": "sum",
       "output_heads": {
         "graph": {
-          "num_sharedlayers": 2,
-          "dim_sharedlayers": 50,
+          "num_sharedlayers": 1,
+          "dim_sharedlayers": 400,
           "num_headlayers": 2,
-          "dim_headlayers": [50, 100]
+          "dim_headlayers": [400, 1000]
         }
       },
       "task_weights": [1.0]
@@ -34,9 +35,9 @@
     "Variables_of_interest": {
       "input_node_features": [0],
       "output_index": [0],
-      "output_dim": [4008004],
+      "output_dim": [2005003],
       "output_names": [
-        "density_matrix"
+        "density_matrix_delta_uptr"
       ],
       "type": ["graph"],
       "mask_output_loss": {
@@ -52,6 +53,7 @@
     "Training": {
       "num_epoch": 5,
       "EarlyStopping": true,
+      "patience": 20,
       "Checkpoint": true,
       "perc_train": 0.8,
       "batch_size": 32,

@@ -1,4 +1,21 @@
-from .utils import build_xyz_grid_by_spacing, build_xyz_grid_by_num_points, frobenius_dist, fidelity, pad_density_matrix, unpad_density_matrix, get_density_matrix_mask, plot_density_matrix_mask
+from .utils import (
+    build_xyz_grid_by_spacing, 
+    build_xyz_grid_by_num_points, 
+    frobenius_dist, 
+    fidelity, 
+    pad_density_matrix, 
+    promolecular_density_matrix, 
+    unpad_density_matrix, 
+    get_density_matrix_mask, 
+    plot_density_matrix_mask,
+    triangular_number,
+    triangular_side,
+    is_triangular_number,
+    upper_triangle_vector,
+    upper_triangle_mask_vector,
+    physical_upper_triangle_indices,
+    symmetric_matrix_from_upper_triangle_vector,
+)
 
 __all__ = [
     'build_xyz_grid_by_spacing',
@@ -6,7 +23,15 @@ __all__ = [
     'frobenius_dist',
     'fidelity',
     'pad_density_matrix',
+    'promolecular_density_matrix',
     'unpad_density_matrix',
     'get_density_matrix_mask',
     'plot_density_matrix_mask',
+    'triangular_number',
+    'triangular_side',
+    'is_triangular_number',
+    'upper_triangle_vector',
+    'upper_triangle_mask_vector',
+    'physical_upper_triangle_indices',
+    'symmetric_matrix_from_upper_triangle_vector',
 ]

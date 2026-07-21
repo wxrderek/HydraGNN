@@ -76,6 +76,56 @@ For learning the total density matrix, set `config.json` as follows:
 }
 ```
 
+### Delta learning total density
+For delta learning the total density with the promolecular density matrix as a baseline, set `config.json` as follows:
+
+```
+"Variables_of_interest": {
+    "input_node_features": [0],
+    "output_index": [0],
+    "output_dim": [4008004],
+    "output_names": [
+        "density_matrix_delta"
+    ],
+    "type": ["graph"],
+    ...
+}
+```
+
+The preprocessing path requires `--artifacts_dir` and saves unpadded promolecular density matrices as float32 NumPy files under `artifacts_dir/promolecular_density_matrices/<chembl_id>/conf_<conformer_id>.npy`. Training targets are padded total-density deltas, while inference and figures add the stored promolecular baseline back before computing metrics or downstream physical quantities.
+
+### Learning only the upper triangle
+To learn only the upper triangle of the total density, set `config.json` as follows:
+
+```
+"Variables_of_interest": {
+    "input_node_features": [0],
+    "output_index": [0],
+    "output_dim": [2005003],
+    "output_names": [
+        "density_matrix_uptr"
+    ],
+    "type": ["graph"],
+    ...
+}
+```
+
+To delta learn only the upper triangle of the total density, set `config.json` as follows:
+
+```
+"Variables_of_interest": {
+    "input_node_features": [0],
+    "output_index": [0],
+    "output_dim": [2005003],
+    "output_names": [
+        "density_matrix_delta_uptr"
+    ],
+    "type": ["graph"],
+    ...
+}
+```
+
+
 ### Learning alpha and beta separately
 
 For learning alpha and beta density matrices separately, set `config.json` as follows:

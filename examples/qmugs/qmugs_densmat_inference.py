@@ -74,6 +74,45 @@ def _figs_sample_mode(args):
     return "random_molecules"
 
 
+def _density_matrix_max_size_from_var_config(var_config):
+    '''return padded density matrix size from model output dimension'''
+
+    total_density_names = [
+        ["density_matrix"],
+        ["density_matrix_delta"],
+        ["density_matrix_uptr"],
+        ["density_matrix_delta_uptr"],
+    ]
+    upper_triangle_names = [["density_matrix_uptr"], ["density_matrix_delta_uptr"]]
+    if var_config["output_names"] not in total_density_names:
+        return None
+
+    output_dim = int(var_config["output_dim"][0])
+    if var_config["output_names"] in upper_triangle_names:
+        # upper-triangle head length is T(N_pad) = N_pad(N_pad+1)/2
+        from utils import triangular_side
+        return triangular_side(output_dim)
+
+    # output_dim is N_pad ** 2 for the full total density matrix
+    max_size = int(round(output_dim ** 0.5))
+    if max_size * max_size != output_dim:
+        raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
+
+    return max_size
+
+
+def _model_output_names_from_config(model_dir: str):
+    '''return model output names from a saved HydraGNN config'''
+
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"config.json not found in {model_dir}")
+    with open(config_path, "r") as f:
+        model_config = json.load(f)
+
+    return model_config["NeuralNetwork"]["Variables_of_interest"]["output_names"]
+
+
 def _pre_mpi_rank():
     '''infer rank before distributed setup is initialized'''
 
@@ -104,6 +143,7 @@ def _save_inference_run_config(args, random_state: int):
     inference_config = {
         'model_dir': args.model_dir,
         'checkpoint_path': args.checkpoint_path,
+        'model_output_names': args.model_output_names,
         'basedir': args.basedir,
         'qmugs_data_dir': args.qmugs_data_dir,
         'artifacts_dir': args.artifacts_dir,
@@ -164,6 +204,27 @@ def _save_inference_run_config(args, random_state: int):
     return output_path
 
 
+def _update_downsampled_inference_run_config(
+    run_config_path: str,
+    downsample_config,
+    downsampled_test_conformers,
+):
+    '''record downsampled conformers in the saved inference config'''
+
+    if run_config_path is None or _pre_mpi_rank() != 0:
+        return
+
+    with open(run_config_path, "r") as f:
+        run_config = json.load(f)
+
+    inference_config = run_config["inference_config"]
+    inference_config["downsample_test_config"] = downsample_config
+    inference_config["downsampled_test_conformers"] = downsampled_test_conformers
+
+    with open(run_config_path, "w") as f:
+        json.dump(run_config, f, indent=4)
+
+
 if __name__ == "__main__":
 
     # ----------------------------------------------------------------------------------------------------
@@ -203,6 +264,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log", help="log name", default="QMugs_inference")
     parser.add_argument("--batch_size", type=int, help="batch size", default=1)
+    parser.add_argument(
+        "--perc_downsample_test",
+        type=float,
+        default=1.0,
+        help="proportion of test conformers to use for inference; 1.0 uses the full test set",
+    )
     parser.add_argument(
         "--run_downstream_calculation",
         action="store_true",
@@ -413,9 +480,19 @@ if __name__ == "__main__":
     # validate data dir
     if args.qmugs_data_dir is None:
         args.qmugs_data_dir = os.path.dirname(os.path.abspath(args.basedir))
+    args.model_output_names = _model_output_names_from_config(model_dir=args.model_dir)
     if args.artifacts_dir is None:
+        if args.model_output_names in [["density_matrix_delta"], ["density_matrix_delta_uptr"]]:
+            raise ValueError("--artifacts_dir is required for delta density matrix inference")
         args.artifacts_dir = os.path.join("logs", args.log, "artifacts")
     args.artifacts_dir = os.path.abspath(args.artifacts_dir)
+    
+    # validate downsampling request
+    if args.perc_downsample_test <= 0.0 or args.perc_downsample_test > 1.0:
+        raise ValueError(
+            f"--perc_downsample_test must satisfy 0 < perc_downsample_test <= 1, "
+            f"got {args.perc_downsample_test}"
+        )
 
     # save run-defining config before validation, distributed setup, data loading, or inference
     run_config_path = _save_inference_run_config(
@@ -470,8 +547,11 @@ if __name__ == "__main__":
     )
     config = pretrained_model.config
     var_config = config["NeuralNetwork"]["Variables_of_interest"]
+    max_size = _density_matrix_max_size_from_var_config(var_config=var_config)
 
     log(f"[DONE] Loaded HydraGNN pretrained model from {pretrained_model.checkpoint_path}", rank=0)
+    if max_size is not None:
+        log(f"[INFO] Density matrix padded dimension from model config: {max_size}", rank=0)
 
     # ----------------------------------------------------------------------------------------------------
     # load data
@@ -486,8 +566,69 @@ if __name__ == "__main__":
         var_config=var_config,
     )
 
-    # assign disjoint global pickle indices to each MPI rank
-    local_subset = list(range(rank, testset_meta.ntotal, world_size))
+    # choose global pickle indices before assigning disjoint work to MPI ranks
+    global_subset = list(range(testset_meta.ntotal))
+    downsample_config = None
+    downsampled_test_conformers = None
+
+    # perform downsampling
+    if args.perc_downsample_test < 1.0:
+        num_downsampled_conformers = max(1, int(testset_meta.ntotal * args.perc_downsample_test))
+        if num_downsampled_conformers < testset_meta.ntotal:
+            downsample_rng = np.random.default_rng(random_state)
+            global_subset = sorted([
+                int(index)
+                for index in downsample_rng.choice(
+                    testset_meta.ntotal,
+                    size=num_downsampled_conformers,
+                    replace=False,
+                )
+            ])
+            downsample_config = {
+                'perc_downsample_test': args.perc_downsample_test,
+                'downsample_test_seed': random_state,
+                'original_test_num_conformers': testset_meta.ntotal,
+                'downsampled_test_num_conformers': len(global_subset),
+            }
+
+            if rank == 0:
+                downsampled_test_conformers = []
+                for global_index in global_subset:
+                    data_object = testset_meta.read(global_index)
+                    downsampled_test_conformers.append([
+                        str(data_object.chembl_id),
+                        str(data_object.conformer_id),
+                    ])
+                    del data_object
+
+                _update_downsampled_inference_run_config(
+                    run_config_path=run_config_path,
+                    downsample_config=downsample_config,
+                    downsampled_test_conformers=downsampled_test_conformers,
+                )
+
+                log(
+                    "[INFO] Downsampled test conformers for inference: "
+                    f"{len(global_subset)}/{testset_meta.ntotal} "
+                    f"with perc_downsample_test={args.perc_downsample_test} "
+                    f"and seed={random_state}",
+                    rank=0,
+                )
+                if run_config_path is not None:
+                    log(
+                        "[INFO] Updated inference run config with downsampled test conformers: "
+                        f"{run_config_path}",
+                        rank=0,
+                    )
+        else:
+            log(
+                "[INFO] Requested test conformer downsampling selected the full test set; "
+                "using all test conformers",
+                rank=0,
+            )
+
+    # assign disjoint selected global pickle indices to each MPI rank
+    local_subset = global_subset[rank::world_size]
 
     # create rank-local lazy dataset view
     testset = SimplePickleDataset(
@@ -499,8 +640,8 @@ if __name__ == "__main__":
     )
 
     log(
-        "[DONE] testset global size: %d, local size on rank %d: %d"
-        % (testset_meta.ntotal, rank, len(testset)),
+        "[DONE] testset global size: %d, selected size: %d, local size on rank %d: %d"
+        % (testset_meta.ntotal, len(global_subset), rank, len(testset)),
         rank=0,
     )
 
@@ -516,6 +657,7 @@ if __name__ == "__main__":
         return_numpy_matrices=False,
         save_per_matrix_metrics=True,
         batch_size=args.batch_size,
+        max_size=max_size,
         run_downstream_calculation=args.run_downstream_calculation,
         downstream_calculations=args.downstream_calculations,
         qmugs_data_dir=args.qmugs_data_dir,

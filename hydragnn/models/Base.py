@@ -898,6 +898,18 @@ class Base(Module):
     # ----------------------------------------------------------------------------------------------------
     # new graph-level target masking treatment (Derek)
 
+    @staticmethod
+    def _decode_triangular_dim(length):
+        """Return n with n(n+1)/2 == length (row-major upper-triangle length), else None."""
+
+        import math
+
+        # invert the triangular number; exact only when length is actually triangular
+        n = (math.isqrt(8 * length + 1) - 1) // 2
+        if n * (n + 1) // 2 == length:
+            return n
+        return None
+
     def _compact_target_indices(
         self,
         head_dim,
@@ -923,6 +935,20 @@ class Base(Module):
 
                 # row-major indices select the physical upper-left block inside the padded target.
                 return (row_indices * full_matrix_dim + col_indices).reshape(-1)
+
+            # upper-triangle head: head_dim = T(N_pad), compact_length = T(target_dim).
+            n_pad_triangular = self._decode_triangular_dim(head_dim)
+            if (
+                n_pad_triangular is not None
+                and compact_length == target_dim * (target_dim + 1) // 2
+            ):
+                # row-major physical upper-triangle entries (i, j), 0 <= i <= j < target_dim.
+                iu = torch.triu_indices(target_dim, target_dim, device=device) # (2, T(target_dim))
+                rows = iu[0]
+                cols = iu[1]
+
+                # position of physical (i, j) within the row-major padded upper triangle.
+                return rows * n_pad_triangular - (rows * (rows - 1)) // 2 + (cols - rows)
 
             if target_dim == compact_length:
                 # 1D graph target: compact mask corresponds to the first target_dim vector entries.
@@ -995,12 +1021,19 @@ class Base(Module):
                 compact_length = sample_mask.numel()
             else:
                 # Reconstruct the unpadded physical size when no explicit test mask is stored.
+                # Square heads are checked first so a coincidentally triangular N_pad**2 is
+                # still treated as a full matrix (holds for the N_pad values used here).
                 full_matrix_dim = int(head_dim ** 0.5)
+                n_pad_triangular = self._decode_triangular_dim(head_dim)
                 if (
                     sample_target_dim is not None
                     and full_matrix_dim * full_matrix_dim == head_dim
                 ):
                     compact_length = int(sample_target_dim.item()) ** 2
+                elif sample_target_dim is not None and n_pad_triangular is not None:
+                    # upper-triangle head: physical compact length is T(target_dim).
+                    sample_dim = int(sample_target_dim.item())
+                    compact_length = sample_dim * (sample_dim + 1) // 2
                 elif sample_target_dim is not None:
                     compact_length = int(sample_target_dim.item())
                 else:

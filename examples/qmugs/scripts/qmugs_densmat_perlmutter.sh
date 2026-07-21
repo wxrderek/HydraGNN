@@ -17,9 +17,10 @@ function cmd() {
 }
 
 # --- Paths (override with environment variables if needed) ---
-HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
-EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
+HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/pscratch/sd/w/wxrderek/HydraGNN}
+echo "HydraGNN root: $HYDRAGNN_ROOT"
+VENV_PATH="$HYDRAGNN_ROOT/HydraGNN-Installation-Perlmutter/hydragnn_venv"
+EXAMPLE_DIR="$HYDRAGNN_ROOT/examples/qmugs"
 
 # --- Perlmutter module + conda setup ---
 # module reset
@@ -84,8 +85,8 @@ export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
 export BATCH_SIZE=32
 export NUM_EPOCH=5
-# export MAX_DENSITY_MATRIX_SIZE=800
-export UPDATE_MAX_PADDED_DIMENSION=0
+export MAX_DENSITY_MATRIX_SIZE=800
+export UPDATE_MAX_PADDED_DIMENSION=1
 
 export HYDRAGNN_DDSTORE_METHOD=1
 export HYDRAGNN_CUSTOM_DATALOADER=0
@@ -126,7 +127,7 @@ fi
 cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 --gpus-per-task=1 --gpu-bind=none -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
-    --log=qmugs-train-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION--everyone \
+    --log=qmugs-train-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION --everyone \
     --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
@@ -134,4 +135,4 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     --perc_load=0.01 \
     --perc_train=0.8 \
     "${SIZE_AWARE_ARGS[@]}" \
-    --modelname="QMugs001"
+    --modelname="QMugs001_max800_delta_uptr"

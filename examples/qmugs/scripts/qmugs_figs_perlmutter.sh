@@ -3,7 +3,7 @@
 #SBATCH -J QMugs-Figs
 #SBATCH -o figs-job-%j.out
 #SBATCH -e figs-job-%j.out
-#SBATCH -t 00:30:00
+#SBATCH -t 00:20:00
 #SBATCH -C cpu
 #SBATCH -q debug
 #SBATCH -N 1
@@ -16,14 +16,16 @@ function cmd() {
 }
 
 # --- Paths (override with environment variables if needed) ---
-HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
-EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
+HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/pscratch/sd/w/wxrderek/HydraGNN}
+echo "HydraGNN root: $HYDRAGNN_ROOT"
+VENV_PATH="$HYDRAGNN_ROOT/HydraGNN-Installation-Perlmutter/hydragnn_venv"
+EXAMPLE_DIR="$HYDRAGNN_ROOT/examples/qmugs"
 LOG_DIR=${LOG_DIR:-$HYDRAGNN_ROOT/logs/QMugs_inference}
 ARTIFACTS_DIR=${ARTIFACTS_DIR:-}
 
 # --- Figure configs ---
 # Metric figures always run; these flags enable sampled visualizations
+RUN_METRICS_FIGS=${RUN_METRICS_FIGS:-1}
 RUN_SAMPLE_FIGS=${RUN_SAMPLE_FIGS:-0}
 RUN_ELECTRON_DENSITY_FIGS=${RUN_ELECTRON_DENSITY_FIGS:-0}
 RUN_DIPOLE_FIGS=${RUN_DIPOLE_FIGS:-0}
@@ -31,6 +33,7 @@ FIGS_SAMPLE_MODE=${FIGS_SAMPLE_MODE:-random_molecules}
 FIGS_NUM_RANDOM_MOLECULES=${FIGS_NUM_RANDOM_MOLECULES:-2}
 FIGS_NUM_BEST_CONFORMERS=${FIGS_NUM_BEST_CONFORMERS:-2}
 FIGS_NUM_SMALLEST_MOLECULES=${FIGS_NUM_SMALLEST_MOLECULES:-2}
+FIGS_CHEMBL_IDS=${FIGS_CHEMBL_IDS:-}
 FIGS_SEED=${FIGS_SEED:-0}
 FIGS_DENSITY_POINT_FILTER=${FIGS_DENSITY_POINT_FILTER:-top_percentile}
 FIGS_DENSITY_TOP_PERCENTILE=${FIGS_DENSITY_TOP_PERCENTILE:-99.0}
@@ -110,18 +113,22 @@ export HYDRAGNN_CUSTOM_DATALOADER=1
 # ----------------------------------------------------------------------------------------------------
 # SET THESE
 
-LOG_DIR=$HYDRAGNN_ROOT/logs/QMugs_inference
-ARTIFACTS_DIR=/pscratch/sd/w/wxrderek/artifacts_model-QMugs001_data-QMugs001_TEST
+LOG_DIR=$HYDRAGNN_ROOT/logs/qmugs-inference-56206466-NN1
+ARTIFACTS_DIR=/pscratch/sd/w/wxrderek/artifacts/artifacts_model-QMugs001_max800_delta_uptr_data-QMugs001_max800_delta_uptr
+
+RUN_METRICS_FIGS=1
 
 RUN_SAMPLE_FIGS=1
 RUN_ELECTRON_DENSITY_FIGS=1
 RUN_DIPOLE_FIGS=1
-FIGS_SAMPLE_MODE="best_conformers"
-FIGS_NUM_BEST_CONFORMERS=2
-FIGS_NUM_SMALLEST_MOLECULES=2
+FIGS_SAMPLE_MODE="random_molecules"
+# FIGS_NUM_BEST_CONFORMERS=3
+# FIGS_NUM_SMALLEST_MOLECULES=5
+FIGS_NUM_RANDOM_MOLECULES=2
+# FIGS_CHEMBL_IDS=CHEMBL180570
 
-FIGS_SHOW_3D_AXE=0
-FIGS_HIDE_LEGEND=1
+FIGS_SHOW_3D_AXES=0
+FIGS_HIDE_LEGEND=0
 
 FIGS_MATRIX_POOL_SIZE=5
 FIGS_METRICS_NATOMS_BIN_SIZE=4
@@ -135,6 +142,9 @@ if [ -n "$ARTIFACTS_DIR" ]; then
     # cubeprops are read only when both true and predicted files are present
     FIGS_ARGS+=(--artifacts_dir="$ARTIFACTS_DIR")
 fi
+if [ "$RUN_METRICS_FIGS" = "1" ]; then
+    FIGS_ARGS+=(--run_metrics_visuals)
+fi
 if [ "$RUN_SAMPLE_FIGS" = "1" ]; then
     FIGS_ARGS+=(--run_sample_visuals)
 fi
@@ -145,7 +155,12 @@ if [ "$RUN_DIPOLE_FIGS" = "1" ]; then
     FIGS_ARGS+=(--run_dipole_visuals)
 fi
 
-if [ "$FIGS_SAMPLE_MODE" = "best_conformers" ]; then
+if [ -n "$FIGS_CHEMBL_IDS" ]; then
+    FIGS_ARGS+=(--chembl_ids)
+    for chembl_id in ${FIGS_CHEMBL_IDS//,/ }; do
+        FIGS_ARGS+=("$chembl_id")
+    done
+elif [ "$FIGS_SAMPLE_MODE" = "best_conformers" ]; then
     FIGS_ARGS+=(--best_conformers)
 elif [ "$FIGS_SAMPLE_MODE" = "smallest_molecules" ]; then
     FIGS_ARGS+=(--smallest_molecules)

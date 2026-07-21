@@ -1,6 +1,6 @@
 # Task: Upgrade Inference
 
-Status: DONE
+Status: Done
 Estimated scope: small
 
 ---

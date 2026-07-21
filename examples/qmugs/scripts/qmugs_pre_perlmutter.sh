@@ -16,9 +16,10 @@ function cmd() {
 }
 
 # --- Paths (override with environment variables if needed) ---
-HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
-EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
+HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/pscratch/sd/w/wxrderek/HydraGNN}
+echo "HydraGNN root: $HYDRAGNN_ROOT"
+VENV_PATH="$HYDRAGNN_ROOT/HydraGNN-Installation-Perlmutter/hydragnn_venv"
+EXAMPLE_DIR="$HYDRAGNN_ROOT/examples/qmugs"
 
 # --- Perlmutter module + conda setup ---
 # module reset
@@ -115,11 +116,15 @@ if [ "$UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
     SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
 fi
 
-cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=1 -l --kill-on-bad-exit=1 \
+# --- More paths ---
+ARTIFACTS_DIR=/pscratch/sd/w/wxrderek/artifacts/artifacts_model-QMugs001_max800_delta_uptr_data-QMugs001_max800_delta_uptr
+
+cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-node=4 -l --kill-on-bad-exit=1 \
     --export=ALL \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
     --log=qmugs-pre-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-PM-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION --everyone \
     --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
+    --artifacts_dir="$ARTIFACTS_DIR" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
@@ -128,4 +133,4 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     "${SIZE_AWARE_ARGS[@]}" \
     --preonly \
     --streaming_preonly \
-    --modelname="QMugs001"
+    --modelname=QMugs001_max800_delta_uptr

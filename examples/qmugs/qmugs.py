@@ -66,6 +66,26 @@ NUM_CONFORMERS = 1992984
 BOHR_TO_ANGSTROM = 0.52917721092
 DIPOLE_AU_TO_DEBYE = 2.541746473
 
+PROMOLECULAR_DENSITY_MATRIX_SUBDIR = 'promolecular_density_matrices'
+
+# total density matrix output names, including the delta and upper-triangle variants
+DENSITY_MATRIX_OUTPUT_NAMES = [
+    ['density_matrix'],
+    ['density_matrix_delta'],
+    ['density_matrix_uptr'],
+    ['density_matrix_delta_uptr'],
+]
+# output names whose target is a delta against the promolecular baseline
+DELTA_OUTPUT_NAMES = [
+    ['density_matrix_delta'],
+    ['density_matrix_delta_uptr'],
+]
+# output names that store/predict only the row-major upper triangle
+UPPER_TRIANGLE_OUTPUT_NAMES = [
+    ['density_matrix_uptr'],
+    ['density_matrix_delta_uptr'],
+]
+
 
 # ----------------------------------------------------------------------------------------------------
 # QMugs dataset class
@@ -87,6 +107,9 @@ class QMugsDataset(AbstractBaseDataset):
         pad_density_matrix=True,
         mask_output_loss=None,
         predict_alpha_beta=False,
+        density_matrix_delta=False,
+        upper_triangle=False,
+        artifacts_dir=None,
         normalize=False, # NOT IMPLEMENTED YET
     ):
         super().__init__()
@@ -98,7 +121,20 @@ class QMugsDataset(AbstractBaseDataset):
 
         self.pad_density_matrix = pad_density_matrix
         self.predict_alpha_beta = predict_alpha_beta
+        self.density_matrix_delta = density_matrix_delta
+        # when True, store only the row-major upper triangle of the (padded) density matrix
+        self.upper_triangle = upper_triangle
         self.normalize=normalize
+        self.artifacts_dir = os.path.abspath(artifacts_dir) if artifacts_dir is not None else None
+
+        if self.density_matrix_delta and self.predict_alpha_beta:
+            raise NotImplementedError("Delta learning is implemented only for total density matrices")
+        if self.upper_triangle and self.predict_alpha_beta:
+            raise NotImplementedError("Upper triangle prediction is implemented only for total density matrices")
+        if self.upper_triangle and not self.pad_density_matrix:
+            raise NotImplementedError("Upper triangle prediction requires padded density matrices")
+        if self.density_matrix_delta and self.artifacts_dir is None:
+            raise ValueError("artifacts_dir is required for density_matrix_delta preprocessing")
 
         # parse masking configuration as specified
         if mask_output_loss is not None:
@@ -160,7 +196,8 @@ class QMugsDataset(AbstractBaseDataset):
 
 
     # ----------------------------------------------------------------------------------------------------
-    # pre and post processing of densities
+    # pre and post processing of density matrices
+
     def _pad_density_matrix(self, density_matrix):
         '''pad density matrix with 0's to match maximal dimension in dataset'''
 
@@ -190,6 +227,42 @@ class QMugsDataset(AbstractBaseDataset):
         )
 
         return mask
+
+
+    def _density_matrix_delta_target(
+        self,
+        psi4_wfn,
+        density_matrix: np.ndarray,
+        chembl_id: str,
+        conformer_id: str,
+    ):
+        '''return the delta target and save the promolecular baseline'''
+
+        from utils import promolecular_density_matrix
+        if self.artifacts_dir is None:
+            raise ValueError("artifacts_dir is required for promolecular density matrices")
+
+        density_matrix = np.asarray(density_matrix, dtype=np.float64) # (n_basis, n_basis)
+        promolecular_matrix = promolecular_density_matrix(psi4_wfn) # (n_basis, n_basis)
+        assert promolecular_matrix.shape == density_matrix.shape
+
+        promolecular_path = os.path.join(
+            self.artifacts_dir,
+            PROMOLECULAR_DENSITY_MATRIX_SUBDIR,
+            str(chembl_id),
+            f"conf_{str(conformer_id).zfill(2)}.npy",
+        )
+
+        os.makedirs(os.path.dirname(promolecular_path), exist_ok=True)
+        np.save(
+            promolecular_path,
+            promolecular_matrix.astype(np.float32, copy=False),
+        )
+
+        density_matrix_delta = density_matrix - promolecular_matrix # (n_basis, n_basis)
+        assert density_matrix_delta.shape == density_matrix.shape
+
+        return density_matrix_delta, promolecular_path
 
     # ----------------------------------------------------------------------------------------------------
     # dataset prep
@@ -221,6 +294,7 @@ class QMugsDataset(AbstractBaseDataset):
         Da = psi4_wfn.Da().np
         Db = psi4_wfn.Db().np
         D_tot = Da + Db
+        promolecular_density_matrix_path = ''
 
         # save original density matrix dimension
         density_matrix_dim = torch.tensor(int(Da.shape[0]), dtype=torch.int32)
@@ -230,6 +304,21 @@ class QMugsDataset(AbstractBaseDataset):
         if D_tot.shape[0] > self.__class__.max_padded_density_matrix_dimension:
             raise ValueError(f'A loaded density matrix has size {D_tot.shape}, the output dimension is {self.__class__.max_padded_density_matrix_dimension}')
 
+        # optionally replace the total density target by total density minus SAD baseline
+        if self.density_matrix_delta:
+            D_tot, promolecular_density_matrix_path = self._density_matrix_delta_target(
+                psi4_wfn=psi4_wfn,
+                density_matrix=D_tot,
+                chembl_id=chembl_id,
+                conformer_id=conformer_id,
+            )
+            assert D_tot.shape == (density_matrix_dim_int, density_matrix_dim_int)
+
+        # the row-major upper-triangle indices are reused by both the target and the mask below
+        upper_triangle_indices = None
+        if self.upper_triangle:
+            upper_triangle_indices = np.triu_indices(density_matrix_dim_int) # 2 x (T(n_basis),)
+
         # pad density matrix
         if self.pad_density_matrix:
             if self.predict_alpha_beta:
@@ -238,7 +327,17 @@ class QMugsDataset(AbstractBaseDataset):
 
                 Da = torch.from_numpy(Da).to(torch.float32)
                 Db = torch.from_numpy(Db).to(torch.float32)
-            else: 
+            elif self.upper_triangle:
+                # store only the row-major upper triangle of the padded matrix
+                from utils import upper_triangle_vector
+                N_pad = self.__class__.max_padded_density_matrix_dimension
+                D_tot = upper_triangle_vector(
+                    D_tot,
+                    N_pad,
+                    triu_indices=upper_triangle_indices,
+                ) # (T(N_pad),)
+                D_tot = torch.from_numpy(D_tot).to(torch.float32)
+            else:
                 D_tot = self._pad_density_matrix(D_tot.copy())
                 D_tot = torch.from_numpy(D_tot).to(torch.float32)
         else:
@@ -334,11 +433,19 @@ class QMugsDataset(AbstractBaseDataset):
                     perc_atom_pairs_masked=self.mask_config.get('perc_atom_pairs_masked', 0.2),
                 )
             # mask out the padded region only
-            else: 
+            else:
                 density_mask = np.ones((density_matrix_dim_int, density_matrix_dim_int), dtype=bool)
 
-            # store compact mask with shape (n_basis, n_basis), not padded to (2002, 2002)
+            # the compact mask has shape (n_basis, n_basis), not padded to (2002, 2002)
             assert density_mask.shape == (density_matrix_dim_int, density_matrix_dim_int)
+
+            if self.upper_triangle:
+                # keep only the row-major upper triangle of the mask to match the upper-triangle target
+                from utils import upper_triangle_mask_vector
+                density_mask = upper_triangle_mask_vector(
+                    density_mask,
+                    triu_indices=upper_triangle_indices,
+                ) # (T(n_basis),)
             density_mask = torch.from_numpy(density_mask).to(torch.bool)
         
 
@@ -399,22 +506,30 @@ class QMugsDataset(AbstractBaseDataset):
                 chemical_composition=chemical_composition,
                 smiles_string=None, # available in QMugs summary.csv file, which is currently not being parsed
                 x=x,
-                y=D_tot, # y has shape (2002, 2002) when padding is enabled
-                y_mask=density_mask, # y_mask has compact shape (n_basis, n_basis), not padded
+                # y is (N_pad, N_pad) for the full matrix, or (T(N_pad),) for the upper triangle
+                y=D_tot,
+                # y_mask is compact (n_basis, n_basis), or (T(n_basis),) for the upper triangle
+                y_mask=density_mask,
                 # auxiliary inputs
                 density_matrix_dim=density_matrix_dim,
                 chembl_id=chembl_id,
                 conformer_id=conformer_id,
                 wfn_path=wfn_path,
+                promolecular_density_matrix_path=promolecular_density_matrix_path,
                 natoms_int=natoms_int,
                 charge=charge,
                 multiplicity=multiplicity,
                 graph_attr=graph_attr,
             )
-            
-            # y_mask_loc records compact mask offsets: (1, 2) for one density-matrix head
+
+            # y_mask_loc records the compact mask length for the single density-matrix head
+            if self.upper_triangle:
+                # compact upper-triangle mask has T(n_basis) = n_basis(n_basis+1)/2 entries
+                compact_mask_length = density_matrix_dim_int * (density_matrix_dim_int + 1) // 2
+            else:
+                compact_mask_length = density_matrix_dim_int ** 2
             data_object.y_mask_loc = torch.tensor(
-                [[0, density_matrix_dim_int ** 2]],
+                [[0, compact_mask_length]],
                 dtype=torch.int64,
             )
 
@@ -931,7 +1046,137 @@ class QMugsInference:
         for p in self.model.parameters():
             p.requires_grad_(False) # freeze parameters
         self.model = self.model.to(dtype=param_dtype, device=device)
-    
+
+
+    def _resolve_promolecular_density_matrix_path(
+        self,
+        batch,
+        batch_index,
+        artifacts_dir: str = None,
+    ):
+        '''return the promolecular density matrix path for one batched conformer'''
+
+        if hasattr(batch, 'promolecular_density_matrix_path'):
+            promolecular_path = self._get_batch_attr_value(
+                batch=batch,
+                name='promolecular_density_matrix_path',
+                batch_index=batch_index,
+            )
+            if promolecular_path is not None and str(promolecular_path) != '':
+                return str(promolecular_path)
+
+        if artifacts_dir is None:
+            raise ValueError("artifacts_dir is required for density_matrix_delta inference")
+
+        chembl_id = str(self._get_batch_attr_value(
+            batch=batch,
+            name='chembl_id',
+            batch_index=batch_index,
+        ))
+        conformer_id = str(self._get_batch_attr_value(
+            batch=batch,
+            name='conformer_id',
+            batch_index=batch_index,
+        ))
+
+        return os.path.join(
+            artifacts_dir,
+            PROMOLECULAR_DENSITY_MATRIX_SUBDIR,
+            chembl_id,
+            f"conf_{conformer_id.zfill(2)}.npy",
+        )
+
+
+    def _load_promolecular_density_matrix(
+        self,
+        batch,
+        batch_index,
+        artifacts_dir: str,
+        dim: int,
+        device,
+        dtype,
+    ):
+        '''load one promolecular density matrix as a tensor'''
+
+        promolecular_path = self._resolve_promolecular_density_matrix_path(
+            batch=batch,
+            batch_index=batch_index,
+            artifacts_dir=artifacts_dir,
+        )
+        if not os.path.isfile(promolecular_path):
+            raise FileNotFoundError(
+                f"Promolecular density matrix not found: {promolecular_path}"
+            )
+
+        promolecular_np = np.load(promolecular_path).astype(np.float32, copy=False) # (n_basis, n_basis)
+        if promolecular_np.shape != (dim, dim):
+            raise ValueError(
+                f"Promolecular density matrix has shape {promolecular_np.shape}, "
+                f"expected {(dim, dim)}"
+            )
+
+        return torch.as_tensor(
+            promolecular_np,
+            dtype=dtype,
+            device=device,
+        )
+
+
+    def _reconstruct_total_density_if_delta(
+        self,
+        pred_mat,
+        true_mat,
+        batch,
+        batch_index,
+        artifacts_dir: str,
+        dim: int,
+    ):
+        '''add the promolecular baseline when predictions are deltas'''
+
+        output_names = self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"]
+        if output_names not in DELTA_OUTPUT_NAMES:
+            return pred_mat, true_mat, None
+
+        promolecular_mat = self._load_promolecular_density_matrix(
+            batch=batch,
+            batch_index=batch_index,
+            artifacts_dir=artifacts_dir,
+            dim=dim,
+            device=pred_mat.device,
+            dtype=pred_mat.dtype,
+        ) # (n_basis, n_basis)
+
+        pred_total = pred_mat + promolecular_mat # (n_basis, n_basis)
+        true_total = true_mat + promolecular_mat # (n_basis, n_basis)
+        assert pred_total.shape == true_total.shape
+
+        promolecular_path = self._resolve_promolecular_density_matrix_path(
+            batch=batch,
+            batch_index=batch_index,
+            artifacts_dir=artifacts_dir,
+        )
+
+        return pred_total, true_total, promolecular_path
+
+
+    def _fold_padded_upper_triangle(self, padded_vector, dim: int, max_size: int):
+        '''reconstruct one full symmetric (dim, dim) matrix from a padded upper-triangle vector'''
+
+        # padded_vector holds the row-major upper triangle of the padded (max_size, max_size) matrix
+        device = padded_vector.device
+        iu = torch.triu_indices(dim, dim, device=device) # (2, T(dim)), row-major
+        rows = iu[0]
+        cols = iu[1]
+
+        # position of physical entry (i, j) within the padded upper-triangle vector
+        offsets = rows * max_size - (rows * (rows - 1)) // 2 + (cols - rows) # (T(dim),)
+        physical = padded_vector[offsets] # (T(dim),)
+
+        full = torch.zeros((dim, dim), dtype=padded_vector.dtype, device=device) # (dim, dim)
+        full[rows, cols] = physical
+        full[cols, rows] = physical # mirror to enforce Hermitian symmetry
+        return full
+
 
     ######################################################################################################
     # DEFUNCT
@@ -1029,6 +1274,7 @@ class QMugsInference:
         return_numpy_matrices=False,
         save_per_matrix_metrics=False,
         batch_size=1,
+        max_size: int = None,
         # downstream calculations
         run_downstream_calculation=False,
         downstream_calculations=None,
@@ -1067,9 +1313,37 @@ class QMugsInference:
         if run_downstream_prediction:
             self.run_downstream_predictions(downstream_predictions=downstream_predictions)
 
+        # get output names of trained model
+        output_names = self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"]
+        if output_names in DELTA_OUTPUT_NAMES and artifacts_dir is None:
+            raise ValueError("artifacts_dir is required for delta density matrix inference")
+        if artifacts_dir is not None:
+            artifacts_dir = os.path.abspath(artifacts_dir)
+
+        # upper-triangle models store the padded upper triangle instead of the full matrix
+        is_upper_triangle = output_names in UPPER_TRIANGLE_OUTPUT_NAMES
+
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         inference_start_time = time.time()
-        max_size = QMugsDataset.max_padded_density_matrix_dimension
+
+        # max_size is the padded matrix dimension N_pad used by the trained model
+        if max_size is None:
+            var_config = self.config["NeuralNetwork"]["Variables_of_interest"]
+            if var_config["output_names"] in DENSITY_MATRIX_OUTPUT_NAMES:
+                output_dim = int(var_config["output_dim"][0])
+                if is_upper_triangle:
+                    # upper-triangle head length is T(N_pad) = N_pad(N_pad+1)/2
+                    from utils import triangular_side
+                    max_size = triangular_side(output_dim)
+                else:
+                    max_size = int(round(output_dim ** 0.5))
+                    if max_size * max_size != output_dim:
+                        raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
+            else:
+                max_size = QMugsDataset.max_padded_density_matrix_dimension
+        max_size = int(max_size)
+        if max_size <= 0:
+            raise ValueError(f"max_size must be a positive integer, got {max_size}")
 
         # initialize local metric accumulators
         streaming_state = None
@@ -1111,10 +1385,16 @@ class QMugsInference:
                     pred = self.model(batch)
 
                 # total density matrix prediction
-                if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] == ['density_matrix']:
-                    pred_batch = pred[0].reshape(-1, max_size, max_size)
-                    true_batch = batch.y.reshape(-1, max_size, max_size)
+                if output_names in DENSITY_MATRIX_OUTPUT_NAMES:
                     dims_batch = batch.density_matrix_dim
+                    if is_upper_triangle:
+                        # pred and target are padded upper-triangle vectors of length T(N_pad)
+                        tri_len = max_size * (max_size + 1) // 2
+                        pred_batch = pred[0].reshape(-1, tri_len) # (batch, T(N_pad))
+                        true_batch = batch.y.reshape(-1, tri_len) # (batch, T(N_pad))
+                    else:
+                        pred_batch = pred[0].reshape(-1, max_size, max_size)
+                        true_batch = batch.y.reshape(-1, max_size, max_size)
                 else:
                     raise NotImplementedError
 
@@ -1125,12 +1405,25 @@ class QMugsInference:
                     dims_batch,
                 )):
                     assert(raw_pred_mat.shape == raw_true_mat.shape)
-                    assert(raw_pred_mat.shape[0] == max_size)
 
-                    # unpad matrices to original size
                     dim = int(dim.item())
-                    pred_mat = raw_pred_mat[:dim, :dim]
-                    true_mat = raw_true_mat[:dim, :dim]
+                    if is_upper_triangle:
+                        # fold each padded upper triangle into a full symmetric (dim, dim) matrix
+                        pred_mat = self._fold_padded_upper_triangle(raw_pred_mat, dim, max_size) # (dim, dim)
+                        true_mat = self._fold_padded_upper_triangle(raw_true_mat, dim, max_size) # (dim, dim)
+                    else:
+                        assert(raw_pred_mat.shape[0] == max_size)
+                        # unpad matrices to original size
+                        pred_mat = raw_pred_mat[:dim, :dim]
+                        true_mat = raw_true_mat[:dim, :dim]
+                    pred_mat, true_mat, promolecular_path = self._reconstruct_total_density_if_delta(
+                        pred_mat=pred_mat,
+                        true_mat=true_mat,
+                        batch=batch,
+                        batch_index=batch_index,
+                        artifacts_dir=artifacts_dir,
+                        dim=dim,
+                    )
                     local_matrix_count += 1
 
                     downstream_metric_values = None
@@ -1166,6 +1459,7 @@ class QMugsInference:
                             per_matrix_metrics=per_matrix_metrics,
                             downstream_metric_values=downstream_metric_values,
                             downstream_record_values=downstream_record_values,
+                            promolecular_density_matrix_path=promolecular_path,
                         )
 
                     # release matrices from memory
@@ -1213,7 +1507,8 @@ class QMugsInference:
         '''compute true and predicted dipole moments for one conformer'''
 
         # only total density matrix predictions are supported
-        if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] != ['density_matrix']:
+        output_names = self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"]
+        if output_names not in DENSITY_MATRIX_OUTPUT_NAMES:
             raise NotImplementedError(
                 "Downstream dipole moment calculations currently require total density matrix predictions"
             )
@@ -1325,7 +1620,8 @@ class QMugsInference:
         '''compute true and predicted electron density grid metrics for one conformer'''
 
         # only total density matrix predictions are supported
-        if self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"] != ['density_matrix']:
+        output_names = self.config["NeuralNetwork"]["Variables_of_interest"]["output_names"]
+        if output_names not in DENSITY_MATRIX_OUTPUT_NAMES:
             raise NotImplementedError("Downstream electron density calculations currently require total density matrix predictions")
         
         # validate method
@@ -1679,6 +1975,7 @@ class QMugsInference:
         per_matrix_metrics=None, # persisted dict of per matrix metrics
         downstream_metric_values=None,
         downstream_record_values=None,
+        promolecular_density_matrix_path=None,
     ):
         '''update local streaming metrics from one unpadded matrix pair'''
 
@@ -1696,6 +1993,8 @@ class QMugsInference:
                 'charge': int(batch.charge[batch_index].item()),
                 'multiplicity': int(batch.multiplicity[batch_index].item()),
             }
+            if promolecular_density_matrix_path is not None:
+                record['promolecular_density_matrix_path'] = promolecular_density_matrix_path
 
         # reconstruction losses available to train on
         for criterion in criterions:

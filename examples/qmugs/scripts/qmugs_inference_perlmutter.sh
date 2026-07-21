@@ -6,7 +6,7 @@
 #SBATCH -t 00:30:00
 #SBATCH -C gpu
 #SBATCH -q debug
-#SBATCH -N 2
+#SBATCH -N 8
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-task=1
 #SBATCH -c 32
@@ -17,14 +17,18 @@ function cmd() {
 }
 
 # --- Paths (override with environment variables if needed) ---
-HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/global/homes/w/wxrderek/HydraGNN}
-VENV_PATH=${VENV_PATH:-/global/homes/w/wxrderek/HydraGNN/HydraGNN-Installation-Perlmutter/hydragnn_venv}
-EXAMPLE_DIR=$HYDRAGNN_ROOT/examples/qmugs
+HYDRAGNN_ROOT=${HYDRAGNN_ROOT:-/pscratch/sd/w/wxrderek/HydraGNN}
+echo "HydraGNN root: $HYDRAGNN_ROOT"
+VENV_PATH="$HYDRAGNN_ROOT/HydraGNN-Installation-Perlmutter/hydragnn_venv"
+EXAMPLE_DIR="$HYDRAGNN_ROOT/examples/qmugs"
 MODEL_DIR=${MODEL_DIR:-$HYDRAGNN_ROOT/logs/qmugs-55245318-NN2-PM-FSDP0-V2-TP0}
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-qmugs-55245318-NN2-PM-FSDP0-V2-TP0_epoch_65.pk}
 DATASET_BASEDIR=${DATASET_BASEDIR:-/pscratch/sd/w/wxrderek/qmugs/QMugs001_new.pickle}
 QMUGS_DATA_DIR=${QMUGS_DATA_DIR:-/pscratch/sd/w/wxrderek/qmugs}
 LOG_NAME=${LOG_NAME:-QMugs_inference}
+
+# --- Inference data configs ---
+PERC_DOWNSAMPLE_TEST=${PERC_DOWNSAMPLE_TEST:-1.0}
 
 # --- Downstream task configs ---
 ARTIFACTS_DIR=${ARTIFACTS_DIR:-$HYDRAGNN_ROOT/logs/$LOG_NAME/artifacts}
@@ -150,12 +154,14 @@ fi
 # ----------------------------------------------------------------------------------------------------
 # SET THESE
 
-MODEL_DIR=$HYDRAGNN_ROOT/logs/qmugs-55245318-NN2-PM-FSDP0-V2-TP0
-CHECKPOINT_PATH=qmugs-55245318-NN2-PM-FSDP0-V2-TP0_epoch_65.pk
+MODEL_DIR=$HYDRAGNN_ROOT/logs/qmugs-train-56206466-NN1-PM-FSDP0-V2
+CHECKPOINT_PATH=qmugs-train-56206466-NN1-PM-FSDP0-V2_epoch_4.pk
 
-DATASET_BASEDIR=/pscratch/sd/w/wxrderek/qmugs/QMugs001_new.pickle
-ARTIFACTS_DIR=/pscratch/sd/w/wxrderek/artifacts_model-QMugs001_data-QMugs001
+DATASET_BASEDIR=/pscratch/sd/w/wxrderek/qmugs/QMugs001_max800_delta_uptr.pickle
+ARTIFACTS_DIR=/pscratch/sd/w/wxrderek/artifacts/artifacts_model-QMugs001_max800_delta_uptr_data-QMugs001_max800_delta_uptr
 QMUGS_DATA_DIR=/pscratch/sd/w/wxrderek/qmugs
+
+PERC_DOWNSAMPLE_TEST=0.05
 
 RUN_DOWNSTREAM_CALCULATION=1
 DOWNSTREAM_CALCULATIONS="electron_density dipole_moment"
@@ -163,7 +169,7 @@ DOWNSTREAM_CALCULATIONS="electron_density dipole_moment"
 RUN_DOWNSTREAM_PREDICTION=0
 DOWNSTREAM_PREDICTIONS=""
 
-RUN_FIGS=1
+RUN_FIGS=0
 RUN_SAMPLE_FIGS=1
 RUN_DIPOLE_FIGS=1
 RUN_ELECTRON_DENSITY_FIGS=1
@@ -270,6 +276,7 @@ cmd srun -N$SLURM_JOB_NUM_NODES -n$((SLURM_JOB_NUM_NODES*4)) -c32 --ntasks-per-n
     --artifacts_dir="$ARTIFACTS_DIR" \
     --log=qmugs-inference-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES \
     --batch_size=$BATCH_SIZE \
+    --perc_downsample_test="$PERC_DOWNSAMPLE_TEST" \
     "${DOWNSTREAM_CALCULATION_ARGS[@]}" \
     "${DOWNSTREAM_PREDICTION_ARGS[@]}" \
     "${FIGS_ARGS[@]}" \

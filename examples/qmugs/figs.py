@@ -79,6 +79,34 @@ def _sample_output_dir(output_dir: str, record):
     return sample_dir
 
 
+def _batch_attr_value(batch, name: str, batch_index: int = 0):
+    '''return one batched graph attribute as a Python value'''
+
+    value = getattr(batch, name)
+    if isinstance(value, (list, tuple)):
+        return value[batch_index]
+    if torch.is_tensor(value):
+        if value.dim() == 0:
+            return value.item()
+        return value[batch_index].item()
+    return value
+
+
+def _promolecular_density_matrix_path(record, artifacts_dir: str):
+    '''return the expected promolecular density matrix path for one record'''
+
+    if artifacts_dir is None:
+        raise ValueError("artifacts_dir is required for density_matrix_delta figures")
+
+    chembl_id, conformer_id = _record_key(record)
+    return os.path.join(
+        artifacts_dir,
+        "promolecular_density_matrices",
+        chembl_id,
+        f"conf_{conformer_id}.npy",
+    )
+
+
 def _average_pool_matrix(matrix: np.ndarray, pool_size: int):
     '''average pool a square matrix by non-overlapping blocks'''
 
@@ -169,15 +197,36 @@ def _load_sdf_bonds(sample, qmugs_data_dir: str = None):
 # ----------------------------------------------------------------------------------------------------
 # sampled inference
 
-def sample_inference(pretrained_model, dataset, selected_records):
+def sample_inference(pretrained_model, dataset, selected_records, artifacts_dir: str = None):
     '''rerun inference on a small selected dataset and return unpadded matrices'''
 
-    # output_dim is N_pad ** 2 for the total density matrix head
+    # output_dim is N_pad ** 2 for the full head, or T(N_pad) for the upper-triangle head
     var_config = pretrained_model.config["NeuralNetwork"]["Variables_of_interest"]
+    output_names = var_config["output_names"]
+    total_density_names = [
+        ["density_matrix"],
+        ["density_matrix_delta"],
+        ["density_matrix_uptr"],
+        ["density_matrix_delta_uptr"],
+    ]
+    delta_names = [["density_matrix_delta"], ["density_matrix_delta_uptr"]]
+    upper_triangle_names = [["density_matrix_uptr"], ["density_matrix_delta_uptr"]]
+    density_matrix_delta = output_names in delta_names
+    is_upper_triangle = output_names in upper_triangle_names
+    if output_names not in total_density_names:
+        raise NotImplementedError("Figure generation currently supports only total density matrix predictions")
+    if density_matrix_delta and artifacts_dir is None:
+        raise ValueError("artifacts_dir is required for delta density matrix figures")
+
     output_dim = int(var_config["output_dim"][0])
-    max_size = int(round(output_dim ** 0.5))
-    if max_size * max_size != output_dim:
-        raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
+    if is_upper_triangle:
+        # upper-triangle head length is T(N_pad) = N_pad(N_pad+1)/2
+        from utils import triangular_side
+        max_size = triangular_side(output_dim)
+    else:
+        max_size = int(round(output_dim ** 0.5))
+        if max_size * max_size != output_dim:
+            raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
 
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
@@ -194,17 +243,21 @@ def sample_inference(pretrained_model, dataset, selected_records):
 
         wfn_path = None
         if hasattr(batch, "wfn_path"):
-            # PyG collation can present string metadata as lists or tensors
-            wfn_path_value = batch.wfn_path
-            if isinstance(wfn_path_value, (list, tuple)):
-                wfn_path = str(wfn_path_value[0])
-            elif torch.is_tensor(wfn_path_value):
-                if wfn_path_value.dim() == 0:
-                    wfn_path = str(wfn_path_value.item())
-                else:
-                    wfn_path = str(wfn_path_value[0].item())
-            else:
-                wfn_path = str(wfn_path_value)
+            wfn_path = str(_batch_attr_value(batch=batch, name="wfn_path"))
+
+        promolecular_path = None
+        if hasattr(batch, "promolecular_density_matrix_path"):
+            promolecular_value = _batch_attr_value(
+                batch=batch,
+                name="promolecular_density_matrix_path",
+            )
+            if promolecular_value is not None and str(promolecular_value) != "":
+                promolecular_path = str(promolecular_value)
+        if density_matrix_delta and promolecular_path is None:
+            promolecular_path = _promolecular_density_matrix_path(
+                record=record,
+                artifacts_dir=artifacts_dir,
+            )
 
         # inference runs on the model device, but stored plot inputs are converted back to NumPy
         batch = batch.to(pretrained_model.device)
@@ -212,27 +265,54 @@ def sample_inference(pretrained_model, dataset, selected_records):
             with pretrained_model.autocast_ctx:
                 pred = pretrained_model.model(batch)
 
-            if var_config["output_names"] != ["density_matrix"]:
-                raise NotImplementedError("Figure generation currently supports only total density matrix predictions")
-
-            pred_batch = pred[0].reshape(-1, max_size, max_size) # (batch_size, N_pad, N_pad)
-            true_batch = batch.y.reshape(-1, max_size, max_size) # (batch_size, N_pad, N_pad)
             dims_batch = batch.density_matrix_dim # (batch_size,)
-
-            raw_pred_mat = pred_batch[0, :, :] # (N_pad, N_pad)
-            raw_true_mat = true_batch[0, :, :] # (N_pad, N_pad)
             dim = int(dims_batch[0].item())
 
-            # remove padding before any plotting or downstream scalar-field calculation
-            pred_mat = raw_pred_mat[:dim, :dim].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
-            true_mat = raw_true_mat[:dim, :dim].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+            if is_upper_triangle:
+                from utils import (
+                    physical_upper_triangle_indices,
+                    symmetric_matrix_from_upper_triangle_vector,
+                )
+                # pred and target are padded upper-triangle vectors of length T(N_pad)
+                pred_vec = pred[0].reshape(-1).detach().cpu().numpy().astype(np.float64) # (T(N_pad),)
+                true_vec = batch.y.reshape(-1).detach().cpu().numpy().astype(np.float64) # (T(N_pad),)
+                offsets = physical_upper_triangle_indices(dim, max_size) # (T(n_basis),)
+                # fold the physical upper triangle into the full symmetric matrix
+                pred_mat = symmetric_matrix_from_upper_triangle_vector(pred_vec[offsets], dim) # (n_basis, n_basis)
+                true_mat = symmetric_matrix_from_upper_triangle_vector(true_vec[offsets], dim) # (n_basis, n_basis)
+            else:
+                pred_batch = pred[0].reshape(-1, max_size, max_size) # (batch_size, N_pad, N_pad)
+                true_batch = batch.y.reshape(-1, max_size, max_size) # (batch_size, N_pad, N_pad)
+                raw_pred_mat = pred_batch[0, :, :] # (N_pad, N_pad)
+                raw_true_mat = true_batch[0, :, :] # (N_pad, N_pad)
+                # remove padding before any plotting or downstream scalar-field calculation
+                pred_mat = raw_pred_mat[:dim, :dim].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+                true_mat = raw_true_mat[:dim, :dim].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
             assert pred_mat.shape == true_mat.shape
+            if density_matrix_delta:
+                if not os.path.isfile(promolecular_path):
+                    raise FileNotFoundError(f"Promolecular density matrix not found: {promolecular_path}")
+                promolecular_matrix = np.load(promolecular_path).astype(np.float64, copy=False) # (n_basis, n_basis)
+                if promolecular_matrix.shape != pred_mat.shape:
+                    raise ValueError(
+                        f"Promolecular density matrix has shape {promolecular_matrix.shape}, "
+                        f"expected {pred_mat.shape}"
+                    )
+                pred_mat = pred_mat + promolecular_matrix # (n_basis, n_basis)
+                true_mat = true_mat + promolecular_matrix # (n_basis, n_basis)
 
             mask = None
             if hasattr(batch, "y_mask") and batch.y_mask is not None:
                 # compact masks are stored over the unpadded density matrix entries
-                compact_mask = batch.y_mask.detach().cpu().numpy().reshape(-1).astype(bool) # (n_basis * n_basis,)
-                if compact_mask.size == dim * dim:
+                compact_mask = batch.y_mask.detach().cpu().numpy().reshape(-1).astype(bool) # (n_basis*n_basis,) or (T(n_basis),)
+                if is_upper_triangle and compact_mask.size == dim * (dim + 1) // 2:
+                    # rebuild the full (dim, dim) boolean mask from its upper triangle
+                    rows, cols = np.triu_indices(dim)
+                    full_mask = np.zeros((dim, dim), dtype=bool) # (n_basis, n_basis)
+                    full_mask[rows, cols] = compact_mask
+                    full_mask[cols, rows] = compact_mask # mirror; mask == True means supervised entry
+                    mask = full_mask
+                elif compact_mask.size == dim * dim:
                     # mask == True means the entry was supervised by the loss
                     mask = compact_mask.reshape(dim, dim) # (n_basis, n_basis)
 
@@ -244,6 +324,7 @@ def sample_inference(pretrained_model, dataset, selected_records):
             "positions_angstrom": positions_angstrom,
             "atomic_numbers": atomic_numbers,
             "wfn_path": wfn_path,
+            "promolecular_density_matrix_path": promolecular_path,
         })
 
     return sample_results
@@ -430,7 +511,6 @@ def plot_density_matrix_visuals(
                     vmax=vmax,
                 )
 
-        # reconstruction scatter plots are disabled for now
         # reconstruction_scatter(
         #     true_matrices=true_matrix,
         #     predicted_matrices=pred_matrix,
@@ -439,7 +519,6 @@ def plot_density_matrix_visuals(
         #     zscore=True,
         # )
 
-    # reconstruction scatter plots are disabled for now
     # if len(all_true_matrices) > 0:
     #     # pooled scatter uses one z-score normalization over all sampled entries
     #     reconstruction_scatter(
@@ -633,7 +712,6 @@ def plot_electron_density_visuals(
             show_legend=show_legend,
         )
 
-        # density point-cloud plots are disabled for now
         # density_visual(
         #     positions_angstrom=sample["positions_angstrom"],
         #     atomic_numbers=sample["atomic_numbers"],
@@ -650,6 +728,7 @@ def plot_electron_density_visuals(
         #     show_axes=show_axes,
         #     show_legend=show_legend,
         # )
+
         density_isosurface_visual(
             positions_angstrom=sample["positions_angstrom"],
             atomic_numbers=sample["atomic_numbers"],
@@ -664,7 +743,7 @@ def plot_electron_density_visuals(
             show_axes=show_axes,
             show_legend=show_legend,
         )
-        # density point-cloud plots are disabled for now
+
         # density_visual(
         #     positions_angstrom=sample["positions_angstrom"],
         #     atomic_numbers=sample["atomic_numbers"],
@@ -681,6 +760,7 @@ def plot_electron_density_visuals(
         #     show_axes=show_axes,
         #     show_legend=show_legend,
         # )
+
         density_isosurface_visual(
             positions_angstrom=sample["positions_angstrom"],
             atomic_numbers=sample["atomic_numbers"],
@@ -695,7 +775,7 @@ def plot_electron_density_visuals(
             show_axes=show_axes,
             show_legend=show_legend,
         )
-        # density point-cloud plots are disabled for now
+
         # density_visual(
         #     positions_angstrom=sample["positions_angstrom"],
         #     atomic_numbers=sample["atomic_numbers"],
@@ -713,6 +793,7 @@ def plot_electron_density_visuals(
         #     show_axes=show_axes,
         #     show_legend=show_legend,
         # )
+
         density_isosurface_visual(
             positions_angstrom=sample["positions_angstrom"],
             atomic_numbers=sample["atomic_numbers"],
@@ -727,6 +808,7 @@ def plot_electron_density_visuals(
             show_axes=show_axes,
             show_legend=show_legend,
         )
+        
         density_signed_isosurface_visual(
             positions_angstrom=sample["positions_angstrom"],
             atomic_numbers=sample["atomic_numbers"],
@@ -839,6 +921,7 @@ def plot_dipole_visuals(
 def main(
     log_dir: str,
     artifacts_dir: str = None,
+    run_metrics_visuals: bool = True,
     run_sample_visuals: bool = False,
     run_electron_density_visuals: bool = False,
     run_dipole_visuals: bool = False,
@@ -846,6 +929,7 @@ def main(
     num_random_molecules: int = 5,
     num_best_conformers: int = 10,
     num_smallest_molecules: int = 10,
+    chembl_ids=None,
     seed: int = DEFAULT_RANDOM_STATE,
     density_point_filter: str = "top_percentile",
     density_top_percentile: float = 99.5,
@@ -876,6 +960,28 @@ def main(
 
         sample_mode_local = str(sample_mode).strip().lower()
         rng = np.random.default_rng(int(seed))
+
+        if sample_mode_local == "chembl_ids":
+            if chembl_ids is None or len(chembl_ids) == 0:
+                raise ValueError("sample_mode='chembl_ids' requires at least one chembl_id")
+            selected_molecules = [str(chembl_id) for chembl_id in chembl_ids]
+            selected_molecule_set = set(selected_molecules)
+            selected_order = {
+                chembl_id: i_molecule
+                for i_molecule, chembl_id in enumerate(selected_molecules)
+            }
+            selected_records = [
+                record for record in metrics
+                if str(record["chembl_id"]) in selected_molecule_set
+            ]
+            # explicit molecule mode includes every test conformer for each requested molecule
+            return sorted(
+                selected_records,
+                key=lambda record: (
+                    selected_order[str(record["chembl_id"])],
+                    str(record["conformer_id"]),
+                ),
+            )
 
         if sample_mode_local == "random_molecules":
             molecule_ids = sorted({str(record["chembl_id"]) for record in metrics})
@@ -1020,6 +1126,7 @@ def main(
             pretrained_model=local_inference_runner,
             dataset=selected_dataset,
             selected_records=ordered_records,
+            artifacts_dir=artifacts_dir,
         )
 
     # ----------------------------------------------------------------------------------------------------
@@ -1079,20 +1186,27 @@ def main(
         log(f"[WARNING] inference_run_config.json not found in {log_dir}; sampled visuals will be skipped", rank=0)
         run_config = None
     inference_config = {} if run_config is None else run_config.get("inference_config", {})
+    if artifacts_dir is None:
+        artifacts_dir = inference_config.get("artifacts_dir", None)
+    if artifacts_dir is not None:
+        artifacts_dir = os.path.abspath(artifacts_dir)
 
     # ----------------------------------------------------------------------------------------------------
     # metric visuals
 
     # metric plots require only per_matrix_metrics.json
-    log(f"[INFO] Plotting scalar metrics for {len(metrics)} conformers", rank=0)
-    plot_metric_visuals(
-        metrics=metrics,
-        output_dir=figure_dirs["metrics"],
-        metrics_max_natoms=metrics_max_natoms,
-        metrics_max_density_matrix_dim=metrics_max_density_matrix_dim,
-        metrics_natoms_bin_size=metrics_natoms_bin_size,
-        metrics_density_matrix_dim_bin_size=metrics_density_matrix_dim_bin_size,
-    )
+    if run_metrics_visuals:
+        log(f"[INFO] Plotting scalar metrics for {len(metrics)} conformers", rank=0)
+        plot_metric_visuals(
+            metrics=metrics,
+            output_dir=figure_dirs["metrics"],
+            metrics_max_natoms=metrics_max_natoms,
+            metrics_max_density_matrix_dim=metrics_max_density_matrix_dim,
+            metrics_natoms_bin_size=metrics_natoms_bin_size,
+            metrics_density_matrix_dim_bin_size=metrics_density_matrix_dim_bin_size,
+        )
+    else:
+        log(f"[INFO] Skipping scalar metrics visuals", rank=0)
 
     # ----------------------------------------------------------------------------------------------------
     # sampled visuals
@@ -1185,6 +1299,11 @@ if __name__ == "__main__":
         help="optional artifacts directory containing cubeprop outputs",
     )
     parser.add_argument(
+        "--run_metrics_visuals",
+        action="store_true",
+        help="plot metrics against molecule size",
+    )
+    parser.add_argument(
         "--run_sample_visuals",
         action="store_true",
         help="rerun inference on selected samples and plot density matrices",
@@ -1234,6 +1353,12 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="number of smallest molecules by atom count to sample",
+    )
+    parser.add_argument(
+        "--chembl_ids",
+        nargs="*",
+        default=None,
+        help="explicit chembl_id values to plot; includes all selected test conformers",
     )
     parser.add_argument(
         "--seed",
@@ -1319,7 +1444,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.smallest_molecules:
+    if args.chembl_ids is not None and len(args.chembl_ids) > 0:
+        sample_mode = "chembl_ids"
+    elif args.smallest_molecules:
         sample_mode = "smallest_molecules"
     elif args.best_conformers:
         sample_mode = "best_conformers"
@@ -1329,6 +1456,7 @@ if __name__ == "__main__":
     main(
         log_dir=args.log_dir,
         artifacts_dir=args.artifacts_dir,
+        run_metrics_visuals=args.run_metrics_visuals,
         run_sample_visuals=args.run_sample_visuals,
         run_electron_density_visuals=args.run_electron_density_visuals,
         run_dipole_visuals=args.run_dipole_visuals,
@@ -1336,6 +1464,7 @@ if __name__ == "__main__":
         num_random_molecules=args.num_random_molecules,
         num_best_conformers=args.num_best_conformers,
         num_smallest_molecules=args.num_smallest_molecules,
+        chembl_ids=args.chembl_ids,
         seed=args.seed,
         density_point_filter=args.density_point_filter,
         density_top_percentile=args.density_top_percentile,

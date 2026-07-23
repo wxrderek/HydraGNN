@@ -13,3 +13,5 @@ installation_DOE_supercomputers/HydraGNN-Installation-Frontier*/
 *.dat
 
 HydraGNN-Installation-Perlmutter/
+HydraGNN-Installation-Duke-Compute-Cluster/
+references/*_info/

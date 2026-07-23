@@ -48,15 +48,19 @@ The setup of this directory is as follows:
     - `density_matrix_visualizers.py`: wrappers/functions to visualize density matrices
     - `dipole_moment_visualizers.py`: wrappers/functions to visualize dipole moments
     - `metrics_visualizers.py`: wrappers/functions to visualize metrics
-- `scripts/`: shell scripts to run Perlmutter jobs to run Python scripts
-    - `qmugs_densmat_perlmutter.sh`: runs training
-    - `qmugs_eda_perlmutter.sh`: runs EDA (NO LONGER USED)
-    - `qmugs_inference_perlmutter.sh`: runs inference 
-    - `qmugs_figs_perlmutter.sh`: runs figures given previous inference run
-    - `qmugs_pre_perlmutter.sh`: runs data loading and preprocessing prior to training
-    - `test.sh`: test for environment and package setup
+- `scripts/`: shell scripts to run SLURM jobs to run Python scripts, one subdirectory
+  per machine. The two subdirectories hold the same six scripts and differ only in
+  SLURM headers, module loading, and paths; the Python arguments are identical.
+    - `perlmutter/`: Perlmutter (NERSC)
+        - `qmugs_densmat_perlmutter.sh`: runs training
+        - `qmugs_eda_perlmutter.sh`: runs EDA (NO LONGER USED)
+        - `qmugs_inference_perlmutter.sh`: runs inference
+        - `qmugs_figs_perlmutter.sh`: runs figures given previous inference run
+        - `qmugs_pre_perlmutter.sh`: runs data loading and preprocessing prior to training
+        - `test.sh`: test for environment and package setup
+    - `dcc/`: Duke Compute Cluster, same six scripts with `_dcc` in place of
+      `_perlmutter`. See `references/dcc_info/perlmutter_to_dcc_transfer.md`.
 - `utils/`: utility functions, including data loading, pre/postprocessing
-    - `densmat.png`: plot of matrix heatmap with masking (ARTIFACT)
     - `download_data.json`: configuration for data download (WILL NOT MODIFY FURTHER)
     - `download_data.py`: python script for data download and parsing (WILL NOT MODIFY FURTHER)
     - `download_data.sh`: shell script for data download (WILL NOT MODIFY FURTHER)
@@ -70,6 +74,8 @@ The setup of this directory is as follows:
     -  various helper functions for internal use in the two classes
 - `qmugs_densmat_train.py`: script to either preprocess QMugs data for training, ot run HydraGNN training on preprocessed data
 - `qmugs_densmat_inference.py`: script to run inference, currently very hardcoded
+- `eda.py`: script with EDA functionalities for the QMugs dataset (NO LONGER USED)
+- `figs.py`: script to run figure plotting given a previous inference run
 - `qmugs_densmat.json`: configuration file for HydraGNN functionalities
 - `requirements.txt`: QMugs-specific dependencies
 - `README.md`: README file for devs

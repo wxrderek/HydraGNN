@@ -1,0 +1,480 @@
+\documentclass[12pt]{article}
+\usepackage{DerekNotes}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\leftmark}
+\fancyfoot[C]{\thepage}
+
+\addbibresource{ref.bib}
+
+\begin{document}
+    \title{\hrule \vspace{20pt} \LARGE{\textbf{Density Matrix Learning}} \vspace{-4pt}}
+    \author{\Large{Derek Wang}}
+    \date{\vspace{8pt} \hrule}
+    \rhead{Density Matrix Learning}
+    \maketitle
+    \vspace{-30pt}
+    \begin{center}
+        \large
+        Ideas, July 2026
+    \end{center}
+    \hrule
+
+    \section*{Purpose}
+
+    Some thoughts on new methods for learning density matrices, specifically one electron density matrices (or 1-RDMs) of molecules. In particular, I'm thinking about autoregressive ways to construct density matrices sequentially.
+
+    \tableofcontents 
+    \newpage
+
+    \section{Problem}
+    Given geometric information about a molecule, predict its one electron density matrix, written in an atomic orbital (AO) basis. More specifically, given
+    \begin{itemize}
+        \item[(1)] The positions $\{r_j = (x_j, y_j, z_j)\}_{j=1}^N$ of all $N$ atoms,
+        \item[(2)] The species $\{s_j \in \{\text{elements}\}\}_{j=1}^N$ of all $N$ atoms,
+    \end{itemize}
+    predict the one electron total spin density matrix, or the 1-RDM, denoted $D = (D_{\mu \nu})$ in the AO basis $\{\ket{\phi_k} = \phi_k(r)\}_{k=1}^K$, such that the electron density function (as a scalar field over real 3-space) is given by
+    \begin{equation}
+        \rho(r) = \sum_{\mu\nu} D_{\mu \nu} \phi_\mu (r) \phi_\nu^* (r)
+    \end{equation}
+
+    \section{Motivation}
+
+    \begin{itemize}
+        \item Electron densities and 1-RDMs are fundamental descriptors of electronic structure, providing a single transferable representation from which other properties can be calculated. In particular, the expectation of any one electron operator $\hat O$ is given by
+        \[ \braket{\hat O} = \tr[OD] = \sum_{\mu \nu} D_{\mu \nu} O_{\nu \mu}\]
+        \item There is some empirical evidence (and some physical intuition) that 1-RDM provide transferable representations from which other properties can be predicted via downstream ML models.
+        \item Ab initio quantum chemical methods to calculate 1-RDMs, e.g. self-consistent KS-DFT calculations, are extremely expensive. ML provides much faster inference, despite requiring more computational resources to train.
+
+    \end{itemize}
+    
+
+    \section{Sequential Decomposition of Learning}
+    Let $D_k$ denote the $k$-th principle submatrix, consisting of the entries $(D_{\mu \nu})_{\mu, \nu \in \{1, \ldots, k\}}$ in the first $k$ rows and columns.  We define the learning task sequentially: at time step $k$, we want to take
+    \[ (\{(r_j, s_j)\}_{j=1}^N, D_{k-1} ) \mapsto D_k\]
+    At $k = K$, the output is $D_K \equiv D$. 
+
+    \subsection{Density Matrix Properties}
+    One electron density matrices of molecules satisfy the following:
+    \begin{itemize}
+        \item[(1)] Hermitianity: $D = D^\dagger$. Since $D$ is real, this is equivalent to symmetry: $D = D^T$.
+        \item[(2)] Trace: if $N_e$ is the number of electrons, we need $\tr(DS) = N_e$, where $S$ is the AO overlap matrix.
+        \item[(3)] Positive semidefinite (PSD): $x^\dagger D x \geq 0$ for all $x \in \C^K$. Equivalently, all eigenvalues of $D$ are nonnegative. 
+    \end{itemize}
+
+    (1) can be enforced by just predicting the upper triangle. (2) can be enforced by trace normalizing the output before computing losses. (3) is less straight forward. Below is a proposed decomposition that satisfies all 3 constraints. 
+
+    \subsection{Decomposing Into Column Prediction}
+    Decompose $D_k$ as
+    \begin{equation}
+        D_k = \begin{pmatrix}
+            D_{k-1} & c_k \\
+            c_k^T & d_k
+        \end{pmatrix}
+    \end{equation}
+    where $c_k \in \R^{k-1}$ is the vector of entries above the $k$th diagonal. Together with the diagonal element $d_k$, we have all the information corresponding to the $k$th orbital in $D$. \\[-6pt]
+    
+    Let $\triu (A)$ denote the upper triangle of a matrix $A$. At step $1$, we predict $c_1 \equiv d_1 \equiv D_1 \equiv \triu(D_1)$. At step $2$, we predict $(c_2, d_2)$, which can be used to construct $\triu(D_2)$:
+
+    \[ \triu(D_2) = \begin{pmatrix}
+        \triu(D_1) & c_2 \\
+        & d_2
+    \end{pmatrix}\]
+
+    Repeat this. At step 3, we have access to $\triu(D_2)$, and we predict $(c_3, d_3)$. From this, we can construct $\triu(D_3)$:
+    \[
+    \triu(D_3) = \begin{pmatrix}
+        \triu(D_2) & c_3 \\
+        & d_3
+    \end{pmatrix}
+    \]
+    
+    More generally, at step $k$, we have access to $\triu(D_{k-1})$, and we predict $(c_k, d_k)$. From this, we can construct $\triu(D_k)$:
+    \[ \triu(D_k) = \begin{pmatrix}
+        \triu(D_{k-1}) & c_k \\
+        & d_k
+    \end{pmatrix}\]
+    
+    Thus, letting $\mathcal{G} = \{(r_j, s_j)\}_{j=1}^N$ at step $k$, we parametrize the map
+    \begin{equation}
+        (\mathcal{G}, \triu(D_{k-1}) ) \mapsto (c_k, d_k)
+    \end{equation}
+
+    Note at step $K$, we get $\triu(D_K)$ and can thus easily construct $D_K$ to be Hermitian, satisfying constraint (1). Instead of taking $D = D_K$, we trace normalize: $D = (N_e/ \tr (D_KS))D_K$ thereby satisfying constraint (2). Note the notation here is misleading; technically we must multiply $D$ by the overlap matrix $S$ since AO orbitals are generally not orthogonal. That said, I will neglect this in writing for now; one must keep this in mind for implementation however. \\[-6pt] 
+    
+    To satisfy the PSD constraint (3), we use a particular parameterization of the map in Equation 3, motivated by a theorem about the generalized Schur complement of Hermitian, PSD matrices. 
+
+    \subsection{Generalized Schur Complement}
+    \textbf{Definition.} The \textit{Moore-Penrose pseudoinverse} of a matrix $A$ is denoted $A^+$. If $A = U \Sigma V^\dagger$ is the SVD of $A$ with $\Sigma = \diag(\sigma_1, \ldots, \sigma_n)$, then $A^+ = V \Sigma^+ U^\dagger$, where $\Sigma^+ = \diag(\sigma_1^{-1}, \ldots, \sigma_n^{-1})^\dagger$ (equivalent definition for any diagonal matrix). \\[-6pt]
+
+    \textbf{Corollary 1.} (Moore-Penrose Identities) The following hold for any matrix $A$:
+    \begin{itemize}
+        \item[(a)] $A A^+ A = A$.
+        \item[(b)] $A^+ A A^+ = A^+$.
+        \item[(c)] $(AA^+)^\dagger = A A^+$.
+        \item[(d)] $(A^+ A)^ \dagger = A ^+ A$.
+    \end{itemize}
+    Note that these conditions uniquely define $A^+$. \\[-6pt]
+    
+    \textbf{Definition.} Let $M$ be a complex matrix partitioned as
+
+    \[ M = \begin{pmatrix}
+        A & B \\ C & D
+    \end{pmatrix}\]
+    
+    The \textit{generalized Schur complement} of $A$ in $M$ is defined $M|A = D - CA^+ B$. \\[-6pt]
+
+    \textbf{Theorem 1.} [\href{https://nhigham.com/2023/06/01/what-is-the-schur-complement-of-a-matrix/?utm_source=chatgpt.com}{Higham}, Theorem 1.2 of \href{https://scholarcommons.sc.edu/cgi/viewcontent.cgi?article=1032&context=math_facpub}{Markham}] (Conditions for PSD) If $M$ is Hermitian, i.e. $C = B^\dagger$, then $M \succeq 0$ if and only if the following hold:
+    \begin{itemize}
+        \item[(a)] $A \succeq 0$,
+        \item[(b)] $M|A = D - B^\dagger A^+ B \succeq 0$,
+        \item[(c)] $\nullity(A) \subseteq \nullity(B^\dagger)$.
+    \end{itemize}
+    This may be referred to as the generalized Schur complement theorem for Hermitian matrices, and perhaps Albert's Theorem of Positivity.
+
+    \textbf{Proposition 1.} $(c)$ from Theorem 1 is equivalent to $\image(B) \subseteq \image (A)$. \\[-6pt]
+    
+    \textit{Proof.} $(\implies)$. Take $x \in \nullity(A)$, then $B^\dagger x = 0 \iff x^\dagger B = 0$, so every column of $B$ is orthogonal to all $x \in \nullity(A)$, i.e. $\image(B) \subseteq \nullity(A)^\perp$. Now $A$ is Hermitian, so for all $x \in \nullity(A)$, $(Ay)^\dagger x = y^\dagger (A x) = 0$, meaning all $Ay \in \image(A)$ are also in $\nullity(A)^\perp$, i.e. $\image(A) \subseteq \nullity(A)^\perp$. By rank-nullity, $\dim \image(A) = n - \dim \nullity(A) = \dim \nullity(A)^\perp$, so $\image(A) = \nullity(A)^\perp$. Thus $\image(B) \subseteq \image(A)$. \\[-6pt]
+
+    $(\implies)^{-1}$. Take $x \in \image(B)$, then $x \in \image(A) = \nullity(A)^\perp$, so for all $y \in \nullity(A)$, it holds $x^\dagger y = 0$. Now write $x = Bz$ for any $z$, so $(Bz)^\dagger y = z^\dagger(B^\dagger y) = 0$ for any $z$, meaning $B^\dagger y = 0 \implies y \in \nullity(B^\dagger)$. Hence $\nullity(A) \subseteq \nullity(B^\dagger)$.
+
+    \subsection{Using Theorem 1 for PSD Constraint}
+    We specialize Theorem 1 to the objects at step $k$ of our learning task, where for ease of notation we use the full submatrices instead of upper triangles. Here, $M = D_k$, $A = D_{k-1}$, $B = c_k$, $D = d_k$, and everything is real. \\[-6pt]
+
+    Now if we constrain $d_1 \geq 0$ in step 1 and ensure $D_{k-1} \succeq 0 \implies D_k \succeq 0$, then we are done. By Theorem 1, we thus need to ensure
+    \begin{itemize}
+        \item[(a)] $D_{k-1} \succeq 0$ (recursion from step 1 gives this for free),
+        \item[(b)] $D_k | D_{k-1} = d_k - c_k^T D_{k-1}^+ c_k \geq 0$,
+        \item[(c)] $\nullity(D_{k-1}) \subseteq \nullity(c_k^T)$.
+    \end{itemize}
+
+    Regarding (b), we can restate it as $d_k = c_k^T D_{k-1}^+ c_k + \delta_k$ for some $\delta_k \geq 0$. We can further write $\delta_k = f_k(\alpha_k)$ for some $f_k: \R \to \R \setminus \R^-$ and $\alpha_k \in \R$. \\[-6pt]
+
+    Regarding (c), note $\nullity(c_k^T) = \{x \in \C^{k-1}: c_k^T x = 0\}$, so we need to choose $c_k$ such that $x \in \nullity(D_{k-1}) = \image(D_{k-1})^\perp \implies c_k^T x = 0$, i.e. $c_k$ is orthogonal to all vectors in $\image(D_{k-1})^\perp$, i.e. $c_k \in \image(D_{k-1})$ since things are finite dimensional. This also follows from Proposition 1. Hence to satisfy (c), we just pick $c_k = D_{k-1}z_k$ for some $z_k \in \R^{k-1}$.
+
+    \subsection{Applying the PSD Constraint}
+
+    The outputs at step $k$ are $c_k = D_{k-1}z_k$ for some $z_k \in \R^{k-1}$ and $d_k = c_k^T D_{k-1}^+ c_k + f_k(\alpha_k) = (D_{k-1} z_k)^T D_{k-1}^+ D_{k-1} z_k + f_k(\alpha_k)$ for some $f_k: \R \to \R \setminus \R^-$ and $\alpha_k \in \R$. Note by the first Moore-Penrose Identity (Corollary 1 (a)), we can just write
+    \begin{align*}
+        d_k &= z_k^T D_{k-1}^TD_{k-1}^+ D_{k-1} z_k + f_k(\alpha_k) \\
+        &= z_k^T D_{k-1}D_{k-1}^+ D_{k-1} z_k + f_k(\alpha_k) \\
+        &= z_k^T D_{k-1} z_k + f_k(\alpha_k) \\
+        &= z_k^T c_k + f_k(\alpha_k)
+    \end{align*}
+
+    Thus, we convenient never have to take the pseudoinverse! We parametrize the map at step $k$ given in Equation 3 with
+    \begin{equation}
+        (z_k, \alpha_k, f_k)
+    \end{equation}
+    To disambiguate from the parameters of $(z_k, \alpha_k, f_k)$ themselves (as functions of the input), we hereby refer to them as \textit{latents}. If we fix $f_k \equiv f$ for all $k$ to some nonnegative-valued function of real numbers, then we are left with $(z_k, \alpha_k)$. Labeling the step $k$ map $F_k$, we summarize the model as
+    \begin{equation}
+        F_k(\mathcal{G}, D_{k-1}) = (D_{k-1} z_k,\  z_k^T D_{k-1} z_k + f(\alpha_k)) =: (c_k, d_k)
+    \end{equation}
+    where $z_k$ and $\alpha_k$ can be parametrized by NNs $(g, h)_\theta$.
+    \begin{equation}
+        z_k = g_{\theta}(\mathcal{G}, D_{k-1}, \ldots), \ \ \alpha_k = h_\theta (\mathcal{G}, D_{k-1}, \ldots)
+    \end{equation}
+    For the cleanest size generalization, we leave the network parameters $\theta$ as shared across all $k$, instead of parametrizing a new $\theta_k$ per $k$. If the model truly learns how to place a new orbital in the molecule given a bunch of existing ones, then this should not be an issue apart from being a harder statistical problem. \\[-6pt]
+    
+    As shown in Section 2.2, we can construct $\triu(D_k)$ or $D_k$ from $(c_k, d_k)$ and move on to the next time step. After step $K$, we then trace normalize. Now, all 3 constraints are satisfied. To summarize, we state a quick theorem. \\[-6pt]
+
+    \textbf{Theorem 2.1.} (PSD constraint). If $D_{k-1} \succeq 0$ is a $(k-1) \times (k-1)$ Hermitian, then for any $z_k \in \R^{k-1}$ and $\delta_k \geq 0$, letting
+    \begin{equation}
+        c_k = D_{k-1} z_k, \ \ d_k = z_k^T c_k + \delta_k
+    \end{equation}
+    gives the construction of a $k \times k$ Hermitian matrix
+    \begin{equation}
+        D_k = \begin{pmatrix}
+            D_{k-1} & c_k \\
+            c_k^T & d_k
+        \end{pmatrix} \succeq 0
+    \end{equation}
+
+    \textit{Proof.} By the restatement of Theorem 1 given in 3.4, we only need $d_k - c_k^T D^+_{k-1} c_k \geq 0$. By Corollary 1 (a), i.e. the Moore-Penrose Identities,
+    \begin{align*}
+        d_k &=  z_k^T c_k + \delta_k \\
+        &= z_k^T D_{k-1} z_k + \delta_k \\
+        &= z_k^T D_{k-1}D_{k-1}^+ D_{k-1} z_k + \delta_k \\
+        &= c_k^TD_{k-1}^+ c_k + \delta_k \\
+        &\geq c_k^TD_{k-1}^+ c_k
+    \end{align*}
+    since $\delta_k \geq 0$. 
+
+    \subsection{Extension to Delta Learning}
+    Delta learning has seen empirical success in MLIPs-like tasks and generally improve the performance of models, including the total density learner we implemented in HydraGNN. As a baseline, we use the \textit{promolecular density matrix} $D^{pro}$, computed as a superposition of densities of individual non-interacting atoms placed in the correct positions. We target
+    \begin{equation}
+        \Delta D = D - D^{pro}
+    \end{equation}
+    with our learner. Intuitively, $\Delta D$ contains interaction and bond information between atoms, without needing to worry about the baseline non-interacting density. \\[-6pt]
+
+    Note immediately that this breaks Theorem 2.1 if we simply replace $D_k$ with $\Delta D_k$ at each step, since $\Delta D_k$ is not PSD. Luckily, it remains Hermitian. Note $D^{pro}$ is also Hermitian and PSD by construction. Additionally, trace normalization must be changed slightly. Theorem 2.2 handles the delta learning case. \\[-6pt]
+
+    \textbf{Theorem 2.2.} (PSD constraint for delta learning). Let $D_{k-1} \succeq 0$ and $D_{k-1}^{pro} \succeq 0$ be $(k-1) \times (k-1)$ Hermitian matrices and $\Delta D_{k-1} = D_{k-1} - D_{k-1}^{pro}$. For any $k$, let
+    \begin{equation}
+        D_k = \begin{pmatrix}
+            D_{k-1} & c_k \\
+            c_k^T & d_k
+        \end{pmatrix}, \ \ D_k^{pro} = \begin{pmatrix}
+            D_{k-1}^{pro} & c_k^{pro} \\
+            (c_k^{pro})^T & d_k^{pro}
+        \end{pmatrix}
+    \end{equation}  
+    
+    
+    then for any $z_k \in \R^{k-1}$ and $\delta_k \geq 0$, letting
+    \begin{equation}
+        \Delta c_k = (D_{k-1}^{pro} + \Delta D_{k-1}) z_k - c_k^{pro}, \ \ \Delta d_k = z_k^T (c_k^{pro} + \Delta c_k) - d_k^{pro} + \delta_k
+    \end{equation}
+    gives the construction of a $k \times k$ Hermitian matrix
+    \begin{equation}
+        D_k = D_k^{pro} + \Delta D_k = \begin{pmatrix}
+            D_{k-1}^{pro} + \Delta D_{k-1} & c_k^{pro} + \Delta c_k \\
+            (c_k^{pro} + \Delta c_k)^T & d_k^{pro} + \Delta d_k
+        \end{pmatrix} \succeq 0
+    \end{equation}
+
+    \textit{Proof.} This is a simple extension of Theorem 2.1. As seen in 3.4, we need to check 
+    \[ c_k^{pro} + \Delta c_k \in \image(D_{k-1}^{pro} + \Delta D_{k-1})\]
+    and 
+    \[ d_{k}^{pro} + \Delta d_k - (c_K^{pro} + \Delta c_k)^T (D_{k-1}^{pro} + \Delta D_{k-1})^+ (c_K^{pro} + \Delta c_k) \geq 0\]
+
+    The image condition is trivial:
+    \[ c_k^{pro} + \Delta c_k = (D_{k-1}^{pro} + \Delta D_{k-1}) z_k  \in \image(D_{k-1}^{pro} + \Delta D_{k-1})\]
+
+    The second condition is also trivial with an application of the first Moore-Penrose identity:
+    \begin{align*}
+        d_k^{pro} +\Delta d_k &= z_k^T (c_k^{pro} + \Delta c_k) +\delta_k \\
+        &=z_k^T (D_{k-1}^{pro} + \Delta D_{k-1}) z_k + \delta_k \\
+        &= z_k^T (D_{k-1}^{pro} + \Delta D_{k-1})^T  (D_{k-1}^{pro} + \Delta D_{k-1})^+  (D_{k-1}^{pro} + \Delta D_{k-1}) z_k + \delta_k \\
+        &= (c_k^{pro} + \Delta c_k)^T (D_{k-1}^{pro} + \Delta D_{k-1})^+ (c_k^{pro} + \Delta c_k) + \delta_k \\
+        &\geq (c_k^{pro} + \Delta c_k)^T (D_{k-1}^{pro} + \Delta D_{k-1})^+ (c_k^{pro} + \Delta c_k)
+    \end{align*} 
+    since $\delta_k$. To make life easier, in a formal proof, it suffices to take Theorem 1 word for word and replace $(\cdot)$ with $(\cdot)^{pro} + \Delta (\cdot)$ for $D_k$'s, $c_k$'s and $d_k$'s. \\[-6pt]
+    
+    Thus by Theorem 2.2, the core formulation of our model barely changes as long as $D^{pro}$ is computed beforehand; from empirical experience, this is a past computation with Psi4. In other words, we treat $D^{pro}$ as fixed a priori and used NNs to parametrize the same $z_k$ and $\alpha_k$. In particular, the interpretation and role of latents do not change at all. 
+
+    \section{Training Objective}
+    Let $\theta = (\theta_1, \ldots, \theta_K)$. Add hats to all predictions; hat-less symbols denote ground truth. We have the following loss function components available. 
+
+    \subsection{Final Reconstruction Loss}
+    Let 
+    \begin{equation}
+        \mathcal{L}_{rec} = \mathcal{N} \magnitude{W \odot (\hat D_\theta - D)}^2
+    \end{equation}
+    for some matrix norm (or kind-of norm) $\magnitude{ \cdot }$, normalization $\mathcal{N}$, and weight matrix $W$ that can up/down weight and mask out certain entries (perhaps corresponding to atom-atom pair blocks). Note $W$ is fixed for each sample prior to training, and can be assigned randomly according to some sensible distribution. Note this is computed once per sample at the end of the $K$ time steps, so it assumes we run the entire sequence before computing loss. 
+
+    \subsection{Per-Step Reconstruction Loss}
+    At step $k$, let
+    \begin{equation}
+        \mathcal{L}_k = \mathcal{N}_k \magnitude{W_k \odot (\hat D_k - D_k)}^2
+    \end{equation}
+    where everything is as described in Section 3.1. Note the final reconstruction loss is a special case with $k =K$. We can evaluate the loss in several distinct ways:
+    \begin{itemize}
+        \item[(1)] Compute $\mathcal{L}_k$ immediately after step $k$ for each sample and optimize over all samples. This effectively trains $F_1$, then $F_2$, then $F_3$, and so on. 
+        \item[(2)] Compute $\mathcal{L}_k$ immediately after step $k$ for each molecule, but only optimize after all $K$ steps, and optimize something like
+        \begin{equation}
+            \mathcal{L}_{rec} = \sum_{k=1}^K w_k \mathcal{L}_k
+        \end{equation}
+        where the weights $w_k$ up/down weight certain time steps (for instance, the final step. This evidently assumes the entire sequence is run before accumulating loss. 
+        \item[(3)] Pick a subset $\mathcal{K} \subseteq \{1, \ldots, K\}$ of time steps. Compute $\mathcal{L}_k$ immediately after step $k$ for each molecule, but only optimize after $k' - k'_- $ steps where $k' = \min \{k' \in \mathcal{K}:k' \geq k\}$ and $k'_- = \max \{k' \in \mathcal{K}:k' < k\}$, and optimize something like
+        \begin{equation}
+            \mathcal{L}_{rec \ k'} = \sum_{k=k'_-}^{k'} w_k \mathcal{L}_k
+        \end{equation}
+        This splits the sequential training process of (1) into $|\mathcal{K}|$ chunks, where $\mathcal{K}$ can now be chosen in specific ways. Note this is more general than (1) and (2); the former is the special case $\mathcal{K} = \{K\}$, the latter is $\mathcal{K} = \{1, \ldots, k\}$. This also admits  sequential, semi-sequential, or joint training schemes (more in Section 6)
+        \item[(4)] We have implicitly assumed that $K$ is the number of orbitals of the largest molecule in the dataset, so things work. However, if we want to perform per-atom-type supervision (treat aggregate losses of all orbitals of each atom), we must fix different indices for each molecule, as they evidently contain different atom species in different orders. (3) fixes $\mathcal{K}$ across all samples. For each sample molecule, pick a different subset $\mathcal{K}^{mol} \subseteq \{1, \ldots, K\}$ of time steps. Compute $\mathcal{L}_k$ immediately after step $k$, but only aggregate losses after $k^j - k^j_- $ steps where $k^j = \min \{k^j \in \mathcal{K}^{mol}:k^j \geq k\}$ and $k^j_- = \max \{k^j \in \mathcal{K}^{mol}:k^j < k\}$. Now, compile the loss across all molecules at the $j$th atom:
+        \begin{equation}
+            \mathcal{L}_{rec \ j} =  \sum_{k=k^j_-}^{k^j} w_k \mathcal{L}_k
+        \end{equation}
+        Now, we can implicitly supervise on a per-atom basis, permitting the loss to weight $F_1, \ldots, F_K$ in sequential chunks. Intuitively this works best only if a canonical physical ordering of atoms is available for all molecules (will discuss later). Note this is now more general than (1), (2), and (3), as (3) is the special case $\mathcal{K}^{mol} = \mathcal{K}$ for all atoms $j$. However, this blocks the ability to train semi-sequentially, since atom-based chunks differ across molecules.
+    \end{itemize}
+
+    More specifically, for (3) and (4), we can optimize the entire sequence $F_1, \ldots, F_K$ jointly, but instead weigh the aggregate losses of each $k' \in \mathcal{K}$ or each atom $j$ differently, so
+    \begin{equation} 
+        \mathcal{L}_{rec} = \sum_{j=1}^N v^j \left( \sum_{k=k_-^{j}}^{k^j} w_k \mathcal{L}_k \right)
+    \end{equation}
+    where $N$ is the maximum number of atoms in any molecule in the dataset, and we set $v^j = 0$ for molecules with smaller numbers of atoms $N^{mol} < N$ for all $N^{mol} < j \leq N$. \\[-6pt]
+    
+    Lastly, for efficiently, note that we can instead supervise the reconstruction on the newly predicted entries only, since the previous entries are accounted for in the $k-1$st step (assuming $D_{k-1}$ is frozen by the training scheme):
+    \begin{equation}
+        \mathcal{L}_k = \mathcal{N}_k \magnitude{W_k ((\hat c_k, \hat d_k) - (c_k, d_k))}^2
+    \end{equation}
+
+    \subsection{Regularization Loss}
+    At step $k$, let
+    \begin{equation}
+        \mathcal{L}_{reg \ k} = \gamma(z_k) \magnitude{z_k}^2 + \gamma(\alpha_k)\magnitude{f(\alpha_k)}^2
+    \end{equation}
+    where again $\magnitude{\cdot}$ denotes some norm and $\gamma(\cdot)$ some rule to choose relative scaling between the two components. We can supervise on this in the same 3 ways as for the per-step reconstruction loss in Section 3.2. 
+
+    \subsection{Downstream Task Loss (finetuning)}
+    Let $O(D)$ or $O[\rho(r)]$ be some observable computable from the density matrix (or scalar field density). Let
+    \begin{equation}
+        \mathcal{L}_{ds} = \mathcal{N}_{ds} \magnitude{W \odot (O(\hat D_\theta) - O(D))}^2
+    \end{equation}
+    This loss is suitable for fine tuning for downstream tasks of predicting global observables, or simply adding meaningful supervision. Note the downstream observable may be computed directly or predicted with another ML model, in which case we have some $\hat O_{\theta_O}(\hat D_{\theta})$ as the prediction and use either $O(D)$ or $\hat O_{\theta_O}(D)$ as ground truth, depending on whether the downstream model is trained jointly and whether $O(D)$ or $O$ itself is available. \\[-6pt]
+
+    Per-atom features, if ground truth is available, may also be used for supervision. If $O^j(D)$ is such a feature, we can take
+    \[ \mathcal{L}_{ds} = \mathcal{N}_{ds} \sum _{j=1}^N o^j\magnitude{W^j \odot (O^j(\hat D_\theta) - O^j(D))}^2 \]
+    with the same variations as the global observable loss, where $o_j$ provides weights. More generally, if we have $M$ downstream observables available for supervision, we can take
+    \begin{equation}
+        \mathcal{L}_{ds} = \sum_{m=1}^M w_m \mathcal{L}_{ds}^{(m)}
+    \end{equation}
+
+    \subsection{Total Loss}
+    Our total loss may then look like
+    \begin{equation}
+        \mathcal{L} = \lambda_{rec} \mathcal{L}_{rec} + \lambda_{reg} \mathcal{L}_{reg} + \mathcal{\lambda}_{ds} \mathcal{L}_{ds}
+    \end{equation}
+    if we choose to supervise on everything, possibly including the downstream output of a jointly trained downstream predictor. Note we abuse notation here, as formerly each $\mathcal{L}_{(\cdot)}$ denoted the loss for a single molecule, but they now denote the average loss across all molecules. 
+
+    \section{Architectural Implementation}
+
+    The architecture needed to implement the body of the model in Equation 5 is nontrivial. 
+    \begin{itemize}
+        \item $\mathcal{G}$ is naturally a graph. Luckily it is immutable throughout the forward process of the sequential decoder. 
+        \item $D_{k-1}$ is $(k-1) \times (k-1)$, so input size changes.
+        \item $c_k$ (more precisely $z_k$) is length $k-1$, so the output size changes. Luckily $d_k$ (more precisely $\alpha_k$) is a scalar for all $k$. 
+    \end{itemize}
+
+    Instead of trying to force inputs and outputs to match in dimension, we circumvent the size mismatch per step by simply predicting scalar values only. In particular, we train 3 separate decoder heads, attached to a backbone of classic GNN message passing and pooling layers.
+
+    \subsection{GNN Message Passing}
+    Let $\mathcal{G} = (V, E)$ now denote a \textit{molecular graph} associated with the geometry data $\{(r_j, s_j)\}_{j=1}^N$. Note this is a slight change of notation. Here, $V$ is the set of atoms / nodes / vertices, and $E$ by convention contains links for every pair of atoms (not just bonded ones; we want the model to learn the bonding behavior). Due to software constraints, we will only worry about node embeddings, not edge embeddings. Thus the GNN acting on $\mathcal{G}$ is equivalent to it acting on just $V$. \\[-6pt] 
+    
+    Let $v_0^1, \ldots, v_0^N$ denote the node embeddings at layer 0 of the GNN, associated with the initial molecular graph $\mathcal{G}_0$. Note $v_0^j$ is constructed deterministically (concatenation and one-hot encoding) from $(r_j, s_j)$; mathematically, this might look like $v_0^j = \text{ToNode}(r_j, s_j)$. \\[-6pt] 
+    
+    Each layer of the GNN implements (possibly spatially equivariant) message passing on the node embeddings. There are many such message passing stacks designed specifically for molecular graphs (EGNN, PAINN, SchNet, etc.), most of which differ only in how they pass messages. We abstract them away. Letting $\text{GNN}_l$ denote the $l$th such layer, 
+    \[ \text{GNN}_l(v_l^1, \ldots, v_l^N) = (v_{l+1}^1, \ldots, v_{l+1}^N)\]
+    where the $v_{l+1}$'s and $v_l$'s may have different dimensions $c_l$ vs. $c_{l+1}$. The entire GNN acting on $\mathcal{G}_0$ can then be written
+    \begin{equation}
+        \text{GNN}(v_0^1, \ldots, v_0^N) = \bigcirc_l \text{GNN}_l(v_l^1, \ldots, v_l^N) = (v_L^1, \ldots, v_L^N) = \mathcal{G}_L 
+    \end{equation}
+    where $\mathcal{G}_1, \ldots, \mathcal{G}_{L-1}$ can be used to denote the intermediate graph states. We call the final outputs $v_L^1, \ldots, v_L^N \in \R^{c_L}$ the \textit{raw node embeddings} and the matrix representation of $\mathcal{G}_L$ given below the \textit{raw graph embedding matrix}:
+    \[ \text{Mat}[\mathcal{G}_L] = \begin{pmatrix}
+        \vdots & & \vdots \\
+        v_L^1 & \cdots & v_L^N \\
+        \vdots & & \vdots
+    \end{pmatrix}^T \in \R^{c_L \times N}\]
+    Note the matrix is transposed, so each node embedding is a row in the graph embedding matrix. This is just an arbitrary choice of convention. \\[-6pt]
+
+    In practice, the raw graph embedding matrix is often pooled into a single vector. There are many global and hierarchical pooling techniques (summing all node embeddings, averaging node embeddings, aggregating node embeddings via attention, etc.). We will not discuss these at length and abstract them away into some postprocessing function
+    \[ \text{Pool}(\mathcal{G}_L) = G \in \R^{(\cdot) \times (\cdot)}\]
+    where we emphasize that the pooling procedure, in general, could produce a matrix $G$ of any dimension, not necessarily that of $\text{Mat}[\mathcal{G}_L]$. Similarly, the raw node embeddings can be postprocessed, perhaps via small NNs:
+    \[ \text{NN}(v_L^1, \ldots, v_L^N) = (v^1, \ldots, v^N) \ \  \text{where} \ v^j \in \R^c\]
+
+    Thus, in general terms, we follow the GNN message passing with a postprocessing function $\text{Post}: \R^{c_L \times N} \times \R^{c_L} \to \R^{(\cdot) \times (\cdot)} \times \R^c$ given by
+    \[ \text{Post}( \text{Mat}[\mathcal{G}_L], \{v_L^j\}_{j=1}^N) = (\text{Pool}(\mathcal{G}_L), \text{NN}(\{v_L^j\}_{j=1}^N))=(G, \{v^j\}_{j=1}^N)\]
+
+    We call the composition $\text{Post} \circ \text{GNN}$ the \textit{graph encoder}, $G$ the \textit{grap h embedding}, and $\{v^j\}_{j=1}^N$ the \textit{node embeddings}. From the perspective of the sequential decoder, the encoder thus provides $(G, \{v^j\}_{j=1}^N)$ as inputs, so $F_k$ sees $\mathcal{G} = (G, \{v^j\}_{j=1}^N)$ (note the symbol $\mathcal{G}$ has again been rerouted for convenience) and gives the map
+    \[ F_k(\mathcal{G}, D_{k-1}) = (D_{k-1} z_k,\  z_k^T D_{k-1} z_k + f(\alpha_k)) = (c_k, d_k)\]
+    where
+    \[ z_k = g_{\theta}(\mathcal{G}, D_{k-1}, \ldots), \ \ \alpha_k = h_\theta (\mathcal{G}, D_{k-1}, \ldots)\]
+    and the ``$\ldots$'' is a reminder that additional a priori (meta)data on the molecule can be used, including but not limited to:
+    \begin{itemize}
+        \item Order-based labels on atoms,
+        \item Angular momentum labels on orbitals,
+        \item The raw, unprocessed $\{(r_j, s_j)\}_{j=1}^N$ information.
+    \end{itemize}
+
+    We now give a practical characterization of $F_k$, more specifically of $g_\theta$ and $h_\theta$. 
+
+    \subsection{The $d_1$ Decoder Head}
+    To commence the sequence, we need to initialize the upper left entry $d_1$ to be nonnegative. This decoder head is thus very simple:
+    \begin{equation}
+        d_1 = f(h^1_\theta(\mathcal{G})) \geq 0
+    \end{equation}
+    where as previously we assume $f: \R \to \R \setminus \R^-$ and $h_\theta^1$ can be a (probably very simple) NN layer. Note it is highly likely $h_\theta^1$ does not need to see the full information in $\mathcal{G}$ to make a very good prediction.     
+
+    \subsection{The $z_{k, i}$ Decoder Head}
+    Now our task is to pick $z_k \in \R^{k-1}$ for $k = 2, \ldots, K$ using $g_\theta$. To bypass the $k$ mismatch between steps, we instead pick each entry of $z_k$ individually, i.e. $z_{k, i} = g_\theta(\mathcal{G}, D_{k-1})$. \\[-6pt]
+    
+    This gives us a natural motivation to use the pair of node embeddings at index $j(k), j(i)$ associated with orbitals $k$ and $i$ as primary inputs, with the rest of $\mathcal{G}$ present only as auxiliary information if needed. One could even imagine feeding an attention-based, geometry- and label-informed aggregation of the rest of $\mathcal{G}$ alongside $v^{j(k)}$ and $v^{j(k)}$ plus other data for maximal expressivity, although the hope is that the encoder already injected this information into $v^{j(k)}$ and $v^{j(i)}$. \\[-6pt]
+    
+    It is, however, still a good idea to feed $|r_{j(k)} - r_{j(i)}|$, the distance between the atoms of the two orbitals, plus metadata informing the identities of the orbitals (angular momentum numbers, etc). These can be one-hot encoded or integrated with much more principle methods, perhaps in a future attempt to maintain E(3) equivariance in the decoder (which may actually be straight up impossible given the decomposition). \\[-6pt]
+
+    Thus, the general form of the $z_{k, i}$ decoder is
+    \begin{equation}
+        z_{k, i} = g_\theta(v^{j(k)}, v^{j(i)}, |r_{j(k)} - r_{j(i)}|, \mathcal{G}, D_{k-1},\text{metadata})
+    \end{equation}
+    Importantly, note the decoder parameters $\theta$ are shared across all $k$ and $i$. Thus, we need only one $z_{k, i}$ decoder head across all orbitals and molecules; implicit conditioning on the identities of the $k$th and $i$th orbitals should, in principle, arrive in $v^k$, $v^i$, and the rest of the inputs. 
+
+    \subsection{The $\alpha_k$ Decoder Head}
+    The $\alpha_k$ decoder head is simpler: we just predict a scalar at every $k$:
+    \begin{equation}
+        \alpha_k = h_\theta(v^{j(k)}, \mathcal{G}, D_{k-1}, \text{metadata})
+    \end{equation}
+    Again, the decoder is shared across all orbitals and molecules. 
+
+    \subsection{The 3 Decoders}
+    With the construction in 5.2-5.4, we obtain a clean decomposed form of $F_k$ as 3 separate decoders, all of which output scalars conditioned on input data comprised of the GNN outputs, the previous submatrix $D_{k-1}$, and additional metadata. \\[-6pt]
+
+    It bears emphasizing again that the $z_{k, i}$ and $\alpha_k$ decoder heads are shared across all steps $k$, so we literally end up with 3 decoder heads, not one head per orbital-orbital or atom-atom pair (as is the case in some prior works). This is naturally memory efficient; we are not adding parameters at each $k$, just further tuning the existing parameters. 
+
+    \subsection{A Graph Construction Perspective}
+    One useful intuitive picture for making sense of the decoder outputs is to lift the molecular graph into an \textit{orbital graph}, where nodes are orbitals instead of atoms. Now, the $d_k$'s or $\alpha_k$'s become node-level scalar attributes, and the $c_{k, i}$'s or $z_{k, i}$'s become edge-level scalar attributes. Running the sequential decoder thus corresponds to filling in the node and edge features of the orbital graph one at a time, framing it as a graph construction algorithm where the 1-RDM target is effectively the adjacency matrix. 
+
+    \subsection{Generalization Across Molecule Sizes}
+    This further decomposition of $F_k$ into 3 scalar-valued decoder heads allows a natural structural generalization of the architecture to atoms of different sizes. Namely, the architecture of the NNs in the decoder never depends on the the molecule size at any point. The optimistic case is that the model can even generalize to molecules larger than any in its train set. 
+
+    \section{Training Strategies}
+
+    \subsection{Joint Training}
+    The most straightforward training scheme: run each sample all the way through the encoder and decoder, then compute loss, then backpropagate and loop until convergence. Supervision can still be somewhat guided by weighing the loss on different orbitals / atoms differently, as detailed in Section 4. 
+    
+    \subsection{Sequential Training}
+    Instead of training the entire decoder jointly, train one $F_k$ at a time. In particular: run each sample through the encoder and the decoder up to only the $k$th layer, then compute loss with respect to the ground truth $D_k$, then backpropagate and loop until convergence, then increment $k \mapsto k+1$ and repeat. Note this method unlocks explicit loss scheduling schemes with respect to $k$. \\[-6pt]
+
+    One interpretation here is that at step $k$, the first $k-1$ steps serve as pretraining for the $z_{k, i}$ and $\alpha_k$ decoder heads. Each step $k$ just further tunes the same parameters, without adding new parameters. 
+
+    \subsection{Semi-Sequential Training}
+    A generalization of both joint and sequential training, where instead of training one or all layers of the decoder at a time, we train a contiguous subset of $F_k$'s and pick these subsets in a similar manner as described in (3) of Section 4.2. This unlocks more sophisticated ways to explicitly perform loss scheduling with respect to $k$. \\[-6pt]
+    
+    However, note that the method described by (4) of Section 4.2, which constructions chunks corresponding to different $k$'s for different molecules, is unfortunately NOT available. Thus, explicit atom-by-atom sequential supervision is impossible. 
+
+    \subsection{Teacher Forcing}
+    This perhaps belongs in Section 4 on loss functions, but may require distinct data routing than the previous training schemes. In particular, the previous schemes, and most loss formulations in Section 4, assume the decoder heads are fed the predicted $\hat D_{k-1}$ at the $k$th step. This may permit errors to accumulate as $k$ increases, as the model is using more and more of its own (perhaps faulty) predictions as input. \\[-6pt]
+
+    To mitigate this error propagation, we can employ the classic teacher forcing method. Instead of feeding the decoders $\hat D_{k-1}$, we feed it the ground truth $D_{k-1}$ at step $k$, so the model does not reuse its (perhaps faulty) predictions. \\[-6pt]
+    
+    Teacher forcing still admits joint, sequential, or semi-sequential schemes, as it only influences the inputs to the decoders and does not fix where supervision / backpropagation must occur. Since the ground truth is unavailable at inference time, it is standard practice to use teacher forcing as pretraining, and start feeding model predictions at each step after teacher forcing has converged. 
+
+    \section{The Canonical Ordering Problem}
+
+    \subsection{Canonical Orderings in Chemistry}
+    Canonical orderings of atoms in arbitrary molecules used by chemistry codes and databases are generally not spatially aware, in the sense that atoms adjacent to each other in space may not be adjacent to each other in the ordered string. \\[-6pt]
+
+    This is not ideal, as it weakens the physical correlation between the prediction targets at each step of the sequential decoder. In the ideal case, the decoder moves atom-to-atom in a spatially informed manner. Thus, to ``maximize'' the inductive bias given by the decomposition, it is productive to declare a new canonical ordering which is spatially informed and as unique as possible for each molecule. 
+
+    \subsection{Geometry-Aware Orderings}
+
+    \section{Nice Interpretations}
+
+    \subsection{A Natural Discretization of the Target}
+    As noted by Stephan and Max, GNNs tend to learn continuous objects better than discrete objects. More precisely, since generic GNN layers are continuous, GNNs learn best when the output, as a data object, is ``as continuous as possible'' modulo necessary discretizations for machines. Thus, Stephan hypothesizes that learning the point-cloud electron density is easier for GNN architectures than learning the density matrix, which is more discretized numerically and fundamentally (restriction of operator to a finite dimensional subspace). \\[-6pt]
+
+    The proposed sequential architecture in Section 5 mitigates this. Instead of predicting the entire discrete matrix target with a single head and forcing this head to learn the discretization, we predict entry by entry. In a sense, this discretizes the model / predictive pipeline in a compatible manner as the matrix. Each head now only has to worry about predicting scalars, not the discretization of a high dimensional object. 
+
+    \subsection{Placing One Orbital at a Time Intuition}
+    
+    \subsection{The Latent Variable Viewpoint for $z_k, \delta_k$}
+
+    \subsection{The Conditional Distribution Viewpoint for $F_k$}
+
+    \subsection{The Generative Viewpoint}
+
+    \section{Appendix}
+
+    The construction is exactly $LDL^\top$, reparameterized. Claim: the map $(z_2,\dots,z_K;\ \delta_1,\dots,\delta_K) \mapsto D$ defined by your recursion equals $D = L\Delta L^\top$ with $L$ unit lower triangular, $\Delta = \mathrm{diag}(\delta)$, and the strictly-lower part of row $k$ of $L$ given by $\ell_k = L_{k-1}^\top z_k$. \\[-6pt]
+
+    Induction: suppose $D_{k-1} = L\Delta L^\top$. Bordering the factorization with \[\begin{pmatrix} L & 0 \\ w^\top & 1\end{pmatrix}\mathrm{diag}(\Delta,\delta_k)\begin{pmatrix}L^\top & w \\ 0 & 1\end{pmatrix}\] gives off-diagonal $L\Delta w$ and corner $w^\top \Delta w + \delta_k$. Setting $w = L^\top z_k$ yields $L\Delta L^\top z_k = D_{k-1}z_k = c_k$ and $w^\top\Delta w = z_k^\top D_{k-1} z_k = z_k^\top c_k$. Exactly your $(c_k,d_k)$. $\square$ \\[-6pt]
+
+    The clean way to see both (and I think this is what your §8.3/§8.4 stubs are reaching for): since $D \succeq 0$, treat it formally as the covariance of a zero-mean Gaussian $X = (X_1,\dots,X_K)$ indexed by AOs. Then
+
+    - $z_k = D_{k-1}^{+}c_k$ is the vector of linear-regression coefficients of $X_k$ on $X_{<k}$: $\mathbb{E}[X_k \mid X_{<k}] = z_k^\top X_{<k}$.
+    
+    - $\delta_k = \operatorname{Var}(X_k \mid X_{<k})$ is the conditional variance — the Schur complement, literally the density on orbital $k$ not explained by its couplings to already-placed orbitals.
+    
+    - $\ell_k$ are the coefficients of $X_k$ on the innovations $\varepsilon_m = X_m - \mathbb{E}[X_m\mid X_{<m}]$, via $X = L\varepsilon$, $\operatorname{Cov}(\varepsilon)=\Delta$.
+        
+\end{document}

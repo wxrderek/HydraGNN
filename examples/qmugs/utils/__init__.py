@@ -15,6 +15,7 @@ from .utils import (
     upper_triangle_mask_vector,
     physical_upper_triangle_indices,
     symmetric_matrix_from_upper_triangle_vector,
+    orbital_metadata,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     'upper_triangle_mask_vector',
     'physical_upper_triangle_indices',
     'symmetric_matrix_from_upper_triangle_vector',
+    'orbital_metadata',
 ]

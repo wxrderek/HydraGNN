@@ -3,8 +3,8 @@
 #SBATCH -J QMugs-DataLoad
 #SBATCH -o dataload-job-%j.out
 #SBATCH -e dataload-job-%j.out
-#SBATCH -t 02:00:00
-#SBATCH -p youlab
+#SBATCH -t 24:00:00
+#SBATCH -p youlab-gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH -c 12
@@ -113,7 +113,7 @@ export HYDRAGNN_TRACE_LEVEL=0
 export HYDRAGNN_MAX_NUM_BATCH=1000
 export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
-export BATCH_SIZE=16
+export BATCH_SIZE=8
 export NUM_EPOCH=5
 export MAX_DENSITY_MATRIX_SIZE=800
 export UPDATE_MAX_PADDED_DIMENSION=1
@@ -150,10 +150,32 @@ if [ "$UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
     SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
 fi
 
+# ----------------------------------------------------------------------------------------------------
+# SET THESE
+#
+# This dataset is SHARED with the Schur decoder route. scripts/dcc/qmugs_schur_pre_dcc.sh
+# writes the same MODELNAME and the same ARTIFACTS_DIR, so run ONE of the two, not both.
+# They are kept as separate entry points only because each route has its own config file.
+#
+# The two are interchangeable because preprocessing reads just four things from the config,
+# and qmugs_densmat.json and qmugs_schur.json agree on all four: Architecture.radius,
+# Architecture.max_neighbours, Variables_of_interest.output_names and
+# Variables_of_interest.mask_output_loss. If you change any of those in one config, change
+# it in the other or the two routes stop sharing a dataset.
+#
+# One dataset serves both because _mol_to_graph now attaches the per-orbital metadata to
+# every conformer regardless of task, and the delta output name additionally stores the
+# promolecular upper triangle. The dense head reads y (= Delta D); the Schur decoder reads
+# y plus the promolecular triangle and rebuilds the total before its recursion.
+
+MODELNAME=${MODELNAME:-QMugs001_max800_delta_uptr_decodercmp}
+PERC_LOAD=${PERC_LOAD:-0.01}
+PERC_TRAIN=${PERC_TRAIN:-0.8}
+
 # --- More paths ---
 # Perlmutter /pscratch/sd/w/wxrderek/artifacts maps to /work/$USER/artifacts on DCC.
 # Datasets and artifacts may live on /work; only psi4's own installation cannot.
-ARTIFACTS_DIR=/work/$USER/artifacts/DCC_MODEL-QMugs0001_max800_delta_uptr_DATA-QMugs0001_max800_delta_uptr
+ARTIFACTS_DIR=${ARTIFACTS_DIR:-/work/$USER/artifacts/DCC_MODEL-${MODELNAME}_DATA-${MODELNAME}}
 
 # Launched with mpirun, NOT srun: OpenMPI/4.1.6 on DCC cannot be direct-launched by
 # srun (no Slurm PMI support). "--bind-to none" is the analogue of Perlmutter's
@@ -169,9 +191,9 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
-    --perc_load=0.001 \
-    --perc_train=0.8 \
+    --perc_load=$PERC_LOAD \
+    --perc_train=$PERC_TRAIN \
     "${SIZE_AWARE_ARGS[@]}" \
     --preonly \
     --streaming_preonly \
-    --modelname=QMugs0001_max800_delta_uptr
+    --modelname="$MODELNAME"

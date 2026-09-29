@@ -10,6 +10,7 @@
 ##############################################################################
 
 import os
+import math
 import numpy as np
 
 import torch
@@ -59,6 +60,14 @@ def loss_function_selection(loss_function_string: str):
         return torch.nn.GaussianNLLLoss()
     else:
         raise ImportError()
+
+def output_constraint_selection(output_constraint_string: str):
+    if output_constraint_string == "trace_norm":
+        pass
+    elif output_constraint_string == "trace_zero":
+        pass
+    else:
+        raise NotImplementedError
 
 
 def multitask_optim_state_dict(model, optimizer):
@@ -146,6 +155,23 @@ def save_model(model, optimizer, name, path="./logs/", use_deepspeed=False):
                     if use_multitask
                     else optimizer.state_dict()
                 )
+        elif use_fsdp and fsdp_version == 2:
+            # fully_shard represents parameters as DTensors which serializes its LOCAL SHARD. 
+            # # A plain model.state_dict() here would therefore write only the parameters on rank 0 and the
+            # rest would never reach disk, so the full tensors have to be gathered before the write.
+            from torch.distributed.checkpoint.state_dict import (
+                get_model_state_dict,
+                get_optimizer_state_dict,
+                StateDictOptions,
+            )
+
+            # cpu_offload together with full_state_dict gives rank 0 the whole state dict and
+            # every other rank an empty one. Both calls are collectives and every rank reaches them.
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            model_state_dict = get_model_state_dict(model, options=options)
+            optimizer_state_dict = get_optimizer_state_dict(
+                model, optimizer, options=options
+            )
         else:
             model_state_dict = model.state_dict()
             if isinstance(optimizer, ZeroRedundancyOptimizer):
@@ -303,6 +329,25 @@ def load_existing_model(
                             model, optimizer, checkpoint["optimizer_state_dict"]
                         )
                     optimizer.load_state_dict(optimizer_state_dict)
+        elif use_fsdp and fsdp_version == 2:
+            # the counterpart of the save branch above: the checkpoint holds full tensors,
+            # so rank 0 broadcasts them and each rank reshards to its own DTensor slice.
+            # A plain load_state_dict here would give every rank rank 0's shard.
+            from torch.distributed.checkpoint.state_dict import (
+                set_model_state_dict,
+                set_optimizer_state_dict,
+                StateDictOptions,
+            )
+
+            options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True)
+            set_model_state_dict(model, state_dict, options=options)
+            if (optimizer is not None) and ("optimizer_state_dict" in checkpoint):
+                set_optimizer_state_dict(
+                    model,
+                    optimizer,
+                    checkpoint["optimizer_state_dict"],
+                    options=options,
+                )
         else:
             model.load_state_dict(state_dict)
             if (optimizer is not None) and ("optimizer_state_dict" in checkpoint):
@@ -518,7 +563,8 @@ class EarlyStopping:
         self.count = 0
 
     def __call__(self, val_loss):
-        if val_loss > self.val_loss_min + self.min_delta:
+        # guard against NaN validation loss
+        if not math.isfinite(float(val_loss)) or val_loss > self.val_loss_min + self.min_delta:
             self.count += 1
             if self.count >= self.patience:
                 return True

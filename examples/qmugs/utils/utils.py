@@ -137,6 +137,49 @@ def symmetric_matrix_from_upper_triangle_vector(upper_triangle: np.ndarray, size
     return matrix
 
 # ----------------------------------------------------------------------------------------------------
+# atomic orbital metadata (inputs to the sequential Schur decoder)
+
+def orbital_metadata(wfn):
+    '''per-orbital atom index, angular momentum, position within shell, and shell ordinal'''
+
+    # The sequential decoder of references/schur_decoder.tex indexes its steps by atomic orbital,
+    # so it needs to know which atom each orbital sits on (this is j(k) of Section 5.3) and what
+    # kind of orbital it is. Psi4 stores the basis shell by shell in the same canonical ordering
+    # as the density matrix, so one walk over the shells labels every orbital.
+    basis = wfn.basisset()
+    n_basis = int(basis.nbf())
+
+    to_atom = np.zeros(n_basis, dtype=np.int32) # (n_basis,)
+    angular_momentum = np.zeros(n_basis, dtype=np.int32) # (n_basis,)
+    within_shell = np.zeros(n_basis, dtype=np.int32) # (n_basis,), position inside its shell
+    shell_ordinal = np.zeros(n_basis, dtype=np.int32) # (n_basis,), which shell of its own atom
+
+    shells_seen_per_atom = {}
+    ao_start = 0
+    for shell_index in range(basis.nshell()):
+        shell = basis.shell(shell_index)
+        atom_index = int(shell.ncenter)
+        n_functions = int(shell.nfunction)
+
+        ordinal = shells_seen_per_atom.get(atom_index, 0)
+        shells_seen_per_atom[atom_index] = ordinal + 1
+
+        block = slice(ao_start, ao_start + n_functions)
+        to_atom[block] = atom_index
+        angular_momentum[block] = int(shell.am)
+        within_shell[block] = np.arange(n_functions, dtype=np.int32)
+        shell_ordinal[block] = ordinal
+        ao_start += n_functions
+
+    if ao_start != n_basis:
+        raise ValueError(
+            f"Shell walk covered {ao_start} basis functions, expected {n_basis}"
+        )
+
+    return to_atom, angular_momentum, within_shell, shell_ordinal
+
+
+# ----------------------------------------------------------------------------------------------------
 # promolecular density matrix computation (baseline for delta learning)
 
 def promolecular_density_matrix(wfn, basis_name: str = "def2-SVP"):

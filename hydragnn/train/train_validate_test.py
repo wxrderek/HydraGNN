@@ -23,6 +23,7 @@ from hydragnn.utils.distributed import get_device, check_remaining
 from hydragnn.utils.model.model import Checkpoint, EarlyStopping
 
 import os
+import logging
 
 from torch.profiler import record_function
 
@@ -324,6 +325,9 @@ def train_validate_test(
             if getattr(dataloader.sampler, "set_epoch", None) is not None:
                 dataloader.sampler.set_epoch(epoch)
 
+        if getattr(model.module, "set_epoch", None) is not None:
+            model.module.set_epoch(epoch)
+
         with profiler as prof:
             tr.enable()
             tr.start("train")
@@ -337,6 +341,7 @@ def train_validate_test(
                 use_deepspeed=use_deepspeed,
                 compute_grad_energy=compute_grad_energy,
                 precision=precision,
+                epoch=epoch,
             )
             tr.stop("train")
             tr.disable()
@@ -641,6 +646,7 @@ def train(
     use_deepspeed=False,
     compute_grad_energy=False,
     precision="fp32",
+    epoch=None,
 ):
     if profiler is None:
         profiler = Profiler()
@@ -678,6 +684,14 @@ def train(
     syncopt = {"cudasync": False}
     ## 0: default (no detailed tracing), 1: sync tracing
     trace_level = int(os.getenv("HYDRAGNN_TRACE_LEVEL", "0"))
+
+    # Optional guards on the optimizer step against NaN parameters
+    clip_grad_norm = float(os.getenv("HYDRAGNN_CLIP_GRAD_NORM", "0.0"))
+    skip_nonfinite_step = bool(int(os.getenv("HYDRAGNN_SKIP_NONFINITE_STEP", "0")))
+    # Report the gradient norm every this many batches even when it is finite. Whether the
+    # norm creeps up over epochs or jumps in a single step is what separates a slow blow-up
+    # from one bad batch, and that is invisible in the loss.
+    grad_norm_stride = int(os.getenv("HYDRAGNN_GRAD_NORM_STRIDE", "0"))
     if trace_level > 0:
         syncopt = {"cudasync": True}
     tr.start("dataload", **syncopt)
@@ -775,10 +789,50 @@ def train(
         tr.stop("backward", **syncopt)
         tr.start("opt_step", **syncopt)
         # print_peak_memory(verbosity, "Max memory allocated before optimizer step")
-        if use_deepspeed:
-            model.step()
-        else:
+        skip_step = False
+
+        if (
+            clip_grad_norm > 0.0 or skip_nonfinite_step or grad_norm_stride > 0
+        ) and not use_deepspeed:
             if scaler is not None:
+                scaler.unscale_(opt)
+
+            # max_norm = inf returns the total gradient norm without rescaling anything
+            max_norm = clip_grad_norm if clip_grad_norm > 0.0 else float("inf")
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if grad_norm_stride > 0 and ibatch % grad_norm_stride == 0:
+                logging.info(
+                    "gradient norm at epoch %s batch %d rank %d: grad_norm=%.6e loss=%.6e",
+                    epoch,
+                    ibatch,
+                    dist.get_rank() if dist.is_initialized() else 0,
+                    float(grad_norm),
+                    float(loss),
+                )
+            if skip_nonfinite_step and not bool(torch.isfinite(grad_norm)):
+                skip_step = True
+
+            # every rank has to reach the same verdict or their parameters diverge
+            skip_step = bool(MPI.COMM_WORLD.allreduce(int(skip_step), op=MPI.MAX))
+            if skip_step:
+                logging.warning(
+                    "non-finite gradient at epoch %s batch %d rank %d: grad_norm=%s loss=%s; "
+                    "skipping the optimizer step. Conformers in this batch: %s",
+                    epoch,
+                    ibatch,
+                    dist.get_rank() if dist.is_initialized() else 0,
+                    float(grad_norm),
+                    float(loss),
+                    getattr(data, "chembl_id", "unknown"),
+                )
+                opt.zero_grad()
+
+                if scaler is not None:
+                    scaler.update()
+        if not skip_step:
+            if use_deepspeed:
+                model.step()
+            elif scaler is not None:
                 scaler.step(opt)
                 scaler.update()
             else:

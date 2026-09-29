@@ -9,8 +9,10 @@
 # SPDX-License-Identifier: BSD-3-Clause                                      #
 ##############################################################################
 
+import logging
+
 import torch
-from torch.nn import ModuleList, Sequential, ReLU, Linear, Module, ModuleDict
+from torch.nn import ModuleList, Sequential, ReLU, Linear, Module, ModuleDict, Identity
 import torch.nn.functional as F
 from torch_geometric.nn import (
     BatchNorm,
@@ -19,9 +21,11 @@ from torch_geometric.nn import (
     global_mean_pool,
 )
 from torch_geometric.nn import Sequential as PyGSequential
+from torch_geometric.utils import to_dense_batch
 from torch.utils.checkpoint import checkpoint
 import torch_scatter
 from hydragnn.utils.model import activation_function_selection, loss_function_selection
+from hydragnn.utils.pooling import build_graph_pooling
 import sys
 import pdb
 from hydragnn.utils.distributed import get_device
@@ -59,6 +63,7 @@ class Base(Module):
         num_conv_layers: int = 16,
         num_nodes: int = None,
         graph_pooling: str = "mean",
+        max_nodes: int = None,
         use_graph_attr_conditioning: bool = False,
         graph_attr_conditioning_mode: str = "concat_node",
     ):
@@ -78,6 +83,7 @@ class Base(Module):
         self.graph_convs = ModuleList()
         self.feature_layers = ModuleList()
         self.num_nodes = num_nodes
+        self.max_nodes = max_nodes # max nodes of any graph in the dataset
         ##One head represent one variable
         ##Head can have different sizes, head_dims
         self.heads_NN = ModuleList()
@@ -144,21 +150,53 @@ class Base(Module):
             if "edge_attr" not in self.conv_args:
                 self.conv_args += ", edge_attr"
 
-        # Graph pooling policy
-        pool_mode = graph_pooling.lower()
+        # Graph pooling policy. graph_pooling accepts either a bare string or a dict of form
+        # {"type": ..., "pool_config": {...}}. 
+        if isinstance(graph_pooling, dict):
+            pool_mode = graph_pooling.get("type", "mean").lower()
+            pool_config = dict(graph_pooling.get("pool_config", {}))
+        else:
+            pool_mode = graph_pooling.lower()
+            pool_config = {}
         if pool_mode == "sum":
             pool_mode = "add"
-        pool_map = {
+
+        # max_nodes may arrive as a constructor arg for PAINN/EGNN or inside the pooling sub-dict
+        if self.max_nodes is None and pool_config.get("max_nodes", None) is not None:
+            self.max_nodes = int(pool_config["max_nodes"])
+        pool_config.pop("max_nodes", None)  # passed separately, not as a pooler kwarg
+
+        legacy_reductions = {
             "mean": (global_mean_pool, "mean"),
             "add": (global_add_pool, "sum"),
             "max": (global_max_pool, "max"),
         }
-        if pool_mode not in pool_map:
-            raise ValueError("Unsupported graph_pooling: " + graph_pooling)
         self.graph_pooling = pool_mode
-        self.graph_pool_fn, self.graph_pool_reduction = pool_map[pool_mode]
 
-        def _pool_graph_features(x_tensor, batch_tensor):
+        if pool_mode in legacy_reductions:
+            # legacy global reduction have no submodule pooler
+            self.graph_pool = None
+            self.graph_pool_fn, self.graph_pool_reduction = legacy_reductions[pool_mode]
+            self.pooled_shape = (1, hidden_dim)
+            self.pooled_dim = hidden_dim # pooled_dim forced to hidden_dim by architecture
+        else:
+            # new hierarchical poolers
+            self.graph_pool = build_graph_pooling(
+                pool_mode, hidden_dim, self.max_nodes, **pool_config
+            )
+            self.graph_pool_fn = None
+            self.graph_pool_reduction = None
+            self.pooled_shape = self.graph_pool.pooled_shape
+            self.pooled_dim = self.graph_pool.pooled_dim
+
+        def _pool_graph_features(x_tensor, batch_tensor, data=None):
+            # x_tensor is (num_nodes_in_batch, hidden_dim)
+            # data field is for a priori metadata to condition on
+            if self.graph_pool is not None:
+                pooled = self.graph_pool(x_tensor, batch_tensor, data) # (num_graphs, R, C)
+                return pooled.reshape(pooled.shape[0], -1)  # (num_graphs, R * C)
+
+            # legacy global reductions
             if batch_tensor is None:
                 if self.graph_pool_reduction == "mean":
                     return x_tensor.mean(dim=0, keepdim=True)
@@ -597,17 +635,35 @@ class Base(Module):
         # shared dense layers for heads with graph level output
         dim_sharedlayers = 0
         self.num_branches = 1
+        # input width each graph head sees, which is the pooled width when the trunk is bypassed
+        self.graph_head_input_dim = {}
+
         if "graph" in self.config_heads:
             self.num_branches = len(self.config_heads["graph"])
             for branchdict in self.config_heads["graph"]:
-                denselayers = []
+                branchtype = branchdict["type"]
                 dim_sharedlayers = branchdict["architecture"]["dim_sharedlayers"]
-                denselayers.append(Linear(self.hidden_dim, dim_sharedlayers))
+                num_sharedlayers = branchdict["architecture"]["num_sharedlayers"]
+                if num_sharedlayers < 0:
+                    raise ValueError(
+                        f"num_sharedlayers must be non-negative, got {num_sharedlayers}"
+                    )
+
+                if num_sharedlayers == 0:
+                    # bypass the shared trunk so the head network takes the pooled graph embedding directly
+                    self.graph_shared[branchtype] = Identity()
+                    self.graph_head_input_dim[branchtype] = self.pooled_dim
+                    continue
+
+                denselayers = []
+                denselayers.append(Linear(self.pooled_dim, dim_sharedlayers))
                 denselayers.append(self.activation_function)
-                for ishare in range(branchdict["architecture"]["num_sharedlayers"] - 1):
+
+                for ishare in range(num_sharedlayers - 1):
                     denselayers.append(Linear(dim_sharedlayers, dim_sharedlayers))
                     denselayers.append(self.activation_function)
-                self.graph_shared[branchdict["type"]] = Sequential(*denselayers)
+                self.graph_shared[branchtype] = Sequential(*denselayers)
+                self.graph_head_input_dim[branchtype] = dim_sharedlayers
 
         if "node" in self.config_heads:
             self._init_node_conv()
@@ -620,11 +676,18 @@ class Base(Module):
                 for branchdict in self.config_heads["graph"]:
                     branchtype = branchdict["type"]
                     brancharct = branchdict["architecture"]
-                    dim_sharedlayers = brancharct["dim_sharedlayers"]
                     num_head_hidden = brancharct["num_headlayers"]
                     dim_head_hidden = brancharct["dim_headlayers"]
+                    if num_head_hidden < 1:
+                        # the first head layer is always built so 0 behaves exactly like 1
+                        logging.warning(
+                            f"num_headlayers={num_head_hidden} is not supported and is "
+                            "treated as 1; set num_headlayers to len(dim_headlayers)"
+                        )
                     denselayers = []
-                    denselayers.append(Linear(dim_sharedlayers, dim_head_hidden[0]))
+                    denselayers.append(
+                        Linear(self.graph_head_input_dim[branchtype], dim_head_hidden[0])
+                    )
                     denselayers.append(self.activation_function)
                     for ilayer in range(num_head_hidden - 1):
                         denselayers.append(
@@ -694,7 +757,12 @@ class Base(Module):
         print_master("Enabling checkpointing")
         self.conv_checkpointing = True
 
-    def forward(self, data):
+    def encode(self, data):
+        """Run the message-passing trunk and pooling, returning node embeddings v and graph embedding G."""
+
+        # Pure extraction of the encoder half of forward(), which now calls it. Split out so a
+        # sequential decoder (hydragnn/decoders/) can consume v and G without the multihead
+        # decoder running. Nothing about the computation changed.
         ### encoder part ####
         tr.start("enc_forward")
         inv_node_feat, equiv_node_feat, conv_args = self._embedding(data)
@@ -727,18 +795,25 @@ class Base(Module):
 
         x = inv_node_feat
         tr.stop("enc_forward")
-        tr.start("branch_forward")
-        #### multi-head decoder part####
         # shared dense layers for graph level output
         if data.batch is None:
-            x_graph = self._pool_graph_features(x, None)
+            x_graph = self._pool_graph_features(x, None, data)
             # individual samplers
             data.batch = data.x * 0
         else:
-            x_graph = self._pool_graph_features(x, data.batch)
+            x_graph = self._pool_graph_features(x, data.batch, data)
 
         # Optional pool-level fusion of graph_attr into pooled embedding
         x_graph = self._apply_graph_pool_conditioning(x_graph, data)
+
+        # x is (num_nodes_in_batch, hidden_dim), x_graph is (num_graphs, pooled_dim); the node
+        # heads still need equiv_node_feat and conv_args, so they are returned alongside
+        return x, x_graph, equiv_node_feat, conv_args
+
+    def forward(self, data):
+        x, x_graph, equiv_node_feat, conv_args = self.encode(data)
+        tr.start("branch_forward")
+        #### multi-head decoder part####
         outputs = []
         outputs_var = []
         # if no dataset_name, set it to be 0

@@ -96,6 +96,7 @@ def create_model_config(
             "graph_attr_conditioning_mode", "concat_node"
         ),
         graph_pooling=config["Architecture"].get("graph_pooling", "mean"),
+        max_nodes=config["Architecture"].get("max_nodes", None),
         verbosity=verbosity,
         use_gpu=use_gpu,
     )
@@ -156,6 +157,7 @@ def create_model(
     use_graph_attr_conditioning: bool = False,
     graph_attr_conditioning_mode: str = "fuse_pool",
     graph_pooling: str = "mean",
+    max_nodes: int = None,
     verbosity: int = 0,
     use_gpu: bool = True,
 ):
@@ -476,6 +478,7 @@ def create_model(
             num_conv_layers=num_conv_layers,
             num_nodes=num_nodes,
             graph_pooling=graph_pooling,
+            max_nodes=max_nodes,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
         )
@@ -505,6 +508,7 @@ def create_model(
             num_conv_layers=num_conv_layers,
             num_nodes=num_nodes,
             graph_pooling=graph_pooling,
+            max_nodes=max_nodes,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
         )

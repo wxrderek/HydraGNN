@@ -22,7 +22,9 @@ rng = np.random.default_rng(random_state)
 from torch_geometric.transforms import Distance
 
 import hydragnn
+from hydragnn.decoders import SchurDecoderModel
 from hydragnn.utils.model import print_model
+from hydragnn.utils.pooling import graph_pooled_dim
 from hydragnn.utils.print.print_utils import iterate_tqdm, log, log0
 from hydragnn.preprocess.graph_samples_checks_and_updates import (
     RadiusGraph,
@@ -116,6 +118,31 @@ if __name__ == "__main__":
         help="set the padded density matrix dimension to max_density_matrix_size",
     )
 
+    # Schur decoder overrides. Everything else about the decoder is configured in the JSON;
+    # these three are exposed because sweeping them is the point of the first runs, and
+    # editing the JSON per job invites the two from getting out of step.
+    parser.add_argument(
+        "--schur_routing",
+        type=str,
+        choices=["teacher_forcing", "free_running"],
+        help="override SchurDecoder.routing from the config file",
+        default=None,
+    )
+    parser.add_argument(
+        "--schur_supervision",
+        type=str,
+        choices=["joint", "semi_sequential", "per_step"],
+        help="override SchurDecoder.supervision from the config file",
+        default=None,
+    )
+    parser.add_argument(
+        "--schur_target",
+        type=str,
+        choices=["total", "delta"],
+        help="override SchurDecoder.target from the config file",
+        default=None,
+    )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--adios",
@@ -145,8 +172,28 @@ if __name__ == "__main__":
     with open(os.path.join(dirpwd, 'utils/download_data.json'), 'r') as f:
         download_config = json.load(f)
         
-    dataset_dir = download_config.get('data_dir', './dataset')    
+    dataset_dir = download_config.get('data_dir', './dataset')
     verbosity = config["Verbosity"]["level"]
+
+    # resolved here rather than at model construction because it changes how the output head is
+    # sized below: the sequential Schur decoder never calls the Base head
+    schur_config = config["NeuralNetwork"].get("SchurDecoder", None)
+    use_schur_decoder = schur_config is not None and schur_config.get("enable", False)
+
+    # command line wins over the config file, and the override is written back so the saved
+    # config records what actually ran
+    if use_schur_decoder:
+        for name in ("routing", "supervision", "target"):
+            override = getattr(args, f"schur_{name}")
+            if override is not None:
+                schur_config[name] = override
+    elif any(
+        getattr(args, f"schur_{name}") is not None
+        for name in ("routing", "supervision", "target")
+    ):
+        raise ValueError(
+            "--schur_* options were given but the config has no enabled SchurDecoder block"
+        )
 
     if args.update_max_padded_dimension:
         if args.max_density_matrix_size is None:
@@ -194,7 +241,10 @@ if __name__ == "__main__":
     graph_feature_names = list(var_config["output_names"])
     graph_feature_dims = [padding_dim] * len(var_config["output_names"])
 
-    if args.update_max_padded_dimension:
+    # The Schur decoder builds the matrix itself and never calls the Base output head, so the
+    # head keeps the stub width set in the config. Widening it to T(N_pad) here would rebuild
+    # exactly the multi-billion-parameter head the decoder exists to replace.
+    if args.update_max_padded_dimension and not use_schur_decoder:
         var_config["output_dim"] = [padding_dim] * len(var_config["output_names"])
 
     if density_matrix_delta and args.preonly and args.artifacts_dir is None:
@@ -214,8 +264,11 @@ if __name__ == "__main__":
     # mask config
     mask_output_loss = var_config.get("mask_output_loss", None)
 
-    # ensure consistent padded matrix dimensions
-    assert all(output_dim == padding_dim for output_dim in var_config["output_dim"])
+    # ensure consistent padded matrix dimensions. The Schur decoder is exempt for the same
+    # reason it is exempt from the widening above: it never calls the Base output head, so its
+    # output_dim is a deliberate stub rather than the width of a padded target.
+    if not use_schur_decoder:
+        assert all(output_dim == padding_dim for output_dim in var_config["output_dim"])
 
     # reset batch size and epochs if specified
     if args.batch_size is not None:
@@ -324,7 +377,44 @@ if __name__ == "__main__":
             # pickle
             elif args.format == "pickle":
                 basedir = os.path.join(dataset_dir, "%s.pickle" % modelname)
-                attrs = {"pna_deg": deg}
+                # atom count maximum over all splits, for concat pooling padding
+                max_natoms = max(
+                    int(data_object.num_nodes)
+                    for split in (trainset, valset, testset)
+                    for data_object in split
+                )
+                # orbital metadata one-hot widths and species list for the Schur decoder, taken
+                # from the data rather than assumed. The widths are the label maxima plus one
+                # because the labels are 0-based.
+                all_objects = [
+                    data_object
+                    for split in (trainset, valset, testset)
+                    for data_object in split
+                ]
+                n_l = 1 + max(
+                    int(data_object.orbital_angular_momentum.max()) for data_object in all_objects
+                )
+                n_m = 1 + max(
+                    int(data_object.orbital_within_shell.max()) for data_object in all_objects
+                )
+                n_shell = 1 + max(
+                    int(data_object.orbital_shell.max()) for data_object in all_objects
+                )
+                species = sorted(
+                    {
+                        int(number)
+                        for data_object in all_objects
+                        for number in data_object.atomic_numbers.reshape(-1).tolist()
+                    }
+                )
+                attrs = {
+                    "pna_deg": deg,
+                    "max_natoms": max_natoms,
+                    "n_l": n_l,
+                    "n_m": n_m,
+                    "n_shell": n_shell,
+                    "species": species,
+                }
                 SimplePickleWriter(
                     trainset,
                     basedir,
@@ -356,6 +446,11 @@ if __name__ == "__main__":
     timer = Timer('load_data')
     timer.start()
 
+    # only the pickle path records the atom count maximum used by concat pooling
+    max_natoms = None
+    # orbital metadata widths and species list recorded by preprocessing, for the Schur decoder
+    orbital_metadata_attrs = {}
+
     # adios
     if args.format == "adios":
         assert AdiosDataset is not None, "ADIOS support not available"
@@ -386,12 +481,21 @@ if __name__ == "__main__":
             basedir=basedir, label="testset", var_config=var_config
         )
         pna_deg = trainset.pna_deg
+        # older pickle datasets predate max_natoms, so it may be absent
+        max_natoms = getattr(trainset, "max_natoms", None)
+        # likewise for the orbital metadata, which predates nothing older than the Schur decoder
+        orbital_metadata_attrs = {
+            name: getattr(trainset, name)
+            for name in ("n_l", "n_m", "n_shell", "species")
+            if getattr(trainset, name, None) is not None
+        }
         if args.ddstore:
             opt = {"ddstore_width": args.ddstore_width}
             trainset = DistDataset(trainset, "trainset", comm, **opt)
             valset = DistDataset(valset, "valset", comm, **opt)
             testset = DistDataset(testset, "testset", comm, **opt)
             trainset.pna_deg = pna_deg
+            trainset.max_natoms = max_natoms
     else:
         raise NotImplementedError("No supported format: %s" % (args.format))
 
@@ -413,6 +517,129 @@ if __name__ == "__main__":
         config, train_loader, val_loader, test_loader
     )
 
+    # Shrink the Base output head back to its stub for the Schur decoder. This has to happen
+    # AFTER update_config, not before: SimplePickleDataset.update_data_object runs
+    # update_predicted_values, which sets data.y_loc, and update_config_NN_outputs then derives
+    # output_dim from y_loc in preference to the config (config_utils.py:233-255). Left alone,
+    # the decoder would build the same T(N_pad)-wide head it exists to replace -- about 5e8
+    # frozen parameters that are never called. graph_feature_dims is deliberately NOT touched:
+    # update_predicted_values slices data.y with it, so narrowing it would truncate the target.
+    if use_schur_decoder:
+        stub_dim = config["NeuralNetwork"]["Variables_of_interest"]["output_dim"]
+        config["NeuralNetwork"]["Architecture"]["output_dim"] = list(stub_dim)
+        log(
+            f"[INFO] Schur decoder: Base output head pinned to output_dim={list(stub_dim)} "
+            f"instead of the padded target width {padding_dim}; the head is never called",
+            rank=0,
+        )
+
+    # ----------------------------------------------------------------------------------------------------
+    # resolve pooling widths before the config is saved and the model is built
+
+    architecture = config["NeuralNetwork"]["Architecture"]
+
+    # graph_pooling may be a bare string or a dict {"type", "pool_config"}
+    graph_pooling_cfg = architecture.get("graph_pooling", "mean")
+    if isinstance(graph_pooling_cfg, dict):
+        pool_type = graph_pooling_cfg.get("type", "mean").lower()
+        pool_config = dict(graph_pooling_cfg.get("pool_config", {}))
+    else:
+        pool_type = graph_pooling_cfg.lower()
+        pool_config = {}
+
+    # hierarchical poolers concatenate node embeddings and need max_nodes and a wide enough first head layer
+    legacy_reductions = {"mean", "add", "sum", "max"}
+    if pool_type not in legacy_reductions:
+
+        # max_nodes may be pinned in pool_config or top-level, else fall back to dataset metadata
+        max_nodes = pool_config.get("max_nodes", architecture.get("max_nodes", None))
+        if max_nodes is None:
+            if max_natoms is None:
+                raise ValueError(
+                    f"graph_pooling='{pool_type}' requires 'max_nodes' in the pooling "
+                    "'pool_config' or 'max_natoms' in the pickle metadata; re-run "
+                    "preprocessing to record max_natoms"
+                )
+            max_nodes = int(max_natoms)
+        max_nodes = int(max_nodes)
+
+        # write the resolved max_nodes back so the saved config fully reproduces the model.
+        # top-level max_nodes is what create.py threads to PAINN/EGNN
+        pool_config["max_nodes"] = max_nodes
+        architecture["max_nodes"] = max_nodes
+        architecture["graph_pooling"] = {"type": pool_type, "pool_config": pool_config}
+
+        # pooled width is exact once max_nodes is known; pooler kwargs exclude max_nodes
+        pooler_kwargs = {k: v for k, v in pool_config.items() if k != "max_nodes"}
+        pooled_dim = graph_pooled_dim(
+            pool_type, architecture["hidden_dim"], max_nodes, **pooler_kwargs
+        )
+        log(
+            f"[INFO] Pooling '{pool_type}': max_nodes={max_nodes}, "
+            f"hidden_dim={architecture['hidden_dim']}, pooled_dim={pooled_dim}",
+            rank=0,
+        )
+
+        # update_config has already normalized output_heads into the branch list form
+        for branch in architecture["output_heads"]["graph"]:
+            brancharct = branch["architecture"]
+            num_sharedlayers = brancharct["num_sharedlayers"]
+
+            # the layer consuming the pooled embedding is the trunk, or the head when there is none
+            if num_sharedlayers == 0:
+                target_key = "dim_headlayers"
+                configured = brancharct["dim_headlayers"][0]
+            else:
+                target_key = "dim_sharedlayers"
+                configured = brancharct["dim_sharedlayers"]
+
+            # widen that layer to the pooled width so it does not contract the concatenation
+            if configured < pooled_dim:
+                if num_sharedlayers == 0:
+                    brancharct["dim_headlayers"][0] = pooled_dim
+                else:
+                    brancharct["dim_sharedlayers"] = pooled_dim
+
+                logging.warning(
+                    f"Pooling '{pool_type}' override on branch '{branch['type']}': "
+                    f"{target_key} raised from {configured} to {pooled_dim} because the "
+                    f"configured width contracts the pooled embedding by a factor of "
+                    f"{pooled_dim / configured:.1f}. This layer now holds "
+                    f"{pooled_dim * pooled_dim:.3e} parameters."
+                )
+                if num_sharedlayers > 1:
+                    logging.warning(
+                        f"Branch '{branch['type']}' has num_sharedlayers={num_sharedlayers}; "
+                        f"each layer beyond the first adds a further "
+                        f"{pooled_dim} x {pooled_dim} linear layer."
+                    )
+
+    # ----------------------------------------------------------------------------------------------------
+    # sequential Schur decoder: fill the widths that must come from the dataset
+
+    if use_schur_decoder:
+        missing = [
+            name
+            for name in ("n_l", "n_m", "n_shell", "species")
+            if name not in orbital_metadata_attrs
+        ]
+        if missing:
+            raise ValueError(
+                f"The Schur decoder needs {missing} in the pickle metadata, which datasets "
+                "preprocessed before the orbital metadata was added do not carry. Re-run "
+                "preprocessing with --preonly to record them."
+            )
+
+        # written into the config so the saved config alone reproduces the identical model
+        schur_config.update(orbital_metadata_attrs)
+        log(
+            "[INFO] Schur decoder orbital metadata widths from the dataset (label maxima plus "
+            f"one, species sorted by atomic number): n_l={schur_config['n_l']}, "
+            f"n_m={schur_config['n_m']}, n_shell={schur_config['n_shell']}, "
+            f"species={schur_config['species']}",
+            rank=0,
+        )
+
     comm.Barrier()
 
     # LINE BELOW THROWS DIMENSION MISMATCH ERROR
@@ -432,14 +659,30 @@ if __name__ == "__main__":
         verbosity=verbosity,
     )
 
+    # attach the sequential Schur decoder, which replaces the dense output head with the
+    # bordering recursion of references/schur_decoder.tex
+    if use_schur_decoder:
+        # create_model_config sets the default dtype before returning, so the decoder's own
+        # modules are already built at run precision; matching the backbone explicitly makes
+        # that dependence visible instead of implicit
+        backbone_dtype = next(model.parameters()).dtype
+        backbone_device = next(model.parameters()).device
+        decoder_kwargs = {k: v for k, v in schur_config.items() if k != "enable"}
+        model = SchurDecoderModel(model, **decoder_kwargs).to(
+            device=backbone_device, dtype=backbone_dtype
+        )
+        log(f"[INFO] Schur decoder attached: routing={schur_config.get('routing')}, "
+            f"supervision={schur_config.get('supervision')}, "
+            f"target={schur_config.get('target')}", rank=0)
+
+    model, _ = hydragnn.utils.distributed.distributed_model_wrapper(
+        model, None, verbosity
+    )
+
     learning_rate = config["NeuralNetwork"]["Training"]["Optimizer"]["learning_rate"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, min_lr=0.00001
-    )
-
-    model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
     )
 
     # Print details of neural network architecture

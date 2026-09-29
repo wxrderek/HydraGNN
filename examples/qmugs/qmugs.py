@@ -262,7 +262,9 @@ class QMugsDataset(AbstractBaseDataset):
         density_matrix_delta = density_matrix - promolecular_matrix # (n_basis, n_basis)
         assert density_matrix_delta.shape == density_matrix.shape
 
-        return density_matrix_delta, promolecular_path
+        # the matrix itself is returned as well as its path: the sequential Schur decoder needs
+        # c_pro_k and d_pro_k at every step (Theorem 2.2), so it cannot wait for a file read
+        return density_matrix_delta, promolecular_path, promolecular_matrix
 
     # ----------------------------------------------------------------------------------------------------
     # dataset prep
@@ -305,8 +307,13 @@ class QMugsDataset(AbstractBaseDataset):
             raise ValueError(f'A loaded density matrix has size {D_tot.shape}, the output dimension is {self.__class__.max_padded_density_matrix_dimension}')
 
         # optionally replace the total density target by total density minus SAD baseline
+        promolecular_matrix = None
         if self.density_matrix_delta:
-            D_tot, promolecular_density_matrix_path = self._density_matrix_delta_target(
+            (
+                D_tot,
+                promolecular_density_matrix_path,
+                promolecular_matrix,
+            ) = self._density_matrix_delta_target(
                 psi4_wfn=psi4_wfn,
                 density_matrix=D_tot,
                 chembl_id=chembl_id,
@@ -346,6 +353,42 @@ class QMugsDataset(AbstractBaseDataset):
                 Db = torch.from_numpy(Db.copy()).to(torch.float32)
             else:
                 D_tot = torch.from_numpy(D_tot.copy()).to(torch.float32)
+
+        # ----------------------------------------------------------------------------------------------------
+        # atomic orbital metadata (inputs to the sequential Schur decoder)
+
+        # j(k) of Section 5.3 of references/schur_decoder.tex, plus the orbital labels the three
+        # decoder heads condition on. The field names deliberately avoid the substrings "index"
+        # and "batch": torch_geometric.data.Data.__inc__ offsets any attribute whose key contains
+        # "index" by num_nodes when batching, which would silently corrupt these.
+        from utils import orbital_metadata, upper_triangle_vector
+        (
+            orbital_to_atom,
+            orbital_angular_momentum,
+            orbital_within_shell,
+            orbital_shell,
+        ) = orbital_metadata(psi4_wfn)
+        assert orbital_to_atom.shape == (density_matrix_dim_int,)
+        orbital_to_atom = torch.from_numpy(orbital_to_atom).to(torch.int32) # (n_basis,)
+        orbital_angular_momentum = torch.from_numpy(orbital_angular_momentum).to(torch.int32)
+        orbital_within_shell = torch.from_numpy(orbital_within_shell).to(torch.int32)
+        orbital_shell = torch.from_numpy(orbital_shell).to(torch.int32)
+
+        # the promolecular baseline is stored as a padded upper-triangle vector, not only as a
+        # path, because Theorem 2.2 needs c_pro_k and d_pro_k at every step of the recursion
+        promolecular_upper_triangle = None
+        if promolecular_matrix is not None:
+            promolecular_pad = (
+                self.__class__.max_padded_density_matrix_dimension
+                if self.pad_density_matrix else density_matrix_dim_int
+            )
+            promolecular_upper_triangle = torch.from_numpy(
+                upper_triangle_vector(
+                    np.asarray(promolecular_matrix, dtype=np.float32),
+                    promolecular_pad,
+                    triu_indices=np.triu_indices(density_matrix_dim_int),
+                )
+            ).to(torch.float32) # (T(promolecular_pad),)
 
         # charge and multiplicity
         charge = torch.tensor(
@@ -485,6 +528,11 @@ class QMugsDataset(AbstractBaseDataset):
                 charge=charge,
                 multiplicity=multiplicity,
                 graph_attr=graph_attr,
+                # atomic orbital metadata, consumed by the sequential Schur decoder
+                orbital_to_atom=orbital_to_atom,
+                orbital_angular_momentum=orbital_angular_momentum,
+                orbital_within_shell=orbital_within_shell,
+                orbital_shell=orbital_shell,
             )
             # y_mask_loc records compact per-head mask offsets: (1, 3) for alpha and beta heads
             data_object.y_mask_loc = torch.tensor(
@@ -520,6 +568,11 @@ class QMugsDataset(AbstractBaseDataset):
                 charge=charge,
                 multiplicity=multiplicity,
                 graph_attr=graph_attr,
+                # atomic orbital metadata, consumed by the sequential Schur decoder
+                orbital_to_atom=orbital_to_atom,
+                orbital_angular_momentum=orbital_angular_momentum,
+                orbital_within_shell=orbital_within_shell,
+                orbital_shell=orbital_shell,
             )
 
             # y_mask_loc records the compact mask length for the single density-matrix head
@@ -532,6 +585,11 @@ class QMugsDataset(AbstractBaseDataset):
                 [[0, compact_mask_length]],
                 dtype=torch.int64,
             )
+
+        # only present when preprocessing with density_matrix_delta, which is the only setting
+        # in which the Schur decoder can be run against the delta target
+        if promolecular_upper_triangle is not None:
+            data_object.promolecular_upper_triangle = promolecular_upper_triangle
 
         # apply graph transforms
         data_object = self.radius_graph(data_object)
@@ -832,7 +890,17 @@ class QMugsDataset(AbstractBaseDataset):
 
             deg_hist = torch.zeros(0, dtype=torch.long)
 
+            # largest atom count seen locally
+            local_max_natoms = 0
             local_i = 0
+
+            # widths of the orbital metadata one-hots and the set of species present. These are
+            # derived from the data rather than assumed, so the Schur decoder heads are built to
+            # the dataset actually in use; see the Schur Decoder section of README.md.
+            local_max_angular_momentum = 0
+            local_max_within_shell = 0
+            local_max_shell = 0
+            local_species = set()
 
             # iterate over assigned molecules
             pbar = iterate_tqdm(
@@ -878,6 +946,23 @@ class QMugsDataset(AbstractBaseDataset):
                     if compute_pna_deg and label == "trainset":
                         deg_hist = _update_deg_hist(deg_hist, data_object)
 
+                    # track the atom count maximum over every split
+                    local_max_natoms = max(local_max_natoms, int(data_object.num_nodes))
+
+                    # track the orbital metadata ranges and the species over every split
+                    local_max_angular_momentum = max(
+                        local_max_angular_momentum,
+                        int(data_object.orbital_angular_momentum.max()),
+                    )
+                    local_max_within_shell = max(
+                        local_max_within_shell, int(data_object.orbital_within_shell.max())
+                    )
+                    local_max_shell = max(
+                        local_max_shell, int(data_object.orbital_shell.max())
+                    )
+                    local_species.update(
+                        int(number) for number in data_object.atomic_numbers.reshape(-1).tolist()
+                    )
                     local_i += 1
 
                     # periodic progress logging
@@ -891,13 +976,50 @@ class QMugsDataset(AbstractBaseDataset):
             log(f"[DONE] Rank {rank}: split={label}, wrote {local_i} local graphs")
             log(f"[DONE] Streaming split={label}", rank=0)
 
-            return deg_hist
-        
-        # stream each dataset split
-        local_deg_hist = _write_split("trainset", trainset_ids)
+            local_orbital_maxima = (
+                local_max_angular_momentum,
+                local_max_within_shell,
+                local_max_shell,
+            )
+            return deg_hist, local_max_natoms, local_orbital_maxima, local_species
 
-        _write_split("valset", valset_ids)
-        _write_split("testset", testset_ids)
+        # stream each dataset split
+        (
+            local_deg_hist,
+            train_max_natoms,
+            train_orbital_maxima,
+            train_species,
+        ) = _write_split("trainset", trainset_ids)
+
+        _, val_max_natoms, val_orbital_maxima, val_species = _write_split("valset", valset_ids)
+        _, test_max_natoms, test_orbital_maxima, test_species = _write_split("testset", testset_ids)
+
+        # reduce the atom count maximum over all splits and all MPI ranks
+        local_max_natoms = torch.tensor(
+            [max(train_max_natoms, val_max_natoms, test_max_natoms)],
+            dtype=torch.long,
+        )
+        dist.all_reduce(local_max_natoms, op=dist.ReduceOp.MAX)
+        max_natoms = int(local_max_natoms.item())
+
+        # reduce the orbital metadata ranges the same way. The one-hot widths are the maxima
+        # plus one, since the labels are 0-based.
+        local_orbital_maxima = torch.tensor(
+            [
+                max(values)
+                for values in zip(train_orbital_maxima, val_orbital_maxima, test_orbital_maxima)
+            ],
+            dtype=torch.long,
+        ) # (3,)
+        dist.all_reduce(local_orbital_maxima, op=dist.ReduceOp.MAX)
+        n_l = int(local_orbital_maxima[0].item()) + 1
+        n_m = int(local_orbital_maxima[1].item()) + 1
+        n_shell = int(local_orbital_maxima[2].item()) + 1
+
+        # union the species over all splits and all MPI ranks, sorted so the slot assignment is
+        # reproducible from the metadata alone
+        all_species = set().union(train_species, val_species, test_species)
+        species = sorted(set().union(*comm.allgather(all_species)))
 
         # reduce pna degree histogram across all MPI ranks
         local_max_deg = torch.tensor([local_deg_hist.numel()], dtype=torch.long)
@@ -921,6 +1043,12 @@ class QMugsDataset(AbstractBaseDataset):
                 attrs = pickle.load(f)
 
             attrs["pna_deg"] = pna_deg
+            attrs["max_natoms"] = max_natoms
+            # orbital metadata one-hot widths and species list for the Schur decoder
+            attrs["n_l"] = n_l
+            attrs["n_m"] = n_m
+            attrs["n_shell"] = n_shell
+            attrs["species"] = species
 
             with open(meta_path, "wb") as f:
                 pickle.dump(minmax_node_feature, f)
@@ -939,6 +1067,11 @@ class QMugsDataset(AbstractBaseDataset):
 
         return {
             "pna_deg": pna_deg,
+            "max_natoms": max_natoms,
+            "n_l": n_l,
+            "n_m": n_m,
+            "n_shell": n_shell,
+            "species": species,
             "train_num_conformers": train_global,
             "val_num_conformers": val_global,
             "test_num_conformers": test_global,

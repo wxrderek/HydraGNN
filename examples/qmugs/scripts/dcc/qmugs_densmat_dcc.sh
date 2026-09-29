@@ -3,9 +3,9 @@
 #SBATCH -J QMugs-Train
 #SBATCH -o train-job-%j.out
 #SBATCH -e train-job-%j.out
-#SBATCH -t 04:00:00
+#SBATCH -t 48:00:00
 #SBATCH -p youlab-gpu
-#SBATCH -N 1
+#SBATCH -N 2
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH -c 12
@@ -134,11 +134,19 @@ export HYDRAGNN_AGGR_BACKEND=mpi
 export HYDRAGNN_VALTEST=1
 
 export HYDRAGNN_TRACE_LEVEL=0
-export HYDRAGNN_MAX_NUM_BATCH=1000
+# HYDRAGNN_MAX_NUM_BATCH truncates every epoch to that many batches per rank
+# (train_validate_test.py:179). At 1000 it was almost exactly a full epoch for the old
+# QMugs01_max500_delta_uptr set: 63983 train / 8 ranks / batch 8 = 1000 batches. The
+# max800 set has 148636 train conformers, which is 2323 batches per rank on 8 ranks, so
+# leaving the cap at 1000 would silently train on 43% of the data and a different 43%
+# is not even guaranteed between epochs. Left unset so an epoch is a real epoch; set it
+# again only to deliberately bound epoch wall time.
+
+# export HYDRAGNN_MAX_NUM_BATCH=1000
 export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
-export BATCH_SIZE=16
-export NUM_EPOCH=5
+export BATCH_SIZE=32
+export NUM_EPOCH=100
 export MAX_DENSITY_MATRIX_SIZE=800
 export UPDATE_MAX_PADDED_DIMENSION=1
 
@@ -164,6 +172,28 @@ export HYDRAGNN_MASTER_PORT=$MASTER_PORT
 export HYDRAGNN_USE_FSDP=0
 export HYDRAGNN_FSDP_VERSION=2
 export HYDRAGNN_FSDP_STRATEGY=FULL_SHARD
+
+# NaN guard, read at hydragnn/train/train_validate_test.py:689-690. Both default to off, so
+# leaving them alone reproduces the unguarded runs exactly. Set them on the sbatch command
+# line, e.g.
+#
+#   HYDRAGNN_SKIP_NONFINITE_STEP=1 sbatch scripts/dcc/qmugs_schur_dcc.sh
+#
+# HYDRAGNN_SKIP_NONFINITE_STEP=1 takes the gradient norm before every optimizer step, and if
+# it is not finite it logs the epoch, batch, rank, grad_norm, loss and the batch's ChEMBL ids,
+# then skips the step instead of writing NaN into the weights. All ranks agree on the verdict
+# through an MPI allreduce, so no rank steps while another skips.
+#
+# HYDRAGNN_CLIP_GRAD_NORM=<x> additionally rescales the gradient to norm x. Leave it at 0
+# while measuring: clipping changes what the run learns, and the first question is only
+# whether grad_norm reads inf (a magnitude overflowed) or nan (a 0/0 in some backward).
+#
+# HYDRAGNN_GRAD_NORM_STRIDE=<n> logs the gradient norm every n batches even when it is finite.
+# A norm that creeps up over epochs means a slow blow-up; one that is flat and then jumps in a
+# single step means one bad batch. The loss shows neither.
+export HYDRAGNN_SKIP_NONFINITE_STEP=${HYDRAGNN_SKIP_NONFINITE_STEP:-0}
+export HYDRAGNN_CLIP_GRAD_NORM=${HYDRAGNN_CLIP_GRAD_NORM:-0}
+export HYDRAGNN_GRAD_NORM_STRIDE=${HYDRAGNN_GRAD_NORM_STRIDE:-0}
 
 TASK_PARALLEL_ARG=""
 if [ "$TASK_PARALLEL" = "1" ]; then
@@ -194,4 +224,4 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     --perc_load=0.01 \
     --perc_train=0.8 \
     "${SIZE_AWARE_ARGS[@]}" \
-    --modelname="QMugs0001_max800_delta_uptr"
+    --modelname="QMugs001_max800_delta_uptr_decodercmp"

@@ -6,6 +6,7 @@ from .model import (
     load_existing_model,
     load_existing_model_config,
     loss_function_selection,
+    output_constraint_selection,
     tensor_divide,
     EarlyStopping,
     print_model,

@@ -168,6 +168,18 @@ def setup_ddp(use_deepspeed=False):
 
     world_size, world_rank = init_comm_size_and_rank()
 
+    ## Bind this rank to its GPU before any CUDA context or process group exists.
+    ## FSDP2's default DeviceMesh derives its device from torch.cuda.current_device(),
+    ## which stays 0 on every rank unless set here; every rank would then move its
+    ## parameters onto GPU 0 and either run out of memory or deadlock in NCCL. DDP is
+    ## unaffected because it is passed device_ids explicitly. The device_count() > 1
+    ## guard leaves the srun "--gpus-per-task=1" layout (one visible GPU per rank)
+    ## untouched, matching the localrank logic in get_device_name below.
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        localrank = get_local_rank()
+        if localrank < torch.cuda.device_count():
+            torch.cuda.set_device(localrank)
+
     def _derive_master_port(default_port: int = 8889) -> str:
         user_port = os.getenv("HYDRAGNN_MASTER_PORT")
         if user_port is not None:
@@ -445,6 +457,15 @@ def get_distributed_model(
         )
 
         if use_fsdp:
+            ## Per-rank device report. FSDP places parameters on the rank's *current*
+            ## CUDA device, so these two must agree and must differ across ranks.
+            if torch.cuda.is_available():
+                _, world_rank = get_comm_size_and_rank()
+                print(
+                    f"FSDP rank {world_rank}: current_device=cuda:{torch.cuda.current_device()}",
+                    f"param_device={next(model.parameters()).device}",
+                )
+
             if fsdp_version == 1:
                 print_distributed(verbosity, "Using FSDP v1 wrapper")
                 model = FSDP(model, sharding_strategy=sharding_strategy)

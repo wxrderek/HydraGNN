@@ -11,7 +11,9 @@ installation_DOE_supercomputers/HydraGNN-Installation-Frontier*/
 .venv/
 .psi4-env/
 *.dat
+*.clean
 
 HydraGNN-Installation-Perlmutter/
 HydraGNN-Installation-Duke-Compute-Cluster/
 references/*_info/
+references/*_methods/

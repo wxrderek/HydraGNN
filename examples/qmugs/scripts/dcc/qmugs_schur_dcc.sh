@@ -4,7 +4,7 @@
 #SBATCH -o schur-train-job-%j.out
 #SBATCH -e schur-train-job-%j.out
 #SBATCH -t 48:00:00
-#SBATCH -p gpu-common
+#SBATCH -p youlab-gpu
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4

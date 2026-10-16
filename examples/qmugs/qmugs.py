@@ -49,6 +49,7 @@ from utils.inference_utils import (
     wavefunction_from_total_density_matrix,
     dipole_moment_from_density_matrix,
 )
+from utils import density_matrix_variables, DensityMatrixDataset
 
 try:
     import psi4
@@ -1138,6 +1139,23 @@ class QMugsInference:
             config = json.load(f)
         self.config = config
 
+        # named data schema applied to stored samples by DensityMatrixDataset. Configs saved
+        # before the schema existed lack it; their output_dim is the padded head width, since
+        # this inference path only supports the dense output head
+        if "Variables" in config:
+            self.variables = config["Variables"]
+        else:
+            var_config = config["NeuralNetwork"]["Variables_of_interest"]
+            self.variables = density_matrix_variables(
+                output_names=var_config["output_names"],
+                padding_dim=int(var_config["output_dim"][0]),
+            )
+            log(
+                "[INFO] config.json predates the named data schema; Variables rebuilt from "
+                f"Variables_of_interest: {self.variables['outputs']}",
+                rank=0,
+            )
+
 
     def _load_model(self):
         '''loads the specified pretrained model'''
@@ -1333,7 +1351,7 @@ class QMugsInference:
         # run inference
         all_pred = []
         all_true = []
-        loader = DataLoader(dataset, batch_size=1, shuffle=False)
+        loader = DataLoader(DensityMatrixDataset(dataset, self.variables), batch_size=1, shuffle=False)
         for batch in loader:
             batch = batch.to(self.device)
 
@@ -1484,9 +1502,9 @@ class QMugsInference:
             streaming_state = self._init_streaming_metric_state(criterions=criterions)
         per_matrix_metrics = []
 
-        # lazy dataloader
+        # lazy dataloader over model-ready samples
         loader = DataLoader(
-            dataset,
+            DensityMatrixDataset(dataset, self.variables),
             batch_size=batch_size,
             shuffle=False,
         )

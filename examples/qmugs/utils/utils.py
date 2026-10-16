@@ -7,8 +7,14 @@ import numpy as np
 import pandas as pd
 import scipy
 import matplotlib.pyplot as plt
+import torch
 from tqdm import tqdm
 from rdkit import Chem
+
+from hydragnn.utils.input_config_parsing.variable_schema import (
+    parse_variable_schema,
+    prepare_data_from_schema,
+)
 
 try:
     import psi4
@@ -32,6 +38,107 @@ SAD_REFERENCE_UNPAIRED_ELECTRONS = [
     1, 2, 3, 4, 5, 4, 3, 2, 1, 0, 1, 2, 3, 2, 1, 0,
 ]
 _PROMOLECULAR_ATOMIC_DENSITY_CACHE = {}
+
+# ----------------------------------------------------------------------------------------------------
+# named data schema (HydraGNN Variables section) for preprocessed QMugs samples
+
+def density_matrix_variables(output_names: list, padding_dim: int):
+    '''return the HydraGNN Variables section: atomic number and positions in, padded density matrix heads out'''
+    # padding_dim is N_pad**2 for full-matrix heads, or T(N_pad) for upper-triangle heads
+    return {
+        "graph_type": "homogeneous",
+        "inputs": [
+            {"name": "atomic_number", "level": "node", "dim": 1},
+            {"name": "pos", "level": "node", "dim": 3, "role": "position"},
+        ],
+        "outputs": [
+            {"name": name, "level": "graph", "dim": int(padding_dim)} for name in output_names
+        ],
+    }
+
+
+class DensityMatrixDataset(torch.utils.data.Dataset):
+    '''map stored QMugs samples to model-ready samples, reproducing the pre-schema HydraGNN load path
+
+    Pickles written by qmugs.py store x = [Z, x, y, z] and all padded targets back to back in y.
+    Before the named data schema, SimplePickleDataset applied update_atom_features and
+    update_predicted_values on every read; this wrapper applies the same transform, then
+    prepare_data_from_schema, so each returned sample carries the same x, y, y_loc and masks.
+    '''
+
+    def __init__(self, dataset, variables: dict):
+        self.dataset = dataset
+        self.schema = parse_variable_schema(variables)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        # clone so in-memory (preloaded or ddstore) samples are never mutated
+        data = self.dataset[index].clone()
+        outputs = self.schema.outputs
+        num_heads = len(outputs)
+        assert all(spec.level == "graph" for spec in outputs), "QMugs heads are graph-level"
+
+        # x is (num_atoms, 4) = [Z, x, y, z]; the model input is Z alone, as update_atom_features
+        # with input_node_features = [0] produced
+        assert data.x.dim() == 2 and data.x.shape[1] == 4, f"unexpected x shape {tuple(data.x.shape)}"
+        data.atomic_number = data.x[:, 0:1] # (num_atoms, 1)
+
+        # y is (N_pad, N_pad), (T(N_pad),) or (2 N_pad**2,); split into one (1, dim) tensor per head
+        y_flat = data.y.reshape(-1)
+        head_dims = [spec.dim for spec in outputs]
+        assert y_flat.numel() == sum(head_dims), (
+            f"target has {y_flat.numel()} entries but the heads expect {sum(head_dims)}"
+        )
+        head_start = 0
+        for spec in outputs:
+            setattr(data, spec.name, y_flat[head_start : head_start + spec.dim].reshape(1, -1))
+            head_start += spec.dim
+
+        # masks, as update_predicted_values handled them: each becomes (num_entries, 1), and its
+        # *_loc becomes (1, num_heads + 1) offsets, all zeros when the mask is absent. A compact
+        # mask has fewer entries than y and is sliced by its stored *_loc; a dense one by head_dims.
+        for mask_name in ("y_mask", "y_test_mask"):
+            raw_mask = getattr(data, mask_name, None)
+            raw_loc = getattr(data, mask_name + "_loc", None)
+            mask_loc = torch.zeros(1, num_heads + 1, dtype=torch.int64, device=data.x.device)
+            if raw_mask is not None:
+                raw_mask_flat = raw_mask.reshape(-1)
+                if raw_mask_flat.numel() != y_flat.numel():
+                    if raw_loc is None:
+                        if num_heads != 1:
+                            raise ValueError(f"compact {mask_name} requires {mask_name}_loc for multi-head outputs")
+                        raw_loc = torch.tensor([[0, raw_mask_flat.numel()]], dtype=torch.int64)
+                    raw_loc = raw_loc.to(dtype=torch.int64).reshape(1, -1)
+                    bounds = [(int(raw_loc[0, i]), int(raw_loc[0, i + 1])) for i in range(num_heads)]
+                else:
+                    offsets = np.cumsum([0] + head_dims)
+                    bounds = [(int(offsets[i]), int(offsets[i + 1])) for i in range(num_heads)]
+                pieces = [raw_mask_flat[low:high].reshape(-1, 1) for low, high in bounds]
+                for i, piece in enumerate(pieces):
+                    mask_loc[0, i + 1] = mask_loc[0, i] + piece.numel()
+                setattr(data, mask_name, torch.cat(pieces, 0)) # (num_entries, 1)
+            setattr(data, mask_name + "_loc", mask_loc)
+
+        # builds x = atomic_number (num_atoms, 1), y = (sum(head_dims), 1) and y_loc; it also
+        # deletes edge_attr, which no QMugs model reads while edge_dim is unset
+        # TODO: declare an edge-level input in density_matrix_variables if a config ever sets edge_dim
+        data = prepare_data_from_schema(data, self.schema)
+
+        # drop the copies prepare_data_from_schema leaves beside x and y, so each sample holds one
+        # copy of the padded target, as before
+        del data["atomic_number"]
+        del data["graph_output"]
+        for spec in outputs:
+            del data[spec.name]
+        return data
+
+    def __getattr__(self, name):
+        # delegate dataset metadata (pna_deg, max_natoms, ...) to the wrapped dataset
+        if name in {"dataset", "schema"}:
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
 
 # ----------------------------------------------------------------------------------------------------
 # density matrix processing

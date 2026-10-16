@@ -228,7 +228,9 @@ def sample_inference(pretrained_model, dataset, selected_records, artifacts_dir:
         if max_size * max_size != output_dim:
             raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    # stored samples -> model-ready samples, with the schema the inference wrapper resolved
+    from utils import DensityMatrixDataset
+    loader = DataLoader(DensityMatrixDataset(dataset, pretrained_model.variables), batch_size=1, shuffle=False)
 
     sample_results = []
     for i_sample, batch in enumerate(loader):

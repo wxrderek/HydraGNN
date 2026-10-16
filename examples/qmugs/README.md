@@ -127,6 +127,16 @@ Prefer running the installation script inside a `youlab-gpu` batch job rather th
 
 ## Learning Task Configs
 
+Since the upstream sync with ORNL/HydraGNN (named data schema, #527), HydraGNN itself no longer
+reads `Variables_of_interest`. This example still does: `output_names` selects the task variant,
+`output_dim` is the padded head width (or the Schur decoder's stub width), and `mask_output_loss`
+configures masking. `input_node_features`, `output_index`, `type` and `denormalize_output` are kept
+for the record but are no longer read. `qmugs_densmat_train.py` builds the top-level `Variables`
+section HydraGNN requires from `output_names` and N_pad (`utils.density_matrix_variables`), writes
+it into the saved config, and applies it to stored samples through `utils.DensityMatrixDataset`,
+which reproduces the old load-time transform (x = atomic number, y and y_loc per head, compact
+masks), so pickles preprocessed before the sync load unchanged.
+
 ### Learning total density (alpha + beta)
 For learning the total density matrix, set `config.json` as follows:
 ```

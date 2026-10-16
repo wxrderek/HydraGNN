@@ -57,6 +57,7 @@ except ImportError:
 from qmugs import (
     QMugsDataset,
 )
+from utils import density_matrix_variables, DensityMatrixDataset
 
 # ----------------------------------------------------------------------------------------------------
 transform_coordinates = Distance(norm=False, cat=False)
@@ -238,9 +239,6 @@ if __name__ == "__main__":
     else:
         padding_dim = int(N_pad ** 2)
 
-    graph_feature_names = list(var_config["output_names"])
-    graph_feature_dims = [padding_dim] * len(var_config["output_names"])
-
     # The Schur decoder builds the matrix itself and never calls the Base output head, so the
     # head keeps the stub width set in the config. Widening it to T(N_pad) here would rebuild
     # exactly the multi-billion-parameter head the decoder exists to replace.
@@ -252,14 +250,14 @@ if __name__ == "__main__":
     if density_matrix_delta and args.format != "pickle":
         raise NotImplementedError("delta density matrix learning is implemented only for pickle datasets")
     
-    node_feature_names = ['atomic_number', 'cartesian_coordinates']
-    node_feature_dims = [1, 3]
-    
-    # variables of interest configs
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+    # HydraGNN's named data schema: one graph-level head of width padding_dim per output name.
+    # Built here rather than in the JSON because padding_dim follows N_pad, which
+    # --update_max_padded_dimension can override; written to the config so the saved config
+    # records it. Variables_of_interest stays as the example's own task-variant settings.
+    config["Variables"] = density_matrix_variables(
+        output_names=var_config["output_names"],
+        padding_dim=padding_dim,
+    )
 
     # mask config
     mask_output_loss = var_config.get("mask_output_loss", None)
@@ -463,23 +461,17 @@ if __name__ == "__main__":
             "ddstore_width": args.ddstore_width,
         }
         fname = os.path.join(dataset_dir, "%s.bp" % modelname)
-        trainset = AdiosDataset(fname, "trainset", comm, **opt, var_config=var_config)
-        valset = AdiosDataset(fname, "valset", comm, **opt, var_config=var_config)
-        testset = AdiosDataset(fname, "testset", comm, **opt, var_config=var_config)
+        trainset = AdiosDataset(fname, "trainset", comm, **opt)
+        valset = AdiosDataset(fname, "valset", comm, **opt)
+        testset = AdiosDataset(fname, "testset", comm, **opt)
     
     # pickle
     elif args.format == "pickle":
         log("[START] Pickle data load", rank=0)
         basedir = os.path.join(dataset_dir, "%s.pickle" % modelname)
-        trainset = SimplePickleDataset(
-            basedir=basedir, label="trainset", var_config=var_config
-        )
-        valset = SimplePickleDataset(
-            basedir=basedir, label="valset", var_config=var_config
-        )
-        testset = SimplePickleDataset(
-            basedir=basedir, label="testset", var_config=var_config
-        )
+        trainset = SimplePickleDataset(basedir=basedir, label="trainset")
+        valset = SimplePickleDataset(basedir=basedir, label="valset")
+        testset = SimplePickleDataset(basedir=basedir, label="testset")
         pna_deg = trainset.pna_deg
         # older pickle datasets predate max_natoms, so it may be absent
         max_natoms = getattr(trainset, "max_natoms", None)
@@ -507,8 +499,13 @@ if __name__ == "__main__":
     if args.ddstore:
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
-    
-    # get data loaders
+
+    # stored samples -> model-ready samples (x = Z, y and y_loc per head, masks), see DensityMatrixDataset
+    trainset = DensityMatrixDataset(trainset, config["Variables"])
+    valset = DensityMatrixDataset(valset, config["Variables"])
+    testset = DensityMatrixDataset(testset, config["Variables"])
+
+    # get data loaders. variables= is not passed: DensityMatrixDataset has already applied the schema
     (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
@@ -518,12 +515,10 @@ if __name__ == "__main__":
     )
 
     # Shrink the Base output head back to its stub for the Schur decoder. This has to happen
-    # AFTER update_config, not before: SimplePickleDataset.update_data_object runs
-    # update_predicted_values, which sets data.y_loc, and update_config_NN_outputs then derives
-    # output_dim from y_loc in preference to the config (config_utils.py:233-255). Left alone,
-    # the decoder would build the same T(N_pad)-wide head it exists to replace -- about 5e8
-    # frozen parameters that are never called. graph_feature_dims is deliberately NOT touched:
-    # update_predicted_values slices data.y with it, so narrowing it would truncate the target.
+    # AFTER update_config, not before: update_config sets output_dim from the Variables output
+    # widths, which are padding_dim because the schema validates the stored target against
+    # them. Left alone, the decoder would build the same T(N_pad)-wide head it exists to
+    # replace -- about 5e8 frozen parameters that are never called.
     if use_schur_decoder:
         stub_dim = config["NeuralNetwork"]["Variables_of_interest"]["output_dim"]
         config["NeuralNetwork"]["Architecture"]["output_dim"] = list(stub_dim)
@@ -702,7 +697,7 @@ if __name__ == "__main__":
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         plot_init_solution=False,

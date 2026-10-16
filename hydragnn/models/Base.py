@@ -1350,6 +1350,8 @@ class Base(Module):
         # weights for different tasks as hyper-parameters
         tot_loss = 0
         tasks_loss = []
+        # set when any head takes the compact or dense mask path below
+        masked_loss_used = False
         for ihead in range(self.num_heads):
             head_pre = pred[ihead]
             pred_shape = head_pre.shape
@@ -1369,9 +1371,10 @@ class Base(Module):
                     self.loss_function_type != "GaussianNLLLoss"
                 ), "Expecting var for GaussianNLLLoss, but got None"
 
-                # mask
+                # mask. Without a mask or padding mask the compact path returns None, so it is only
+                # consulted when one is requested; unmasked calls keep upstream's input pattern
                 compact_loss = None
-                if self.head_type[ihead] == "graph":
+                if (mask is not None or use_padding_mask) and self.head_type[ihead] == "graph":
                     compact_loss = self._compact_or_padding_mask_loss(
                         head_pre=head_pre,
                         head_val=head_val,
@@ -1383,10 +1386,12 @@ class Base(Module):
                     )
 
                 if compact_loss is not None:
+                    masked_loss_used = True
                     tot_loss += compact_loss * self.loss_weights[ihead]
                     tasks_loss.append(compact_loss)
 
                 elif mask is not None:
+                    masked_loss_used = True
 
                     head_mask = mask[head_index[ihead]]
                     mask_shape = head_mask.shape
@@ -1427,9 +1432,22 @@ class Base(Module):
                 )
                 tasks_loss.append(self.loss_function(head_pre, head_val, head_var))
 
-        self.last_loss_components = supervised_loss_report(
-            self, pred, value, head_index, tasks_loss, var=var
-        )
+        if masked_loss_used:
+            # Head-level report only. supervised_loss_report would also evaluate the loss once per
+            # output column (N_pad**2 or T(N_pad) Python-level calls for a density-matrix head) and
+            # on unmasked, padded entries, which the masked loss above deliberately excludes.
+            self.last_loss_components = {
+                f"supervised.head_{ihead}": {
+                    "raw": head_loss.detach(),
+                    "weight": float(self.loss_weights[ihead]),
+                    "weighted": (float(self.loss_weights[ihead]) * head_loss).detach(),
+                }
+                for ihead, head_loss in enumerate(tasks_loss)
+            }
+        else:
+            self.last_loss_components = supervised_loss_report(
+                self, pred, value, head_index, tasks_loss, var=var
+            )
         return tot_loss, tasks_loss
 
     def __str__(self):

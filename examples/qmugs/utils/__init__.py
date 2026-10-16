@@ -16,6 +16,8 @@ from .utils import (
     physical_upper_triangle_indices,
     symmetric_matrix_from_upper_triangle_vector,
     orbital_metadata,
+    density_matrix_variables,
+    DensityMatrixDataset,
 )
 
 __all__ = [
@@ -36,4 +38,6 @@ __all__ = [
     'physical_upper_triangle_indices',
     'symmetric_matrix_from_upper_triangle_vector',
     'orbital_metadata',
+    'density_matrix_variables',
+    'DensityMatrixDataset',
 ]

@@ -1214,7 +1214,14 @@ class QMugsInference:
                 batch_index=batch_index,
             )
             if promolecular_path is not None and str(promolecular_path) != '':
-                return str(promolecular_path)
+                if os.path.isfile(str(promolecular_path)):
+                    return str(promolecular_path)
+                # stored path from another machine (e.g. a Perlmutter /pscratch path in a copied
+                # pickle): fall back to the artifacts_dir convention below, reported once
+                if not getattr(self, '_warned_promolecular_fallback', False):
+                    log(f"[WARNING] stored promolecular path not found ({promolecular_path}); "
+                        f"falling back to artifacts_dir={artifacts_dir}", rank=0)
+                    self._warned_promolecular_fallback = True
 
         if artifacts_dir is None:
             raise ValueError("artifacts_dir is required for density_matrix_delta inference")
@@ -2389,7 +2396,14 @@ class QMugsInference:
                 batch_index=batch_index,
             )
             if wfn_path is not None and str(wfn_path) != '':
-                return str(wfn_path)
+                if os.path.isfile(str(wfn_path)):
+                    return str(wfn_path)
+                # stored path from another machine: fall back to the QMugs directory convention
+                # below, reported once
+                if not getattr(self, '_warned_wfn_fallback', False):
+                    log(f"[WARNING] stored wfn_path not found ({wfn_path}); "
+                        f"falling back to qmugs_data_dir={qmugs_data_dir}", rank=0)
+                    self._warned_wfn_fallback = True
 
         # fall back to QMugs directory conventions for old datasets
         if qmugs_data_dir is None:

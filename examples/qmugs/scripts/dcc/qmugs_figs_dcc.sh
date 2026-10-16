@@ -145,6 +145,10 @@ export HYDRAGNN_CUSTOM_DATALOADER=1
 # before using this script. Perlmutter /pscratch/sd/w/wxrderek/artifacts maps to
 # /work/$USER/artifacts on DCC.
 
+# USE_ENV_ONLY=1 skips this block, so every value comes from the environment or the
+# defaults near the top of this script. Unset, the block applies exactly as before.
+if [ "${USE_ENV_ONLY:-0}" != "1" ]; then
+
 LOG_DIR=$HYDRAGNN_ROOT/logs/qmugs-inference-50469262-NN1-DCC
 ARTIFACTS_DIR=/work/$USER/artifacts/artifacts_model-QMugs0001_max800_delta_uptr_data-QMugs0001_max800_delta_uptr-DCC
 
@@ -165,6 +169,8 @@ FIGS_HIDE_LEGEND=0
 FIGS_MATRIX_POOL_SIZE=5
 FIGS_METRICS_NATOMS_BIN_SIZE=4
 FIGS_METRICS_MAX_NATOMS=100
+
+fi
 
 
 # ----------------------------------------------------------------------------------------------------

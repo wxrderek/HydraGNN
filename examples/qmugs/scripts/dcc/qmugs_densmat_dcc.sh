@@ -145,9 +145,9 @@ export HYDRAGNN_TRACE_LEVEL=0
 # export HYDRAGNN_MAX_NUM_BATCH=1000
 export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
-export BATCH_SIZE=32
-export NUM_EPOCH=100
-export MAX_DENSITY_MATRIX_SIZE=800
+export BATCH_SIZE=${BATCH_SIZE:-32}
+export NUM_EPOCH=${NUM_EPOCH:-100}
+export MAX_DENSITY_MATRIX_SIZE=${MAX_DENSITY_MATRIX_SIZE:-800}
 export UPDATE_MAX_PADDED_DIMENSION=1
 
 export HYDRAGNN_DDSTORE_METHOD=1
@@ -169,7 +169,7 @@ export HYDRAGNN_MASTER_ADDR=$MASTER_ADDR
 export HYDRAGNN_MASTER_PORT=$MASTER_PORT
 
 # FSDP knobs (for multi-dataset, set HYDRAGNN_USE_FSDP=0)
-export HYDRAGNN_USE_FSDP=0
+export HYDRAGNN_USE_FSDP=${HYDRAGNN_USE_FSDP:-0}
 export HYDRAGNN_FSDP_VERSION=2
 export HYDRAGNN_FSDP_STRATEGY=FULL_SHARD
 
@@ -217,11 +217,11 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     "$EXAMPLE_DIR/scripts/dcc/mpi_rank_env.sh" \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
     --log=qmugs-train-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-DCC-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION --everyone \
-    --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
+    --inputfile="${INPUTFILE:-$EXAMPLE_DIR/qmugs_densmat.json}" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \
     --pickle \
-    --perc_load=0.01 \
+    --perc_load=${PERC_LOAD:-0.01} \
     --perc_train=0.8 \
     "${SIZE_AWARE_ARGS[@]}" \
-    --modelname="QMugs001_max800_delta_uptr_decodercmp"
+    --modelname="${MODELNAME:-QMugs001_max800_delta_uptr_decodercmp}"

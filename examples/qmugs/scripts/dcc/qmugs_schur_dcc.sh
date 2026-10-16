@@ -267,7 +267,7 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     "$EXAMPLE_DIR/scripts/dcc/mpi_rank_env.sh" \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
     --log="$SCHUR_RUN_NAME" --everyone \
-    --inputfile="$EXAMPLE_DIR/qmugs_schur.json" \
+    --inputfile="${SCHUR_INPUTFILE:-$EXAMPLE_DIR/qmugs_schur.json}" \
     --batch_size=$SCHUR_BATCH_SIZE --num_epoch=$SCHUR_NUM_EPOCH \
     --precision=$SCHUR_PRECISION \
     --pickle \

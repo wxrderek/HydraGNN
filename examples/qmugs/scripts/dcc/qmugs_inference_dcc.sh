@@ -212,6 +212,10 @@ fi
 # training run before using this script; nothing else here depends on them.
 # Perlmutter /pscratch/sd/w/wxrderek/{qmugs,artifacts} map to /work/$USER/{qmugs,artifacts}.
 
+# USE_ENV_ONLY=1 skips this block, so every value comes from the environment or the
+# defaults near the top of this script. Unset, the block applies exactly as before.
+if [ "${USE_ENV_ONLY:-0}" != "1" ]; then
+
 MODEL_DIR=$HYDRAGNN_ROOT/logs/qmugs-train-50461062-NN1-DCC-FSDP0-V2
 CHECKPOINT_PATH=qmugs-train-50461062-NN1-DCC-FSDP0-V2_epoch_4.pk
 
@@ -242,6 +246,8 @@ FIGS_HIDE_LEGEND=1
 FIGS_MATRIX_POOL_SIZE=5
 FIGS_METRICS_NATOMS_BIN_SIZE=4
 FIGS_METRICS_MAX_NATOMS=100
+
+fi
 
 # ----------------------------------------------------------------------------------------------------
 

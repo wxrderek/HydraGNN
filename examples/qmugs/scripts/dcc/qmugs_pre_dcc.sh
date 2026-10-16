@@ -115,7 +115,7 @@ export TASK_PARALLEL=0
 export HYDRAGNN_TASK_PARALLEL_PROPORTIONAL_SPLIT=0
 export BATCH_SIZE=8
 export NUM_EPOCH=5
-export MAX_DENSITY_MATRIX_SIZE=800
+export MAX_DENSITY_MATRIX_SIZE=${MAX_DENSITY_MATRIX_SIZE:-800}
 export UPDATE_MAX_PADDED_DIMENSION=1
 
 export HYDRAGNN_DDSTORE_METHOD=1
@@ -186,7 +186,7 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     "$EXAMPLE_DIR/scripts/dcc/mpi_rank_env.sh" \
     python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
     --log=qmugs-pre-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-DCC-FSDP$HYDRAGNN_USE_FSDP-V$HYDRAGNN_FSDP_VERSION --everyone \
-    --inputfile="$EXAMPLE_DIR/qmugs_densmat.json" \
+    --inputfile="${INPUTFILE:-$EXAMPLE_DIR/qmugs_densmat.json}" \
     --artifacts_dir="$ARTIFACTS_DIR" \
     --batch_size=$BATCH_SIZE --num_epoch=$NUM_EPOCH \
     --precision=fp32 \

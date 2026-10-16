@@ -1,0 +1,129 @@
+{
+  "Verbosity": {
+    "level": 2
+  },
+  "NeuralNetwork": {
+    "Architecture": {
+      "mpnn_type": "PAINN",
+      "enable_interatomic_potential": false,
+      "equivariance": true,
+      "max_neighbours": 7,
+      "num_gaussians": 50,
+      "num_filters": 50,
+      "envelope_exponent": 5,
+      "int_emb_size": 64,
+      "basis_emb_size": 8,
+      "out_emb_size": 128,
+      "num_after_skip": 2,
+      "num_before_skip": 1,
+      "num_radial": 6,
+      "num_spherical": 7,
+      "radius": 7.0,
+      "hidden_dim": 400,
+      "num_conv_layers": 6,
+      "graph_pooling": {
+        "type": "sum",
+        "pool_config": {
+          "reduce_dim": null,
+          "fit_scope": "per_molecule"
+        }
+      },
+      "output_heads": {
+        "graph": {
+          "num_sharedlayers": 0,
+          "dim_sharedlayers": 32,
+          "num_headlayers": 1,
+          "dim_headlayers": [
+            32
+          ]
+        }
+      },
+      "task_weights": [
+        1.0
+      ]
+    },
+    "SchurDecoder": {
+      "enable": true,
+      "conditioning_type": "concat",
+      "use_sequence_position": true,
+      "condition_z_on_graph": false,
+      "orbital_dim": 64,
+      "orbital_hidden_dims": [
+        128
+      ],
+      "global_dim": 32,
+      "global_hidden_dims": [
+        64
+      ],
+      "z_hidden_dims": [
+        128,
+        128
+      ],
+      "alpha_hidden_dims": [
+        128,
+        128
+      ],
+      "d1_hidden_dims": [
+        64
+      ],
+      "num_radial_basis": 16,
+      "radial_cutoff": 10.0,
+      "f": "softplus",
+      "alpha_bias_init": -2.0,
+      "target": "delta",
+      "routing": "teacher_forcing",
+      "supervision": "joint",
+      "chunk_width": null,
+      "epochs_per_chunk": 1,
+      "w_schedule": "per_entry",
+      "step_normalization": "entry_count",
+      "z_regularization_weight": 0.0,
+      "delta_regularization_weight": 0.0,
+      "z_row_chunk": 128,
+      "checkpoint_z_head": true,
+      "max_basis_dim": 800,
+      "report_stride": 50
+    },
+    "Variables_of_interest": {
+      "input_node_features": [
+        0
+      ],
+      "output_index": [
+        0
+      ],
+      "output_dim": [
+        1
+      ],
+      "output_names": [
+        "density_matrix_delta_uptr"
+      ],
+      "type": [
+        "graph"
+      ],
+      "mask_output_loss": {
+        "mask": false,
+        "mask_method": "unif_atoms",
+        "mask_config": {
+          "perc_entries_masked": 0.2,
+          "perc_atom_pairs_masked": 0.2
+        }
+      },
+      "denormalize_output": false
+    },
+    "Training": {
+      "num_epoch": 5,
+      "EarlyStopping": true,
+      "patience": 20,
+      "Checkpoint": true,
+      "perc_train": 0.8,
+      "loss_function_type": "mae",
+      "batch_size": 8,
+      "continue": 0,
+      "startfrom": null,
+      "Optimizer": {
+        "type": "AdamW",
+        "learning_rate": 0.001
+      }
+    }
+  }
+}

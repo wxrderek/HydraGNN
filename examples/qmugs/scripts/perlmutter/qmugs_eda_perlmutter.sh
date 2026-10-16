@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A m4828
 #SBATCH -J QMugs-EDA
-#SBATCH -o eda-job-%j.out
-#SBATCH -e eda-job-%j.out
+#SBATCH -o slurm_output/eda/eda-job-%j.out
+#SBATCH -e slurm_output/eda/eda-job-%j.out
 #SBATCH -t 00:30:00
 #SBATCH -C cpu
 #SBATCH -q debug

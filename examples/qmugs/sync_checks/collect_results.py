@@ -27,6 +27,12 @@ args = parser.parse_args()
 
 EX, L, SC = args.example_dir, args.logs_dir, args.out_dir
 
+
+def log_path(*parts):
+    '''a logs/ path; sync-check runs other than T2 and T4 were later moved to logs/sync-checks/runs/'''
+    moved = os.path.join(L, "sync-checks", "runs", *parts)
+    return moved if os.path.exists(moved) else os.path.join(L, *parts)
+
 # ----------------------------------------------------------------------------------------------------
 # references (sync-checks.md; sources cited there)
 
@@ -91,7 +97,7 @@ def sacct(jobid):
 
 
 def out_file(jobid):
-    hits = glob.glob(os.path.join(EX, f"*-job-{jobid}.out"))
+    hits = glob.glob(os.path.join(EX, "slurm_output", "**", f"*-job-{jobid}.out"), recursive=True)
     return hits[0] if hits else None
 
 
@@ -163,7 +169,7 @@ for check in sorted(jobs):
             verdict = len(checks) == len(T2_BAND) and all(checks.values()) and not r["nan_in_losses"]
         elif check == "T3":
             run = r["run_name"]
-            ckpts = sorted(glob.glob(os.path.join(L, run, f"{run}_epoch_*.pk"))) if run else []
+            ckpts = sorted(glob.glob(os.path.join(log_path(run), f"{run}_epoch_*.pk"))) if run else []
             r["checkpoint_sizes"] = {os.path.basename(c): os.path.getsize(c) for c in ckpts}
             r["size_dev_bytes_vs_ddp"] = [s - DDP_DENSE_CKPT_BYTES for s in r["checkpoint_sizes"].values()]
             verdict = bool(ckpts) and all(abs(d) <= 1_000_000 for d in r["size_dev_bytes_vs_ddp"])
@@ -215,13 +221,13 @@ for check in sorted(jobs):
         verdict = "cuda available: True | device count: 4" in text and "2.8.0+cu128" in text
     elif check == "U2":
         new = [l for l in text.splitlines() if re.match(r"\[(PASS|FAIL)\]", l)]
-        ref = [l for l in read(os.path.join(EX, "schur-decoder-job-53631178.out")).splitlines() if re.match(r"\[(PASS|FAIL)\]", l)]
+        ref = [l for l in read(os.path.join(EX, "slurm_output", "schur_decoder_test", "schur-decoder-job-53631178.out")).splitlines() if re.match(r"\[(PASS|FAIL)\]", l)]
         r["n_pass"], r["n_fail"] = sum(l.startswith("[PASS]") for l in new), sum(l.startswith("[FAIL]") for l in new)
         r["differing_lines"] = [a for a, b in zip(new, ref) if a != b]
         verdict = r["n_pass"] == 33 and r["n_fail"] == 0 and new == ref
     elif check == "U3":
-        a = load_json(os.path.join(L, "qmugs-schur-diagnostics", "schur_decomp_summary.json"))
-        b = load_json(os.path.join(L, "qmugs-schur-diagnostics-synccheck", "schur_decomp_summary.json"))
+        a = load_json(log_path("qmugs-schur-diagnostics", "schur_decomp_summary.json"))
+        b = load_json(log_path("qmugs-schur-diagnostics-synccheck", "schur_decomp_summary.json"))
         if a and b:
             def flat(d, p=""):
                 for k, v in d.items():
@@ -272,7 +278,7 @@ for check in sorted(jobs):
             r["exact_ok"], r["physics_ok"], r["dipole_ok"] = exact, physics, dipole
             verdict = exact and physics and dipole
     elif check.startswith("I"):
-        log_dir = os.path.join(L, f"qmugs-inference-{jobid}-NN1-DCC")
+        log_dir = log_path(f"qmugs-inference-{jobid}-NN1-DCC")
         g = load_json(os.path.join(log_dir, "global_evaluation_metrics.json"))
         r["log_dir"] = log_dir
         r["global_metrics"] = {k: v for k, v in g.items()} if g else None
@@ -288,7 +294,7 @@ for check in sorted(jobs):
                 r["rel_dev_vs_E1_test"] = rel(padded_mse, 2.4862e-4)
                 verdict = verdict and abs(r["rel_dev_vs_E1_test"]) <= 0.01
     elif check == "F1":
-        log_dir = os.path.join(L, f"qmugs-inference-{jobs['I2'][-1]}-NN1-DCC") if "I2" in jobs else None
+        log_dir = log_path(f"qmugs-inference-{jobs['I2'][-1]}-NN1-DCC") if "I2" in jobs else None
         figs = glob.glob(os.path.join(log_dir, "figs", "**", "*.png"), recursive=True) if log_dir else []
         r["n_png"] = len(figs)
         verdict = r["state"] == "COMPLETED" and len(figs) > 0 and "Traceback" not in text

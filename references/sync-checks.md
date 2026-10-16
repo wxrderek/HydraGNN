@@ -4,6 +4,8 @@ Compiled 2026-10-16, against `derek/learn-density` @ `1bc53cf` plus the script a
 
 Status context, with the run numbers and file paths cited below, is in `references/sync-updates.md`. Initial data download is out of scope.
 
+> **Locations after the 2026-10-16 reorganization.** SLURM job outputs that this document names by bare file name (`<type>-job-<id>.out`) now live in `examples/qmugs/slurm_output/<type>/` (pre-campaign jobs) or `examples/qmugs/slurm_output/sync_checks/` (jobs ≥ 58774741). Run directories: the sync-check runs other than T2 (58774955) and T4 (58774758) are in `logs/sync-checks/runs/`; stale pre-sync runs are in `logs/archive/<group>/`. See `examples/qmugs/slurm_output/README.md`.
+
 ---
 
 ## 0. Conventions

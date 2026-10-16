@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A m5216
 #SBATCH -J QMugs-Train
-#SBATCH -o train-debug-job-%j.out
-#SBATCH -e train-debug-job-%j.out
+#SBATCH -o slurm_output/train/train-debug-job-%j.out
+#SBATCH -e slurm_output/train/train-debug-job-%j.out
 #SBATCH -t 00:20:00
 #SBATCH -C gpu
 #SBATCH -q debug

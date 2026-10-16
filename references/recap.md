@@ -1,6 +1,6 @@
 # QMugs density matrix learning — recap of runs to date
 
-Compiled 2026-08-27 from `logs/`, `examples/qmugs/*-job-*.out`, `/work/xw262/qmugs`,
+Compiled 2026-08-27 from `logs/`, `examples/qmugs/*-job-*.out` (since moved to `examples/qmugs/slurm_output/<type>/`; stale runs in `logs/` moved to `logs/archive/`), `/work/xw262/qmugs`,
 `/work/xw262/artifacts`, and the saved per-run `config.json` files. Schur-decoder work is
 excluded. Nothing in this document was produced by re-running anything; every number is read
 off an existing log, config, or file size.

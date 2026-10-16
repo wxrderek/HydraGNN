@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A m5216
 #SBATCH -J QMugs-Figs
-#SBATCH -o figs-job-%j.out
-#SBATCH -e figs-job-%j.out
+#SBATCH -o slurm_output/figs/figs-job-%j.out
+#SBATCH -e slurm_output/figs/figs-job-%j.out
 #SBATCH -t 00:20:00
 #SBATCH -C cpu
 #SBATCH -q debug

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Train
-#SBATCH -o train-job-%j.out
-#SBATCH -e train-job-%j.out
+#SBATCH -o slurm_output/train/train-job-%j.out
+#SBATCH -e slurm_output/train/train-job-%j.out
 #SBATCH -t 48:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 2

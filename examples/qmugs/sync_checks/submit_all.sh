@@ -165,11 +165,11 @@ submit E1b "$(dep afterany:T3)" -- $GPU1 $EXCL -t 01:30:00 sync_checks/sync_pyth
 
 # U1 and U5: test.sh has no header; header of qmugs_schur_decoder_test_dcc.sh plus GPUs
 submit U1 "$(dep afterany:E1b)" -- -A youlab -p youlab-gpu -N 1 --ntasks-per-node=1 -c 8 --mem=32G \
-    --gres=gpu:4 $EXCL -t 00:20:00 -J QMugs-SyncU1 -o sync-U1-job-%j.out -e sync-U1-job-%j.out \
+    --gres=gpu:4 $EXCL -t 00:20:00 -J QMugs-SyncU1 -o slurm_output/sync_checks/sync-U1-job-%j.out -e slurm_output/sync_checks/sync-U1-job-%j.out \
     --wrap "cd $R && bash examples/qmugs/scripts/dcc/test.sh"
 
 submit U5 "$(dep afterany:U1)" -- -A youlab -p youlab-gpu -N 1 --ntasks-per-node=1 -c 8 --mem=32G \
-    --gres=gpu:1 $EXCL -t 00:30:00 -J QMugs-SyncU5 -o sync-U5-job-%j.out -e sync-U5-job-%j.out \
+    --gres=gpu:1 $EXCL -t 00:30:00 -J QMugs-SyncU5 -o slurm_output/sync_checks/sync-U5-job-%j.out -e slurm_output/sync_checks/sync-U5-job-%j.out \
     --wrap "cd $R && source installation_other/module_loads_dcc.sh && load_dcc_modules 12.8 && git log --oneline -1 && PYTHONPATH=$R $V/bin/python -m pytest -q -p no:cacheprovider tests/test_named_variable_schema.py tests/test_loss_reporting.py tests/test_config.py tests/test_create_model.py tests/test_example_training_loss_schema.py -m 'not mpi and not deepspeed and not network and not fairchem'"
 
 T3_RUN=qmugs-train-$(jid T3)-NN1-DCC-FSDP1-V2

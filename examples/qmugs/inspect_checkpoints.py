@@ -19,7 +19,7 @@ Read only: it opens the checkpoints and prints statistics, and writes nothing.
 
 Example:
   python inspect_checkpoints.py \
-      logs/qmugs-schur-train-53692784-NN1-DCC-teacher_forcing-joint-total/qmugs-schur-train-53692784-NN1-DCC-teacher_forcing-joint-total_epoch_24.pk \
+      logs/archive/schur_dcc/qmugs-schur-train-53692784-NN1-DCC-teacher_forcing-joint-total/qmugs-schur-train-53692784-NN1-DCC-teacher_forcing-joint-total_epoch_24.pk \
       logs/qmugs-schur-train-53692804-NN1-DCC-teacher_forcing-joint-total/qmugs-schur-train-53692804-NN1-DCC-teacher_forcing-joint-total_epoch_48.pk
 '''
 

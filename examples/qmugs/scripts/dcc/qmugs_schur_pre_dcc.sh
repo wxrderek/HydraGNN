@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-SchurDataLoad
-#SBATCH -o schur-dataload-job-%j.out
-#SBATCH -e schur-dataload-job-%j.out
+#SBATCH -o slurm_output/dataload/schur-dataload-job-%j.out
+#SBATCH -e slurm_output/dataload/schur-dataload-job-%j.out
 #SBATCH -t 24:00:00
 #SBATCH -p youlab-gpu
 #SBATCH --nodes=1

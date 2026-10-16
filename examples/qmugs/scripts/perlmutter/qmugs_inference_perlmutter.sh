@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A m5216
 #SBATCH -J QMugs-Inference
-#SBATCH -o inference-job-%j.out
-#SBATCH -e inference-job-%j.out
+#SBATCH -o slurm_output/inference/inference-job-%j.out
+#SBATCH -e slurm_output/inference/inference-job-%j.out
 #SBATCH -t 00:30:00
 #SBATCH -C gpu
 #SBATCH -q debug

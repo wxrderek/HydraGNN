@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Schur
-#SBATCH -o schur-job-%j.out
-#SBATCH -e schur-job-%j.out
+#SBATCH -o slurm_output/schur_decomp/schur-job-%j.out
+#SBATCH -e slurm_output/schur_decomp/schur-job-%j.out
 #SBATCH -t 04:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 1

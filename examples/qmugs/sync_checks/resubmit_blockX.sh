@@ -2,7 +2,7 @@
 # Resubmission of block X (the two-node checks) after the first attempt failed at launch on
 # dcc-youlab-gpu-ferc-s-aa25-21 (2026-10-16, jobs 58774741-58774744: "mpirun was unable to
 # launch ... mpi_rank_env.sh ... Node: dcc-youlab-gpu-ferc-s-aa25-21"). Isolated by test jobs
-# 58774934/58774935/58774936/58774937: as a remote mpirun node, aa25-21 either fails to start
+# 58774934/58774935/58774938/58774939: as a remote mpirun node, aa25-21 either fails to start
 # its ranks or they silently run on the other node; other node pairs place ranks correctly. Every
 # two-node job therefore also excludes aa25-21, the same kind of exclusion the DCC scripts keep
 # for aa25-19.

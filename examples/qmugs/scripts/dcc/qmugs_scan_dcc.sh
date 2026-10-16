@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Scan
-#SBATCH -o scan-job-%j.out
-#SBATCH -e scan-job-%j.out
+#SBATCH -o slurm_output/scan/scan-job-%j.out
+#SBATCH -e slurm_output/scan/scan-job-%j.out
 #SBATCH -t 12:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 1

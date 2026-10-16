@@ -1,6 +1,6 @@
 # QMugs 1-RDM learning: project status after the October 2026 restore and upstream sync
 
-Compiled 2026-10-16. **This is a status document only:** it records what exists, what has been run and what is known, and it makes no recommendations. Every number is read from a file that exists now: run logs under `logs/`, SLURM outputs `examples/qmugs/*-job-<id>.out`, saved `config.json` files, the pickles under `/work/xw262/qmugs`, or git. Each number cites its source.
+Compiled 2026-10-16. **This is a status document only:** it records what exists, what has been run and what is known, and it makes no recommendations. Every number is read from a file that exists now: run logs under `logs/`, SLURM outputs `examples/qmugs/*-job-<id>.out` (since moved to `examples/qmugs/slurm_output/<type>/`), saved `config.json` files, the pickles under `/work/xw262/qmugs`, or git. Each number cites its source.
 
 Two earlier documents are folded in rather than repeated:
 - `references/recap.md` (2026-08-27) covers dense-head runs up to job 51083128 and the Perlmutter inference runs.
@@ -200,7 +200,7 @@ All inference so far ran on Perlmutter, on non-FSDP checkpoints (`recap.md` §6)
 - 55245318 (raw, `N_pad` 2002): per-matrix R² 0.457, relative Frobenius error 0.730.
 - 55833314 (raw, `N_pad` 800): R² 0.533, relative Frobenius error 0.677.
 
-The 55914623 inference (job 55939913, `logs/qmugs-inference-55935478-NN1-WRONG-DATA-DIR`) evaluated a delta model on the raw-density pickle and is invalid. Across the valid runs:
+The 55914623 inference (job 55939913, `logs/qmugs-inference-55935478-NN1-WRONG-DATA-DIR`, since moved to `logs/archive/perlmutter/`) evaluated a delta model on the raw-density pickle and is invalid. Across the valid runs:
 - Predicted matrices are not symmetric and not PSD (43–146 negative eigenvalues per matrix).
 - Dipole cosine similarity is negative, with dipole errors of 131–214 a.u.
 

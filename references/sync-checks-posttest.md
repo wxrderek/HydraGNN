@@ -16,8 +16,8 @@ Results of the checks specified in `references/sync-checks.md`, run on DCC on 20
   - `logs/sync-checks/jobs.tsv`: check id → SLURM id → exact submission command; a later row for the same check supersedes an earlier one;
   - `logs/sync-checks/results.json` / `results_table.md`: the collector's mechanical verdicts;
   - helper JSONs in `logs/sync-checks/`;
-  - job outputs in `examples/qmugs/*-job-<id>.out`;
-  - run directories in `logs/<run>/`.
+  - job outputs in `examples/qmugs/slurm_output/sync_checks/*-job-<id>.out` (pre-campaign references such as 53709019 in `examples/qmugs/slurm_output/<type>/`);
+  - run directories in `logs/sync-checks/runs/<run>/`, except T2 (`logs/qmugs-train-58774955-NN2-DCC-FSDP0-V2`) and T4 (`logs/qmugs-schur-train-58774758-NN1-DCC-teacher_forcing-joint-total`), which stay at top level as the reference models trained on the merged code.
 - **Verdicts:**
   - **PASS:** the criterion of `sync-checks.md` holds.
   - **EXPLAINED:** the criterion fails, but the cause is identified with evidence and is not a defect introduced by the sync. Usually the criterion itself was set wrongly a priori; this is stated each time.
@@ -87,7 +87,7 @@ Results of the checks specified in `references/sync-checks.md`, run on DCC on 20
   That is 1 float64 ulp on a value of 4.379542345766e9. The check's own criterion, < 1e-12 (`schur_decoder_test.py:219`), passes.
 - **Investigation.**
   - U2_repeat 58780304 (merged tree, aa25-7) gives 2.178e-16 again, so the difference is deterministic.
-  - U2_premerge 58780335 runs the pre-merge tree (it imports `/work/xw262/HydraGNN-premerge/hydragnn`; output `logs/sync-checks/U2_premerge-58780335.out`). It **also gives 2.178e-16**, and its other 32 lines are identical.
+  - U2_premerge 58780335 runs the pre-merge tree (it imports `/work/xw262/HydraGNN-premerge/hydragnn`; output `examples/qmugs/slurm_output/sync_checks/U2_premerge-58780335.out`). It **also gives 2.178e-16**, and its other 32 lines are identical.
   - Hence the merge is not the cause. The decoder code is unchanged by the sync, and torch has been installed unchanged since 2026-07-21 on the same node.
   - Two changes happened after 2026-08-28, and these runs cannot separate them:
     - the node OS went from el9_7 to el9_8 (glibc-2.34-274 on 2026-08-31, kernel 5.14.0-687 on 2026-09-01);
@@ -299,7 +299,7 @@ All of these runs use `sync_checks/eval_checkpoint.py`. It runs hydragnn's `vali
     - On every conformer the predicted density integrates to 16.8–20.7 electrons **fewer** than the true density on the same cube grid (`electron_density_predicted_integral − electron_density_true_integral`).
     - A net charge of ~20 e makes the predicted dipole depend on the origin. The dipole error grows with the deficit: 4.2 au at −16.8 e, 47–59 au at −20.4 to −20.7 e.
     - That accounts for the size of the error. The model, trained for 15 epochs on an unconstrained head, does not conserve the electron count.
-  - Per-conformer records are in `logs/qmugs-inference-58774961-NN1-DCC/per_matrix_metrics.json`, and the cube files are under `/work/xw262/artifacts/synccheck-inference-I2/cubeprops`.
+  - Per-conformer records are in `logs/sync-checks/runs/qmugs-inference-58774961-NN1-DCC/per_matrix_metrics.json`, and the cube files are under `/work/xw262/artifacts/synccheck-inference-I2/cubeprops`.
   - **Timing:** `inference_time` 266.5 s on 4 ranks, i.e. ≈ 14.8 s wall and ≈ 59 GPU-s per conformer, inside Perlmutter's 46–300 GPU-s.
 - **True dipoles: PASS, on a substitute check.**
   - The criterion "equal to P4's pipeline dipoles for shared conformers" turned out to be vacuous: none of the 18 is in any P4 sample.
@@ -340,7 +340,7 @@ All of these runs use `sync_checks/eval_checkpoint.py`. It runs hydragnn's `vali
 - The run was 58796970 (aa25-17, 2:24, exit 0:0).
 - Partition: `qmugs_figs_dcc.sh` requests the single-node `youlab` CPU partition. Another user's 7-day job (58718624) held that node, so by user decision F1 was submitted with `-p youlab-gpu --exclude=dcc-youlab-gpu-ferc-s-aa25-19`, keeping the script's 1 task, 32 cores, 128G and 20 min. The second attempt, 58795783, was cancelled while pending.
 - There is no exception in the log.
-- Written under `logs/qmugs-inference-58774961-NN1-DCC/figs/`:
+- Written under `logs/sync-checks/runs/qmugs-inference-58774961-NN1-DCC/figs/`:
   - 31 metric-vs-`natoms` plots (png + pdf), covering matrix, electron-density and dipole metrics;
   - for the 2 sampled conformers (CHEMBL3747039 conf_02, CHEMBL3957223 conf_02): true, predicted, difference and |difference| density matrices; molecule, true, predicted and difference electron-density isosurfaces; dipole and normalized-dipole plots.
 - The sample rerun of inference (1 rank) completed.
@@ -383,8 +383,9 @@ None of these was introduced by the sync, and none was fixed.
   - Isolated by test jobs:
     - 58774920: direct execution on 21 works;
     - 58774934: single-node `mpirun` on 21 works;
-    - 58774935 / 58774937: 2-node `mpirun` with 21; both ranks report aa25-20, so the remote rank never runs on 21;
-    - 58774936: the aa25-7/8 pair places ranks correctly.
+    - 58774935 / 58774939: 2-node `mpirun` on aa25-[20-21]; both ranks report aa25-20, so the remote rank never runs on 21;
+    - 58774938: the aa25-7/8 pair places ranks correctly (one rank on each node).
+    - Logs: `examples/qmugs/slurm_output/sync_checks/{nodetest-aa25-21-58774920,mpitest-single21-58774934,mpitest-pair21-58774935,mpitest-pairother-58774938,mpitest-pair21b-58774939}.out`.
   - Block X was resubmitted once by `sync_checks/resubmit_blockX.sh`, excluding aa25-19 and aa25-21 and gated on the end of both lanes. Those are the job ids in this report.
   - Single-node jobs on aa25-21 (I4, P4_raw_uptr, P1_compare_ignore_natoms) are unaffected.
 - **F1** was resubmitted after its dependency cancelled it. That attempt stayed pending on the occupied `youlab` node, and it was run on youlab-gpu by user decision (§7).
@@ -403,7 +404,7 @@ None of these was introduced by the sync, and none was fixed.
 
 All data is kept, by user decision.
 
-- **Run directories:** `logs/qmugs-train-{58774751,58774752,58774955,58774960,58774763,58774764}-*`, `logs/qmugs-schur-train-{58774758,58774759}-*`, `logs/qmugs-inference-{58774756,58774757,58774766,58774961}-NN1-DCC`, `logs/qmugs-schur-diagnostics-synccheck/`.
+- **Run directories:** T2 `logs/qmugs-train-58774955-NN2-DCC-FSDP0-V2` and T4 `logs/qmugs-schur-train-58774758-NN1-DCC-teacher_forcing-joint-total` at top level; all others in `logs/sync-checks/runs/`: `qmugs-train-{58774751,58774752,58774960,58774763,58774764}-*`, `qmugs-schur-train-58774759-*`, `qmugs-inference-{58774756,58774757,58774766,58774961}-NN1-DCC`, `qmugs-pre-{58774746,58774747,58774748}-*`, `qmugs-schur-diagnostics-synccheck/`.
 - **Datasets regenerated by P1–P3:** under `/work/xw262/qmugs/`, as named in `jobs.tsv`.
 - **Inference artifacts:** `/work/xw262/artifacts/synccheck-inference-I2`.
-- **Helper outputs:** `logs/sync-checks/*.json`, `U2_premerge-58780335.out`.
+- **Helper outputs:** `logs/sync-checks/*.json`; the job outputs, including `U2_premerge-58780335.out` and the aa25-21 node tests, in `examples/qmugs/slurm_output/sync_checks/`.

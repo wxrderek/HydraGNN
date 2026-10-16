@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Ckpt
-#SBATCH -o inspect-ckpt-job-%j.out
-#SBATCH -e inspect-ckpt-job-%j.out
+#SBATCH -o slurm_output/inspect_ckpt/inspect-ckpt-job-%j.out
+#SBATCH -e slurm_output/inspect_ckpt/inspect-ckpt-job-%j.out
 #SBATCH -t 01:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 1

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Figs
-#SBATCH -o figs-job-%j.out
-#SBATCH -e figs-job-%j.out
+#SBATCH -o slurm_output/figs/figs-job-%j.out
+#SBATCH -e slurm_output/figs/figs-job-%j.out
 #SBATCH -t 00:20:00
 #SBATCH -p youlab
 #SBATCH -N 1

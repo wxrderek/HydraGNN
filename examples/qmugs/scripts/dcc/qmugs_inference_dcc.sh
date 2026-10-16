@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-Inference
-#SBATCH -o inference-job-%j.out
-#SBATCH -e inference-job-%j.out
+#SBATCH -o slurm_output/inference/inference-job-%j.out
+#SBATCH -e slurm_output/inference/inference-job-%j.out
 #SBATCH -t 04:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 4

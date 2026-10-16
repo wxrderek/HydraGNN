@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A youlab
 #SBATCH -J QMugs-SyncCheck
-#SBATCH -o sync-check-job-%j.out
-#SBATCH -e sync-check-job-%j.out
+#SBATCH -o slurm_output/sync_checks/sync-check-job-%j.out
+#SBATCH -e slurm_output/sync_checks/sync-check-job-%j.out
 #SBATCH -t 04:00:00
 #SBATCH -p youlab-gpu
 #SBATCH -N 1

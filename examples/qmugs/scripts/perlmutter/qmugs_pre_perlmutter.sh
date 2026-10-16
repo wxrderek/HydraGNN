@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -A m4828
 #SBATCH -J QMugs-DataLoad
-#SBATCH -o dataload-job-%j.out
-#SBATCH -e dataload-job-%j.out
+#SBATCH -o slurm_output/dataload/dataload-job-%j.out
+#SBATCH -e slurm_output/dataload/dataload-job-%j.out
 #SBATCH -t 04:00:00
 #SBATCH -C cpu
 #SBATCH -q regular

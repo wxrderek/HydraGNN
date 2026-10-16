@@ -33,6 +33,12 @@ parser.add_argument(
 parser.add_argument("--reference_artifacts", default=None, help="existing artifacts dir")
 parser.add_argument("--candidate_artifacts", default=None, help="regenerated artifacts dir")
 parser.add_argument("--stride", type=int, default=1, help="compare every stride-th sample")
+parser.add_argument(
+    "--ignore_keys",
+    nargs="*",
+    default=[],
+    help="sample attributes excluded from the comparison (reported, e.g. natoms: qmugs.py stores an uninitialized torch.IntTensor(n))",
+)
 parser.add_argument("--out", required=True, help="JSON summary")
 args = parser.parse_args()
 
@@ -69,7 +75,7 @@ def _substitute(value):
     return value
 
 
-summary = {"splits": {}, "artifacts": None}
+summary = {"splits": {}, "artifacts": None, "ignored_keys": list(args.ignore_keys)}
 n_mismatch_total = 0
 for label in ("trainset", "valset", "testset"):
     ref = SimplePickleDataset(basedir=args.reference, label=label)
@@ -94,7 +100,7 @@ for label in ("trainset", "valset", "testset"):
             split["n_sample_mismatch"] += 1
             if len(split["sample_mismatch"]) < 200:
                 split["sample_mismatch"].append({"index": k, "keys_only_reference": sorted(keys_a - keys_b), "keys_only_candidate": sorted(keys_b - keys_a)})
-        for key in sorted(keys_a & keys_b):
+        for key in sorted((keys_a & keys_b) - set(args.ignore_keys)):
             if not _equal(_substitute(a[key]), b[key]):
                 split["n_sample_mismatch"] += 1
                 # the first 200 are recorded; the count covers all of them

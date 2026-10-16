@@ -32,6 +32,11 @@ parser.add_argument(
     action="store_true",
     help="load non-strictly, dropping unexpected keys (E4: upstream #511 vector biases)",
 )
+parser.add_argument(
+    "--split_padding",
+    action="store_true",
+    help="also split each test matrix's squared error into the (n, n) block and the padded region (I1)",
+)
 parser.add_argument("--out", required=True, help="JSON file for the results (rank 0)")
 args = parser.parse_args()
 
@@ -131,6 +136,53 @@ test_loss, test_tasks, _, _ = test(
     test_loader, model, 0, num_tasks=num_tasks, return_samples=False, precision="fp32"
 )
 
+split = None
+if args.split_padding:
+    # square single-head targets only: padded (N_pad, N_pad) with the molecule in the top-left (n, n) block.
+    # each rank takes testset[rank::world_size], so every conformer is counted exactly once (no sampler padding)
+    assert len(output_names) == 1 and not use_schur
+    max_size = int(round(padding_dim ** 0.5))
+    assert max_size * max_size == padding_dim, "split_padding needs a square padded target"
+    device = next(model.parameters()).device
+    sse_block = torch.zeros((), dtype=torch.float64, device=device)
+    sse_pad = torch.zeros((), dtype=torch.float64, device=device)
+    count = torch.zeros((), dtype=torch.float64, device=device)
+    local_indices = list(range(rank, len(testset), world_size))
+    local_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(testset, local_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=test_loader.collate_fn,
+    )
+    model.eval()
+    with torch.no_grad():
+        for batch in local_loader:
+            batch = batch.to(device)
+            pred = model(batch)[0].reshape(-1, max_size, max_size).double() # (B, N_pad, N_pad)
+            true = batch.y.reshape(-1, max_size, max_size).double() # (B, N_pad, N_pad)
+            assert pred.shape == true.shape
+            sq = (pred - true) ** 2 # (B, N_pad, N_pad)
+            dims = batch.density_matrix_dim.reshape(-1).long() # (B,)
+            assert dims.shape[0] == sq.shape[0]
+            # mask of the (n, n) block of every matrix
+            idx = torch.arange(max_size, device=device)
+            in_block = (idx[None, :, None] < dims[:, None, None]) & (idx[None, None, :] < dims[:, None, None]) # (B, N_pad, N_pad)
+            sse_block += (sq * in_block).sum()
+            sse_pad += (sq * (~in_block)).sum()
+            count += sq.shape[0]
+    for t in (sse_block, sse_pad, count):
+        torch.distributed.all_reduce(t)
+    n = float(count.item())
+    split = {
+        # a stored y_mask would change what the logged loss counts, so record whether one exists
+        "stored_sample_keys": sorted(probe.read(0).to_dict()),
+        "n_conformers": int(n),
+        "mean_block_sse_over_padding_dim": float(sse_block.item()) / padding_dim / n,
+        "mean_pad_sse_over_padding_dim": float(sse_pad.item()) / padding_dim / n,
+        "mean_total_sse_over_padding_dim": float(sse_block.item() + sse_pad.item()) / padding_dim / n,
+    }
+    logging.info(f"split_padding: {split}")
+
 if rank == 0:
     commit = subprocess.run(
         ["git", "-C", tree_root, "rev-parse", "HEAD"], capture_output=True, text=True
@@ -153,6 +205,7 @@ if rank == 0:
         "test_loss": float(test_loss),
         "val_tasks": [float(t) for t in val_tasks],
         "test_tasks": [float(t) for t in test_tasks],
+        "split_padding": split,
     }
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)

@@ -246,8 +246,8 @@ for check in sorted(jobs):
         m = re.search(r"(\d+) passed", text)
         r["passed"] = int(m.group(1)) if m else None
         verdict = r["passed"] == 86 and " failed" not in text
-    elif check == "P1_compare":
-        res = load_json(os.path.join(SC, "P1_compare_pickles.json"))
+    elif check.startswith("P1_compare"):
+        res = load_json(os.path.join(SC, "P1_compare_pickles_ignore_natoms.json" if check.endswith("ignore_natoms") else "P1_compare_pickles.json"))
         r["n_mismatch_total"] = res["n_mismatch_total"] if res else None
         r["splits"] = {k: {kk: v[kk] for kk in ("ntotal_reference", "ntotal_candidate", "n_compared", "n_sample_mismatch", "meta_mismatch")} for k, v in res["splits"].items()} if res else None
         r["artifacts"] = res["artifacts"] if res else None

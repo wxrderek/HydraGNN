@@ -17,3 +17,13 @@ HydraGNN-Installation-Perlmutter/
 HydraGNN-Installation-Duke-Compute-Cluster/
 references/*_info/
 references/*_methods/
+*.doc
+*.docx
+  **/logs/
+  **/serialized_dataset/
+  *.h5
+  *.hdf5
+  *.pickle
+  *.pkl
+  *.bp/
+  *.bp

@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2025, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -15,6 +15,7 @@ import pdb
 import torch
 from torch import nn
 from torch import Tensor
+from torch_cluster import radius_graph
 from torch.nn import Identity, Linear, ReLU, Sequential
 from torch_geometric.nn import Sequential as PyGSeq
 from torch_geometric.nn import MessagePassing
@@ -24,19 +25,37 @@ from torch_geometric.nn.models.schnet import (
 )
 from torch_geometric.typing import OptTensor
 
-if torch.cuda.is_available():
-    from torch_geometric.nn.models.schnet import (
-        RadiusInteractionGraph as RadiusInteractionGraph,
-    )
-else:
-    from hydragnn.preprocess.graph_samples_checks_and_updates import (
-        RadiusInteractionGraphCPU as RadiusInteractionGraph,
-    )
-
 from .Base import Base
 
 from hydragnn.utils.model import unsorted_segment_mean
 from hydragnn.utils.model.operations import get_edge_vectors_and_lengths
+
+
+class RadiusInteractionGraph(nn.Module):
+    def __init__(self, cutoff: float, max_num_neighbors: int):
+        super().__init__()
+        self.cutoff = cutoff
+        self.max_num_neighbors = max_num_neighbors
+
+    def forward(self, pos: Tensor, batch: Tensor):
+        # torch_cluster provides CPU and CUDA/ROCm kernels, but not kernels for
+        # every accelerator supported by PyTorch (for example XPU). Build the
+        # discrete neighbor list on CPU for those devices, then calculate
+        # distances from the original positions so their autograd graph stays
+        # on the training device.
+        graph_device_supported = pos.device.type in {"cpu", "cuda"}
+        graph_pos = pos if graph_device_supported else pos.cpu()
+        graph_batch = batch if graph_device_supported or batch is None else batch.cpu()
+        edge_index = radius_graph(
+            graph_pos,
+            r=self.cutoff,
+            batch=graph_batch,
+            max_num_neighbors=self.max_num_neighbors,
+        )
+        edge_index = edge_index.to(pos.device)
+        row, col = edge_index
+        edge_weight = (pos[row] - pos[col]).norm(dim=-1)
+        return edge_index, edge_weight
 
 
 class SCFStack(Base):
@@ -52,6 +71,7 @@ class SCFStack(Base):
         max_neighbours: Optional[int] = None,
         **kwargs,
     ):
+        self.equivariant_attn_adapter_type = "SchNet"
         self.radius = radius
         self.max_neighbours = max_neighbours
         self.num_filters = num_filters
@@ -111,7 +131,9 @@ class SCFStack(Base):
             equivariant=self.equivariance and not last_layer,
         )
 
-        if self.use_edge_attr or (self.use_global_attn and self.is_edge_model):
+        if self.use_edge_attr or (
+            self.global_attn_engine == "GPS" and self.is_edge_model
+        ):
             return PyGSeq(
                 "inv_node_feat, equiv_node_feat, edge_index, edge_weight, edge_rbf, batch, edge_attr",
                 [
@@ -162,14 +184,20 @@ class SCFStack(Base):
 
     def _embedding(self, data):
         super()._embedding(data)
+        node_features = self._input_node_features(data)
+        equivariant_geometry = None
+        if self.global_attn_engine == "EquivariantTransformer":
+            # Capture periodic metadata before the legacy coordinate-update
+            # branch replaces local edge shifts. Global explicit-image
+            # attention must follow the user's original PBC declaration.
+            equivariant_geometry = self._equivariant_attention_geometry(data)
 
-        if (self.use_edge_attr or (self.use_global_attn and self.is_edge_model)) and (
-            self.equivariance
-        ):
+        gps_edge_encodings = self.global_attn_engine == "GPS" and self.is_edge_model
+        if (self.use_edge_attr or gps_edge_encodings) and self.equivariance:
             raise Exception(
                 "For SchNet if using edge attributes or edge encodings for gps, then E(3)-equivariance cannot be ensured. Please disable equivariance or edge attributes."
             )
-        elif self.use_edge_attr or (self.use_global_attn and self.is_edge_model):
+        elif self.use_edge_attr or gps_edge_encodings:
             edge_index = data.edge_index
             data.edge_shifts = torch.zeros(
                 (data.edge_index.size(1), 3), device=data.edge_index.device
@@ -196,12 +224,23 @@ class SCFStack(Base):
                 "batch": data.batch,
             }
 
+        if self.global_attn_engine == "EquivariantTransformer":
+            conv_args.update(equivariant_geometry)
+
         if self.use_global_attn:
-            x = self.pos_emb(data.pe)
-            if self.input_dim:
-                x = torch.cat((self.node_emb(data.x.float()), x), 1)
-                x = self.node_lin(x)
-            if self.is_edge_model:
+            if self.global_attn_engine == "EquivariantTransformer":
+                if not self.input_dim:
+                    raise ValueError(
+                        "EquivariantTransformer requires invariant node features"
+                    )
+                x = self.node_emb(node_features.float())
+            else:
+                x = self.pos_emb(data.pe)
+                if self.input_dim:
+                    x = torch.cat((self.node_emb(node_features.float()), x), 1)
+                    x = self.node_lin(x)
+
+            if self.is_edge_model and self.global_attn_engine == "GPS":
                 e = self.rel_pos_emb(data.rel_pe)
                 if self.use_edge_attr:
                     e = torch.cat((self.edge_emb(conv_args["edge_attr"]), e), 1)
@@ -213,7 +252,7 @@ class SCFStack(Base):
                 )
             return x, data.pos, conv_args
         else:
-            return data.x, data.pos, conv_args
+            return node_features, data.pos, conv_args
 
     def __str__(self):
         return "SCFStack"

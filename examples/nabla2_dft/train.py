@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import mpi4py
 from mpi4py import MPI
 
@@ -42,7 +52,6 @@ except ImportError:
 import hydragnn.utils.profiling_and_tracing.tracer as tr
 from hydragnn.utils.datasets.abstractbasedataset import AbstractBaseDataset
 
-
 torch.set_default_dtype(torch.float32)
 
 transform_coordinates = Distance(norm=False, cat=False)
@@ -55,7 +64,6 @@ conversion_constant_from_hartree_to_eV = 27.2114079527
 # charge and spin are constant across QM7-X dataset
 charge = 0.0  # neutral
 spin = 1.0  # singlet
-graph_attr = torch.tensor([charge, spin], dtype=torch.float32)
 
 
 class Nabla2RelaxDataset(AbstractBaseDataset):
@@ -171,8 +179,6 @@ class Nabla2RelaxDataset(AbstractBaseDataset):
             * conversion_constant_from_hartree_to_eV
         )
 
-        x = torch.cat((atomic_numbers, pos, forces), dim=1)
-
         # Calculate chemical composition
         atomic_number_list = atomic_numbers.tolist()
         assert len(atomic_number_list) == natoms
@@ -188,17 +194,14 @@ class Nabla2RelaxDataset(AbstractBaseDataset):
             pos=pos,
             cell=cell,
             pbc=pbc,
-            atomic_numbers=atomic_numbers,
+            atomic_numbers=atomic_numbers.long().view(-1),
             chemical_composition=chemical_composition,
-            x=x,
             energy=energy,
             energy_per_atom=energy_per_atom,
             forces=forces,
-            graph_attr=graph_attr,
         )
 
         data_object.energy_per_atom = energy_per_atom
-        data_object.y = energy_per_atom if self.energy_per_atom else energy
 
         data_object = self.radius_graph(data_object)
         data_object = transform_coordinates(data_object)
@@ -309,11 +312,7 @@ if __name__ == "__main__":
     with open(input_filename, "r") as f:
         config = json.load(f)
     verbosity = config["Verbosity"]["level"]
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+    var_config = config["Variables"]
 
     if args.batch_size is not None:
         config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
@@ -462,7 +461,11 @@ if __name__ == "__main__":
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
 
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+    ) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
 
@@ -491,7 +494,7 @@ if __name__ == "__main__":
     )
 
     model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
+        model, optimizer, verbosity, config=config
     )
 
     hydragnn.utils.model.load_existing_model_config(
@@ -506,13 +509,11 @@ if __name__ == "__main__":
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         create_plots=False,
-        compute_grad_energy=config["NeuralNetwork"]["Architecture"].get(
-            "enable_interatomic_potential", False
-        ),
+        compute_grad_energy=hydragnn.domain_losses.uses_interatomic_potential(config),
         precision=precision,
     )
 

@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -12,10 +12,11 @@
 import os
 import torch
 from torch_geometric.data import Data
-from typing import List, Union
+from typing import Dict, List, Union
 
-import torch_scatter
-
+from hydragnn.architecture_defaults import MODEL_SPECIFIC_ARCHITECTURE_DEFAULTS
+from hydragnn.domain_losses import create_domain_loss
+from hydragnn.utils.input_config_parsing.config_utils import edge_type_dims
 from hydragnn.models.Base import Base
 from hydragnn.models.GINStack import GINStack
 from hydragnn.models.PNAStack import PNAStack
@@ -30,6 +31,17 @@ from hydragnn.models.EGCLStack import EGCLStack
 from hydragnn.models.PNAEqStack import PNAEqStack
 from hydragnn.models.PAINNStack import PAINNStack
 from hydragnn.models.MACEStack import MACEStack
+from hydragnn.models.AllScAIPStack import AllScAIPStack
+from hydragnn.models.UMAStack import UMAStack
+from hydragnn.models.heterogeneous import (
+    HeteroGINStack,
+    HeteroSAGEStack,
+    HeteroGATStack,
+    HeteroPNAStack,
+    HeteroHGTStack,
+    HeteroHEATStack,
+    HeteroRGATStack,
+)
 
 # InteratomicPotential functionality is now implemented via wrapper composition
 
@@ -38,11 +50,40 @@ from hydragnn.utils.profiling_and_tracing.time_utils import Timer
 from hydragnn.train.train_validate_test import resolve_precision
 
 
+def compute_forces_and_hessian(
+    energy, positions, *, compute_hessian=False, create_graph=False
+):
+    """Differentiate scalar graph energy into forces and a Cartesian Hessian."""
+    forces = -torch.autograd.grad(
+        energy,
+        positions,
+        grad_outputs=torch.ones_like(energy),
+        retain_graph=create_graph or compute_hessian,
+        create_graph=create_graph or compute_hessian,
+    )[0]
+    if not compute_hessian:
+        return forces, None
+
+    rows = []
+    for component in forces.reshape(-1):
+        force_gradient = torch.autograd.grad(
+            component,
+            positions,
+            retain_graph=True,
+            create_graph=create_graph,
+        )[0]
+        rows.append(-force_gradient.reshape(-1))
+    return forces, torch.stack(rows)
+
+
 def create_model_config(
     config: dict,
     verbosity: int = 0,
     use_gpu: bool = True,
+    metadata=None,
+    node_input_dims=None,
 ):
+    model_defaults = MODEL_SPECIFIC_ARCHITECTURE_DEFAULTS
     model = create_model(
         mpnn_type=config["Architecture"]["mpnn_type"],
         input_dim=config["Architecture"]["input_dim"],
@@ -52,6 +93,9 @@ def create_model_config(
         global_attn_engine=config["Architecture"]["global_attn_engine"],
         global_attn_type=config["Architecture"]["global_attn_type"],
         global_attn_heads=config["Architecture"]["global_attn_heads"],
+        attn_only=config["Architecture"].get("attn_only", False),
+        attn_node_types=config["Architecture"].get("attn_node_types", None),
+        structural_encoding=config["Architecture"].get("structural_encoding", None),
         output_type=config["Architecture"]["output_type"],
         output_heads=config["Architecture"]["output_heads"],
         activation_function=config["Architecture"]["activation_function"],
@@ -62,7 +106,11 @@ def create_model_config(
         initial_bias=config["Architecture"]["initial_bias"],
         num_nodes=config["Architecture"]["num_nodes"],
         max_neighbours=config["Architecture"]["max_neighbours"],
-        edge_dim=config["Architecture"]["edge_dim"],
+        edge_dim=(
+            edge_type_dims(config["Architecture"]["edge_types"])
+            if config["Architecture"].get("edge_types") is not None
+            else config["Architecture"]["edge_dim"]
+        ),
         pna_deg=config["Architecture"]["pna_deg"],
         num_before_skip=config["Architecture"]["num_before_skip"],
         num_after_skip=config["Architecture"]["num_after_skip"],
@@ -77,26 +125,172 @@ def create_model_config(
         num_gaussians=config["Architecture"]["num_gaussians"],
         num_filters=config["Architecture"]["num_filters"],
         radius=config["Architecture"]["radius"],
+        periodic_boundary_conditions=config["Architecture"].get(
+            "periodic_boundary_conditions", False
+        ),
         equivariance=config["Architecture"]["equivariance"],
         correlation=config["Architecture"]["correlation"],
         max_ell=config["Architecture"]["max_ell"],
         node_max_ell=config["Architecture"]["node_max_ell"],
         avg_num_neighbors=config["Architecture"]["avg_num_neighbors"],
         conv_checkpointing=config["Training"]["conv_checkpointing"],
-        enable_interatomic_potential=config["Architecture"].get(
-            "enable_interatomic_potential", False
-        ),
-        energy_weight=config["Architecture"].get("energy_weight", 0.0),
-        energy_peratom_weight=config["Architecture"].get("energy_peratom_weight", 0.0),
-        force_weight=config["Architecture"].get("force_weight", 0.0),
+        domain_loss_config=config["Training"].get("loss"),
+        input_node_encodings=config["Architecture"].get("input_node_encodings"),
         use_graph_attr_conditioning=config["Architecture"].get(
             "use_graph_attr_conditioning", False
         ),
+        graph_attr_dim=config["Architecture"].get("graph_attr_dim", 0),
         graph_attr_conditioning_mode=config["Architecture"].get(
             "graph_attr_conditioning_mode", "concat_node"
         ),
         graph_pooling=config["Architecture"].get("graph_pooling", "mean"),
         max_nodes=config["Architecture"].get("max_nodes", None),
+        equivariant_attn_lmax=config["Architecture"].get("equivariant_attn_lmax", 1),
+        equivariant_attn_num_radial=config["Architecture"].get(
+            "equivariant_attn_num_radial", 16
+        ),
+        equivariant_attn_num_hidden_layers=config["Architecture"].get(
+            "equivariant_attn_num_hidden_layers", 1
+        ),
+        equivariant_attn_feedforward_multiplier=config["Architecture"].get(
+            "equivariant_attn_feedforward_multiplier", 2
+        ),
+        equivariant_attn_allow_scalar_only=config["Architecture"].get(
+            "equivariant_attn_allow_scalar_only", False
+        ),
+        equivariant_attn_require_tensor_coupling=config["Architecture"].get(
+            "equivariant_attn_require_tensor_coupling", True
+        ),
+        equivariant_attn_chunk_size=config["Architecture"].get(
+            "equivariant_attn_chunk_size", 512
+        ),
+        equivariant_attn_coupling_mode=config["Architecture"].get(
+            "equivariant_attn_coupling_mode", "parallel"
+        ),
+        equivariant_attn_periodic=config["Architecture"].get(
+            "equivariant_attn_periodic", False
+        ),
+        equivariant_attn_periodic_replication=config["Architecture"].get(
+            "equivariant_attn_periodic_replication", 1
+        ),
+        # AllScAIP-specific
+        allscaip_num_heads=config["Architecture"].get(
+            "allscaip_num_heads", model_defaults["allscaip_num_heads"]
+        ),
+        allscaip_freq_list=config["Architecture"].get(
+            "allscaip_freq_list", model_defaults["allscaip_freq_list"]
+        ),
+        allscaip_atten_name=config["Architecture"].get(
+            "allscaip_atten_name", model_defaults["allscaip_atten_name"]
+        ),
+        allscaip_use_node_path=config["Architecture"].get(
+            "allscaip_use_node_path", model_defaults["allscaip_use_node_path"]
+        ),
+        allscaip_use_sincx_mask=config["Architecture"].get(
+            "allscaip_use_sincx_mask", model_defaults["allscaip_use_sincx_mask"]
+        ),
+        allscaip_use_freq_mask=config["Architecture"].get(
+            "allscaip_use_freq_mask", model_defaults["allscaip_use_freq_mask"]
+        ),
+        allscaip_max_num_elements=config["Architecture"].get(
+            "allscaip_max_num_elements",
+            model_defaults["allscaip_max_num_elements"],
+        ),
+        allscaip_knn_soft=config["Architecture"].get(
+            "allscaip_knn_soft", model_defaults["allscaip_knn_soft"]
+        ),
+        allscaip_distance_function=config["Architecture"].get(
+            "allscaip_distance_function",
+            model_defaults["allscaip_distance_function"],
+        ),
+        allscaip_normalization=config["Architecture"].get(
+            "allscaip_normalization", model_defaults["allscaip_normalization"]
+        ),
+        allscaip_mlp_dropout=config["Architecture"].get(
+            "allscaip_mlp_dropout", model_defaults["allscaip_mlp_dropout"]
+        ),
+        allscaip_atten_dropout=config["Architecture"].get(
+            "allscaip_atten_dropout", model_defaults["allscaip_atten_dropout"]
+        ),
+        allscaip_use_residual_scaling=config["Architecture"].get(
+            "allscaip_use_residual_scaling",
+            model_defaults["allscaip_use_residual_scaling"],
+        ),
+        allscaip_regress_stress=config["Architecture"].get(
+            "allscaip_regress_stress", model_defaults["allscaip_regress_stress"]
+        ),
+        allscaip_use_chunked_graph=config["Architecture"].get(
+            "allscaip_use_chunked_graph", model_defaults["allscaip_use_chunked_graph"]
+        ),
+        allscaip_graph_chunk_size=config["Architecture"].get(
+            "allscaip_graph_chunk_size", model_defaults["allscaip_graph_chunk_size"]
+        ),
+        allscaip_knn_use_low_mem=config["Architecture"].get(
+            "allscaip_knn_use_low_mem", model_defaults["allscaip_knn_use_low_mem"]
+        ),
+        allscaip_dataset_list=config["Architecture"].get(
+            "allscaip_dataset_list", model_defaults["allscaip_dataset_list"].copy()
+        ),
+        # UMA-specific
+        uma_mmax=config["Architecture"].get("uma_mmax", model_defaults["uma_mmax"]),
+        uma_grid_resolution=config["Architecture"].get(
+            "uma_grid_resolution", model_defaults["uma_grid_resolution"]
+        ),
+        uma_edge_channels=config["Architecture"].get(
+            "uma_edge_channels", model_defaults["uma_edge_channels"]
+        ),
+        uma_hidden_channels=config["Architecture"].get(
+            "uma_hidden_channels", model_defaults["uma_hidden_channels"]
+        ),
+        uma_norm_type=config["Architecture"].get(
+            "uma_norm_type", model_defaults["uma_norm_type"]
+        ),
+        uma_ff_type=config["Architecture"].get(
+            "uma_ff_type", model_defaults["uma_ff_type"]
+        ),
+        uma_use_chg_spin=config["Architecture"].get(
+            "uma_use_chg_spin", model_defaults["uma_use_chg_spin"]
+        ),
+        uma_max_num_elements=config["Architecture"].get(
+            "uma_max_num_elements", model_defaults["uma_max_num_elements"]
+        ),
+        uma_variant=config["Architecture"].get(
+            "uma_variant", model_defaults["uma_variant"]
+        ),
+        uma_num_experts=config["Architecture"].get(
+            "uma_num_experts", model_defaults["uma_num_experts"]
+        ),
+        uma_moe_dropout=config["Architecture"].get(
+            "uma_moe_dropout", model_defaults["uma_moe_dropout"]
+        ),
+        uma_use_composition_embedding=config["Architecture"].get(
+            "uma_use_composition_embedding",
+            model_defaults["uma_use_composition_embedding"],
+        ),
+        uma_equivariant_vector_head=config["Architecture"].get(
+            "uma_equivariant_vector_head",
+            model_defaults["uma_equivariant_vector_head"],
+        ),
+        uma_vector_head_index=config["Architecture"].get(
+            "uma_vector_head_index", model_defaults["uma_vector_head_index"]
+        ),
+        hetero_pooling_mode=config["Architecture"].get("hetero_pooling_mode", "sum"),
+        node_target_type=config["Architecture"].get("node_target_type", None),
+        share_relation_weights=config["Architecture"].get(
+            "share_relation_weights", False
+        ),
+        metadata=metadata,
+        node_input_dims=node_input_dims,
+        hetero_attention_heads=config["Architecture"].get("hetero_attention_heads", 4),
+        hetero_attention_negative_slope=config["Architecture"].get(
+            "hetero_attention_negative_slope", 0.2
+        ),
+        hetero_edge_type_emb_dim=config["Architecture"].get(
+            "hetero_edge_type_emb_dim", 16
+        ),
+        hetero_edge_attr_emb_dim=config["Architecture"].get(
+            "hetero_edge_attr_emb_dim", 16
+        ),
         verbosity=verbosity,
         use_gpu=use_gpu,
     )
@@ -129,7 +323,7 @@ def create_model(
     initial_bias: float = None,
     num_nodes: int = None,
     max_neighbours: int = None,
-    edge_dim: int = None,
+    edge_dim: Union[int, Dict[str, int], None] = None,
     pna_deg: torch.tensor = None,
     num_before_skip: int = None,
     num_after_skip: int = None,
@@ -150,16 +344,73 @@ def create_model(
     node_max_ell: int = None,
     avg_num_neighbors: int = None,
     conv_checkpointing: bool = False,
-    enable_interatomic_potential: bool = False,
-    energy_weight: float = 0.0,
-    energy_peratom_weight: float = 0.0,
-    force_weight: float = 0.0,
+    domain_loss_config: dict | None = None,
+    input_node_encodings: list[dict] | None = None,
     use_graph_attr_conditioning: bool = False,
+    graph_attr_dim: int = 0,
     graph_attr_conditioning_mode: str = "fuse_pool",
     graph_pooling: str = "mean",
-    max_nodes: int = None,
+    equivariant_attn_lmax: int = 1,
+    equivariant_attn_num_radial: int = 16,
+    equivariant_attn_feedforward_multiplier: int = 2,
+    equivariant_attn_allow_scalar_only: bool = False,
+    equivariant_attn_require_tensor_coupling: bool = True,
+    equivariant_attn_chunk_size: int | None = 512,
+    equivariant_attn_coupling_mode: str = "parallel",
+    equivariant_attn_periodic: bool = False,
+    equivariant_attn_periodic_replication: int | list[int] = 1,
+    # AllScAIP-specific
+    allscaip_num_heads: int = 8,
+    allscaip_freq_list: List[int] = None,
+    allscaip_atten_name: str = "math",
+    allscaip_use_node_path: bool = True,
+    allscaip_use_sincx_mask: bool = True,
+    allscaip_use_freq_mask: bool = True,
+    allscaip_max_num_elements: int = 119,
+    allscaip_knn_soft: bool = True,
+    allscaip_distance_function: str = "gaussian",
+    allscaip_normalization: str = "rmsnorm",
+    allscaip_mlp_dropout: float = 0.0,
+    allscaip_atten_dropout: float = 0.0,
+    allscaip_use_residual_scaling: bool = True,
+    allscaip_regress_stress: bool = False,
+    allscaip_use_chunked_graph: bool = False,
+    allscaip_graph_chunk_size: int = 512,
+    allscaip_knn_use_low_mem: bool = True,
+    allscaip_dataset_list: List[str] = None,
+    # UMA-specific
+    uma_mmax: int = 2,
+    uma_grid_resolution: int = None,
+    uma_edge_channels: int = 128,
+    uma_hidden_channels: int = None,
+    uma_norm_type: str = "rms_norm_sh",
+    uma_ff_type: str = "grid",
+    uma_use_chg_spin: bool = False,
+    uma_max_num_elements: int = 100,
+    uma_variant: str = "S",
+    uma_num_experts: int = None,
+    uma_moe_dropout: float = 0.0,
+    uma_use_composition_embedding: bool = False,
+    uma_equivariant_vector_head: bool = False,
+    uma_vector_head_index: int = None,
+    hetero_pooling_mode: str = "sum",
+    node_target_type: str = None,
+    share_relation_weights: bool = False,
+    metadata=None,
+    node_input_dims=None,
+    hetero_attention_heads: int = 4,
+    hetero_attention_negative_slope: float = 0.2,
+    hetero_edge_type_emb_dim: int = 16,
+    hetero_edge_attr_emb_dim: int = 16,
     verbosity: int = 0,
     use_gpu: bool = True,
+    periodic_boundary_conditions: bool = False,
+    attn_only: bool = False,
+    *,
+    equivariant_attn_num_hidden_layers: int = 1,
+    attn_node_types: List[str] = None,
+    structural_encoding: dict = None,
+    max_nodes: int = None,
 ):
     timer = Timer("create_model")
     timer.start()
@@ -404,6 +655,22 @@ def create_model(
             graph_pooling=graph_pooling,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            equivariant_attn_num_hidden_layers=equivariant_attn_num_hidden_layers,
+            equivariant_attn_lmax=equivariant_attn_lmax,
+            equivariant_attn_num_radial=equivariant_attn_num_radial,
+            equivariant_attn_feedforward_multiplier=(
+                equivariant_attn_feedforward_multiplier
+            ),
+            equivariant_attn_allow_scalar_only=equivariant_attn_allow_scalar_only,
+            equivariant_attn_require_tensor_coupling=(
+                equivariant_attn_require_tensor_coupling
+            ),
+            equivariant_attn_chunk_size=equivariant_attn_chunk_size,
+            equivariant_attn_coupling_mode=equivariant_attn_coupling_mode,
+            equivariant_attn_periodic=equivariant_attn_periodic,
+            equivariant_attn_periodic_replication=(
+                equivariant_attn_periodic_replication
+            ),
         )
 
     elif mpnn_type == "DimeNet":
@@ -452,6 +719,22 @@ def create_model(
             graph_pooling=graph_pooling,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            equivariant_attn_num_hidden_layers=equivariant_attn_num_hidden_layers,
+            equivariant_attn_lmax=equivariant_attn_lmax,
+            equivariant_attn_num_radial=equivariant_attn_num_radial,
+            equivariant_attn_feedforward_multiplier=(
+                equivariant_attn_feedforward_multiplier
+            ),
+            equivariant_attn_allow_scalar_only=equivariant_attn_allow_scalar_only,
+            equivariant_attn_require_tensor_coupling=(
+                equivariant_attn_require_tensor_coupling
+            ),
+            equivariant_attn_chunk_size=equivariant_attn_chunk_size,
+            equivariant_attn_coupling_mode=equivariant_attn_coupling_mode,
+            equivariant_attn_periodic=equivariant_attn_periodic,
+            equivariant_attn_periodic_replication=(
+                equivariant_attn_periodic_replication
+            ),
         )
 
     elif mpnn_type == "EGNN":
@@ -511,6 +794,22 @@ def create_model(
             max_nodes=max_nodes,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            equivariant_attn_num_hidden_layers=equivariant_attn_num_hidden_layers,
+            equivariant_attn_lmax=equivariant_attn_lmax,
+            equivariant_attn_num_radial=equivariant_attn_num_radial,
+            equivariant_attn_feedforward_multiplier=(
+                equivariant_attn_feedforward_multiplier
+            ),
+            equivariant_attn_allow_scalar_only=equivariant_attn_allow_scalar_only,
+            equivariant_attn_require_tensor_coupling=(
+                equivariant_attn_require_tensor_coupling
+            ),
+            equivariant_attn_chunk_size=equivariant_attn_chunk_size,
+            equivariant_attn_coupling_mode=equivariant_attn_coupling_mode,
+            equivariant_attn_periodic=equivariant_attn_periodic,
+            equivariant_attn_periodic_replication=(
+                equivariant_attn_periodic_replication
+            ),
         )
 
     elif mpnn_type == "PNAEq":
@@ -541,6 +840,22 @@ def create_model(
             graph_pooling=graph_pooling,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            equivariant_attn_num_hidden_layers=equivariant_attn_num_hidden_layers,
+            equivariant_attn_lmax=equivariant_attn_lmax,
+            equivariant_attn_num_radial=equivariant_attn_num_radial,
+            equivariant_attn_feedforward_multiplier=(
+                equivariant_attn_feedforward_multiplier
+            ),
+            equivariant_attn_allow_scalar_only=equivariant_attn_allow_scalar_only,
+            equivariant_attn_require_tensor_coupling=(
+                equivariant_attn_require_tensor_coupling
+            ),
+            equivariant_attn_chunk_size=equivariant_attn_chunk_size,
+            equivariant_attn_coupling_mode=equivariant_attn_coupling_mode,
+            equivariant_attn_periodic=equivariant_attn_periodic,
+            equivariant_attn_periodic_replication=(
+                equivariant_attn_periodic_replication
+            ),
         )
 
     elif mpnn_type == "MACE":
@@ -583,184 +898,394 @@ def create_model(
             graph_pooling=graph_pooling,
             use_graph_attr_conditioning=use_graph_attr_conditioning,
             graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            equivariant_attn_num_hidden_layers=equivariant_attn_num_hidden_layers,
+            equivariant_attn_lmax=equivariant_attn_lmax,
+            equivariant_attn_num_radial=equivariant_attn_num_radial,
+            equivariant_attn_feedforward_multiplier=(
+                equivariant_attn_feedforward_multiplier
+            ),
+            equivariant_attn_allow_scalar_only=equivariant_attn_allow_scalar_only,
+            equivariant_attn_require_tensor_coupling=(
+                equivariant_attn_require_tensor_coupling
+            ),
+            equivariant_attn_chunk_size=equivariant_attn_chunk_size,
+            equivariant_attn_coupling_mode=equivariant_attn_coupling_mode,
+            equivariant_attn_periodic=equivariant_attn_periodic,
+            equivariant_attn_periodic_replication=(
+                equivariant_attn_periodic_replication
+            ),
         )
+
+    elif mpnn_type == "AllScAIP":
+        assert radius is not None, "AllScAIP requires radius input."
+        assert max_neighbours is not None, "AllScAIP requires max_neighbours input."
+        model = AllScAIPStack(
+            # input_args / conv_args are consumed by Base.__init__ but are
+            # unused at runtime because AllScAIP performs its own message
+            # passing. We pass canonical strings for consistency.
+            "inv_node_feat, equiv_node_feat",
+            "inv_node_feat",
+            radius,
+            max_neighbours,
+            allscaip_num_heads,
+            allscaip_freq_list,
+            allscaip_atten_name,
+            allscaip_use_node_path,
+            allscaip_use_sincx_mask,
+            allscaip_use_freq_mask,
+            allscaip_max_num_elements,
+            allscaip_knn_soft,
+            allscaip_distance_function,
+            allscaip_normalization,
+            allscaip_mlp_dropout,
+            allscaip_atten_dropout,
+            allscaip_use_residual_scaling,
+            allscaip_regress_stress,
+            allscaip_dataset_list,
+            allscaip_use_chunked_graph,
+            allscaip_graph_chunk_size,
+            allscaip_knn_use_low_mem,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+        )
+
+    elif mpnn_type == "UMA":
+        assert radius is not None, "UMA requires radius input."
+        assert max_neighbours is not None, "UMA requires max_neighbours input."
+        assert max_ell is not None, "UMA requires max_ell input."
+        assert num_radial is not None, "UMA requires num_radial input."
+        model = UMAStack(
+            "inv_node_feat, equiv_node_feat, edge_index",
+            "inv_node_feat, edge_index",
+            radius,
+            max_neighbours,
+            max_ell,
+            num_radial,
+            uma_mmax,
+            uma_grid_resolution,
+            uma_edge_channels,
+            uma_hidden_channels,
+            uma_norm_type,
+            uma_ff_type,
+            uma_use_chg_spin,
+            uma_max_num_elements,
+            uma_variant,
+            uma_num_experts,
+            uma_moe_dropout,
+            uma_use_composition_embedding,
+            periodic_boundary_conditions,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            uma_equivariant_vector_head=uma_equivariant_vector_head,
+            uma_vector_head_index=uma_vector_head_index,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+        )
+
+    elif mpnn_type == "HeteroGIN":
+        model = HeteroGINStack(
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+
+    elif mpnn_type == "HeteroSAGE":
+        model = HeteroSAGEStack(
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+
+    elif mpnn_type == "HeteroGAT":
+        heads = 6
+        negative_slope = 0.05
+        model = HeteroGATStack(
+            heads,
+            negative_slope,
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+
+    elif mpnn_type == "HeteroPNA":
+        assert pna_deg is not None, "HeteroPNA requires degree input."
+        model = HeteroPNAStack(
+            pna_deg,
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+
+    elif mpnn_type == "HeteroRGAT":
+        model = HeteroRGATStack(
+            hetero_attention_heads,
+            hetero_attention_negative_slope,
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+    elif mpnn_type == "HeteroHGT":
+        model = HeteroHGTStack(
+            hetero_attention_heads,
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+    elif mpnn_type == "HeteroHEAT":
+        model = HeteroHEATStack(
+            hetero_attention_heads,
+            hetero_edge_type_emb_dim,
+            hetero_edge_attr_emb_dim,
+            edge_dim,
+            input_dim,
+            hidden_dim,
+            output_dim,
+            pe_dim,
+            global_attn_engine,
+            global_attn_type,
+            global_attn_heads,
+            output_type,
+            output_heads,
+            activation_function,
+            loss_function_type,
+            equivariance,
+            loss_weights=task_weights,
+            freeze_conv=freeze_conv,
+            initial_bias=initial_bias,
+            num_conv_layers=num_conv_layers,
+            num_nodes=num_nodes,
+            graph_pooling=graph_pooling,
+            use_graph_attr_conditioning=use_graph_attr_conditioning,
+            graph_attr_dim=graph_attr_dim,
+            graph_attr_conditioning_mode=graph_attr_conditioning_mode,
+            hetero_pooling_mode=hetero_pooling_mode,
+            node_target_type=node_target_type,
+            share_relation_weights=share_relation_weights,
+            metadata=metadata,
+            node_input_dims=node_input_dims,
+            attn_only=attn_only,
+            attn_node_types=attn_node_types,
+            structural_encoding=structural_encoding,
+        )
+
     else:
         raise ValueError("Unknown mpnn_type: {0}".format(mpnn_type))
 
-    # Apply interatomic potential enhancement if requested
-    if enable_interatomic_potential:
-        # Instead of complex inheritance, use composition with delegation
-        # This avoids MRO issues and __init__ complications
-        class EnhancedModelWrapper(torch.nn.Module):
-            def __init__(self, original_model):
-                super().__init__()
-                self.model = original_model
-                self.energy_weight = energy_weight
-                self.energy_peratom_weight = energy_peratom_weight
-                self.force_weight = force_weight
-
-            def __getattr__(self, name):
-                # First try to get from the wrapper itself
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    pass
-
-                # Then try to get from the wrapped model
-                try:
-                    return getattr(self.model, name)
-                except AttributeError:
-                    # Handle specific method names that may be expected for interatomic potentials
-                    if name in [
-                        "_compute_enhanced_geometric_features",
-                        "_compute_three_body_interactions",
-                        "_apply_atomic_environment_descriptors",
-                    ]:
-                        # Return placeholder methods that don't interfere with existing architectures
-                        return lambda *args, **kwargs: None
-                    raise AttributeError(
-                        f"'{self.__class__.__name__}' object has no attribute '{name}'"
-                    )
-
-            # ---------- forward ----------
-            def forward(self, data):
-
-                return self.model(data)
-
-            def energy_force_loss(self, pred, data, create_graph=True):
-                """
-                Compute energy and force loss for MLIP training.
-
-                This method is specific to interatomic potentials and computes:
-                1. Energy loss between predicted and true total energies
-                2. Force loss between predicted and true forces (via autograd on positions)
-
-                Forces are computed as negative gradients of total energy with respect to positions.
-                """
-                # Asserts
-                assert (
-                    data.pos is not None
-                    and data.energy is not None
-                    and data.forces is not None
-                ), "data.pos, data.energy, data.forces must be provided for energy-force loss. Check your dataset creation and naming."
-                assert (
-                    data.pos.requires_grad
-                ), "data.pos does not have grad, so force predictions cannot be computed. Check that data.pos has grad set to true before prediction."
-
-                assert (
-                    self.num_heads == 1
-                ), "Force predictions require exactly one head."
-
-                # Support both node and graph heads; enforce sum pooling for graph heads
-                if self.head_type[0] == "node":
-                    node_energy_pred = pred[0]
-                    graph_energy_pred = (
-                        torch_scatter.scatter_add(node_energy_pred, data.batch, dim=0)
-                        .squeeze()
-                        .float()
-                    )
-                elif self.head_type[0] == "graph":
-                    if getattr(self.model, "graph_pooling", "mean") not in ["add"]:
-                        raise ValueError(
-                            "Graph head force loss requires sum pooling (graph_pooling='add')."
-                        )
-                    if isinstance(pred, dict) and "graph" in pred:
-                        graph_energy_pred = pred["graph"][0].squeeze().float()
-                    elif isinstance(pred, (list, tuple)):
-                        graph_energy_pred = pred[0].squeeze().float()
-                    else:
-                        graph_energy_pred = pred.squeeze().float()
-                else:
-                    raise ValueError(
-                        "Force predictions are only supported for node or graph energy heads."
-                    )
-
-                graph_energy_true = data.energy.squeeze().float()
-                tasks_loss = [self.loss_function(graph_energy_pred, graph_energy_true)]
-
-                energy_loss_weight = self.energy_weight
-                energy_peratom_loss_weight = self.energy_peratom_weight
-                force_loss_weight = self.force_weight
-
-                # Interatomic potential training requires at least one active loss term
-                if (
-                    energy_loss_weight <= 0
-                    and energy_peratom_loss_weight <= 0
-                    and force_loss_weight <= 0
-                ):
-                    raise ValueError(
-                        "All interatomic potential loss weights are zero; set at least one of energy_weight, energy_peratom_weight, or force_weight to a positive value."
-                    )
-
-                tot_loss = 0
-                if energy_loss_weight > 0:
-                    tot_loss += (
-                        self.loss_function(graph_energy_pred, graph_energy_true)
-                        * energy_loss_weight
-                    )
-
-                # Energy per atom
-                natoms = torch.bincount(data.batch)
-                graph_energy_peratom_pred = graph_energy_pred / natoms
-                graph_energy_peratom_true = graph_energy_true / natoms
-                tasks_loss.append(
-                    self.loss_function(
-                        graph_energy_peratom_pred, graph_energy_peratom_true
-                    )
+    model.configure_input_feature_encoders(input_node_encodings)
+    if use_graph_attr_conditioning and graph_attr_dim is not None:
+        if model.graph_attr_conditioning_mode == "film":
+            model._ensure_graph_conditioner(graph_attr_dim, device)
+        elif model.graph_attr_conditioning_mode == "concat_node":
+            model._ensure_graph_concat_projector(graph_attr_dim, hidden_dim, device)
+        elif model.graph_attr_conditioning_mode == "fuse_pool":
+            if "graph" not in output_type:
+                raise ValueError(
+                    "fuse_pool graph conditioning requires at least one graph output"
                 )
+            if not getattr(model, "supports_graph_pool_conditioning", True):
+                raise ValueError(
+                    f"{model.__class__.__name__} does not support fuse_pool graph conditioning"
+                )
+            model._ensure_graph_pool_projector(graph_attr_dim, hidden_dim, device)
 
-                if energy_peratom_loss_weight > 0:
-                    tot_loss += (
-                        self.loss_function(
-                            graph_energy_peratom_pred, graph_energy_peratom_true
-                        )
-                        * energy_peratom_loss_weight
-                    )
-
-                # Forces
-                forces_true = data.forces.float()
-                forces_pred = torch.autograd.grad(
-                    graph_energy_pred,
-                    data.pos,
-                    grad_outputs=torch.ones_like(graph_energy_pred),
-                    retain_graph=graph_energy_pred.requires_grad,
-                    create_graph=create_graph,
-                )[0].float()
-                assert (
-                    forces_pred is not None
-                ), "No gradients were found for data.pos. Does your model use positions for prediction?"
-                forces_pred = -forces_pred
-                tasks_loss.append(self.loss_function(forces_pred, forces_true))
-
-                if force_loss_weight > 0:
-                    tot_loss += (
-                        self.loss_function(forces_pred, forces_true) * force_loss_weight
-                    )  # Have force-weight be the complement to energy-weight
-                    ## FixMe: current loss functions require the number of heads to be the number of things being predicted
-                    ##        so, we need to do loss calculation manually without calling the other functions.
-
-                return tot_loss, tasks_loss
-
-            def _compute_enhanced_geometric_features(self, data):
-                """
-                Placeholder for enhanced geometric feature computation (disabled by default).
-                """
-                return data
-
-            def _compute_three_body_interactions(self, data):
-                """
-                Placeholder for three-body interaction computation (disabled by default).
-                """
-                return data
-
-            def _apply_atomic_environment_descriptors(self, data):
-                """
-                Placeholder for atomic environment descriptor application (disabled by default).
-                """
-                return data
-
-        enhanced_model = EnhancedModelWrapper(model)
-        model = enhanced_model
+    model.atomistic_mode_enabled = False
+    model = create_domain_loss(model, domain_loss_config)
 
     if conv_checkpointing:
         model.enable_conv_checkpointing()

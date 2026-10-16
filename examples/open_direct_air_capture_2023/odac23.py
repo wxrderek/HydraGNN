@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os, random, torch, glob, sys, pickle, shutil, traceback
 import queue, threading
 import numpy as np
@@ -18,7 +28,6 @@ from hydragnn.preprocess.graph_samples_checks_and_updates import (
 )
 from hydragnn.utils.distributed import nsplit
 
-
 # transform_coordinates = Spherical(norm=False, cat=False)
 # transform_coordinates = LocalCartesian(norm=False, cat=False)
 transform_coordinates = Distance(norm=False, cat=False)
@@ -29,7 +38,6 @@ transform_coordinates_pbc = PBCDistance(norm=False, cat=False)
 # charge and spin are constant across MPTrj dataset
 charge = 0.0  # neutral
 spin = 1.0  # singlet
-graph_attr = torch.tensor([charge, spin], dtype=torch.float32)
 
 import torch
 from torch_geometric.data import Data, Dataset
@@ -238,8 +246,6 @@ class ODAC2023(AbstractBaseDataset):
                 cell = torch.eye(3, dtype=torch.float32)
                 pbc = torch.tensor([False, False, False], dtype=torch.bool)
 
-            x = torch.cat([atomic_numbers, pos, forces], dim=1)
-
             # Calculate chemical composition
             atomic_number_list = atomic_numbers.tolist()
             assert len(atomic_number_list) == natoms
@@ -255,20 +261,13 @@ class ODAC2023(AbstractBaseDataset):
                 pbc=pbc,
                 edge_index=None,
                 edge_attr=None,
-                atomic_numbers=atomic_numbers,
+                atomic_numbers=atomic_numbers.long().view(-1),
                 chemical_composition=chemical_composition,
                 smiles_string=None,
-                x=x,
                 energy=energy,
                 energy_per_atom=energy_per_atom,
                 forces=forces,
-                graph_attr=graph_attr,
             )
-
-            if self.energy_per_atom:
-                data_object.y = data_object.energy_per_atom
-            else:
-                data_object.y = data_object.energy
 
             if data_object.pbc.any():
                 try:
@@ -286,7 +285,7 @@ class ODAC2023(AbstractBaseDataset):
 
             # Skip samples that still contain self-loops
             if should_skip_self_loops(data_object, context="odac23"):
-                continue
+                return
 
             # Default edge_shifts for when radius_graph_pbc is not activated
             if not hasattr(data_object, "edge_shifts"):

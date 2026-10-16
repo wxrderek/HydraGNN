@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 
 import argparse
 import glob
@@ -209,7 +219,7 @@ def main():
         config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
 
     configure_variable_names(config)
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
+    var_config = config["Variables"]
 
     hydragnn.utils.distributed.setup_ddp()
 

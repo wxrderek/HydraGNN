@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 ###########################################################################################
 # Higher Order Real Clebsch Gordan (based on e3nn by Mario Geiger)
 # Authors: Ilyes Batatia
@@ -57,9 +67,9 @@ def _wigner_nj(
 
                 C = o3.wigner_3j(ir_out.l, ir_left.l, ir.l, dtype=dtype)
                 if normalization == "component":
-                    C *= ir_out.dim ** 0.5
+                    C *= ir_out.dim**0.5
                 if normalization == "norm":
-                    C *= ir_left.dim ** 0.5 * ir.dim ** 0.5
+                    C *= ir_left.dim**0.5 * ir.dim**0.5
 
                 C = torch.einsum("jk,ijl->ikl", C_left.flatten(1), C)
                 C = C.reshape(

@@ -19,6 +19,10 @@ import shutil
 
 import hydragnn, tests
 from hydragnn.utils.input_config_parsing.config_utils import merge_config
+from tests._prediction_workflow import load_checkpoint_and_test
+from tests._training_workflow import train_and_checkpoint
+
+pytestmark = pytest.mark.mpi
 
 
 # Main unit test function called by pytest wrappers.
@@ -77,7 +81,12 @@ def unittest_train_model(
                 + dataset_name
                 + ".pkl"
             )
-        if os.path.exists(pkl_file):
+        required_names = {
+            spec["name"]
+            for group in ("inputs", "outputs")
+            for spec in config["Variables"][group]
+        }
+        if tests.prepared_pickle_has_attributes(pkl_file, required_names):
             config["Dataset"]["path"][dataset_name] = pkl_file
 
     # In the unit test runs, it is found MFC favors graph-level features over node-level features, compared with other models;
@@ -88,6 +97,9 @@ def unittest_train_model(
     # Only run with edge lengths for models that support them.
     if use_lengths:
         config["NeuralNetwork"]["Architecture"]["edge_features"] = ["lengths"]
+        config["Variables"]["inputs"].append(
+            {"name": "edge_lengths", "level": "edge", "dim": 1}
+        )
 
     if rank == 0:
         num_samples_tot = 500
@@ -121,20 +133,22 @@ def unittest_train_model(
                         * (1 - config["NeuralNetwork"]["Training"]["perc_train"])
                         * 0.5
                     )
-                if not os.listdir(data_path):
-                    tests.deterministic_graph_data(
-                        data_path, number_configurations=num_samples
-                    )
+                tests.ensure_deterministic_graph_data(data_path, num_samples)
 
     # Run Training
-    hydragnn.run_training(config, use_deepspeed)
+    train_loader, val_loader, test_loader = (
+        hydragnn.preprocess.dataset_loading_and_splitting(config)
+    )
+    _, config = train_and_checkpoint(
+        config, train_loader, val_loader, test_loader, use_deepspeed
+    )
 
     (
         error,
         error_mse_task,
         true_values,
         predicted_values,
-    ) = hydragnn.run_prediction(config, use_deepspeed)
+    ) = load_checkpoint_and_test(config, test_loader, use_deepspeed)
 
     # Set RMSE and sample MAE error thresholds
     thresholds = {
@@ -191,7 +205,7 @@ def unittest_train_model(
 )
 @pytest.mark.parametrize("basis_function", ["bessel", "gaussian", "chebyshev"])
 @pytest.mark.parametrize("distance_transform", ["None", "Agnesi", "Soft"])
-def pytest_train_model_transforms(
+def test_train_model_transforms(
     model_type,
     basis_function,
     distance_transform,

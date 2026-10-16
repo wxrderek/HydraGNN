@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import mpi4py
 from mpi4py import MPI
 
@@ -69,7 +79,6 @@ transform_coordinates = Distance(norm=False, cat=False)
 # charge and spin are constant across Transition1x dataset
 charge = 0.0  # neutral
 spin = 1.0  # singlet
-graph_attr = torch.tensor([charge, spin], dtype=torch.float32)
 
 
 class Transition1xDataset(AbstractBaseDataset):
@@ -177,8 +186,6 @@ class Transition1xDataset(AbstractBaseDataset):
             )
             total_energy_per_atom_tensor = total_energy_tensor.detach().clone() / natoms
 
-            x = torch.cat([atomic_numbers, pos, forces], dim=1)
-
             # Calculate chemical composition
             atomic_number_list = atomic_numbers.tolist()
             assert len(atomic_number_list) == natoms
@@ -224,20 +231,13 @@ class Transition1xDataset(AbstractBaseDataset):
                 pbc=pbc,  # even if not needed, pbc needs to be defined because ADIOS requires consistency across datasets
                 # edge_index=None,
                 # edge_attr=None,
-                atomic_numbers=atomic_numbers,
+                atomic_numbers=atomic_numbers.long().view(-1),
                 chemical_composition=chemical_composition,
                 # smiles_string=smiles_string,
-                x=x,
                 energy=total_energy_tensor,
                 energy_per_atom=total_energy_per_atom_tensor,
                 forces=forces,
-                graph_attr=graph_attr,
             )
-
-            if self.energy_per_atom:
-                data_object.y = data_object.energy_per_atom
-            else:
-                data_object.y = data_object.energy
 
             data_object = self.radius_graph(data_object)
 
@@ -346,11 +346,7 @@ if __name__ == "__main__":
     with open(input_filename, "r") as f:
         config = json.load(f)
     verbosity = config["Verbosity"]["level"]
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+    var_config = config["Variables"]
 
     # Transformation to create positional and structural laplacian encoders
     """
@@ -525,7 +521,11 @@ if __name__ == "__main__":
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
 
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+    ) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
 
@@ -554,7 +554,7 @@ if __name__ == "__main__":
     )
 
     model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
+        model, optimizer, verbosity, config=config
     )
 
     # Print details of neural network architecture
@@ -574,13 +574,11 @@ if __name__ == "__main__":
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         create_plots=False,
-        compute_grad_energy=config["NeuralNetwork"]["Architecture"].get(
-            "enable_interatomic_potential", False
-        ),
+        compute_grad_energy=hydragnn.domain_losses.uses_interatomic_potential(config),
         precision=precision,
     )
 

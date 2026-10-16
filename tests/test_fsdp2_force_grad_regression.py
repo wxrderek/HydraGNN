@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os
 import tempfile
 from importlib import import_module
@@ -8,6 +18,7 @@ import torch.distributed as dist
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
+from hydragnn.domain_losses import InteratomicPotentialDomainLoss
 from hydragnn.models.create import create_model
 from hydragnn.utils.distributed import get_distributed_model
 from hydragnn.utils.model.model import update_multibranch_heads
@@ -59,7 +70,7 @@ def _bf16_supported():
     "mpnn_type",
     ["EGNN", "DimeNet", "SchNet", "MACE", "PAINN", "PNAEq"],
 )
-def pytest_fsdp2_enhanced_wrapper_force_grad_regression(
+def test_fsdp2_enhanced_wrapper_force_grad_regression(
     monkeypatch, precision, mpnn_type
 ):
     has_cuda = torch.cuda.is_available()
@@ -114,16 +125,40 @@ def pytest_fsdp2_enhanced_wrapper_force_grad_regression(
                 task_weights=[1.0],
                 num_conv_layers=2,
                 num_nodes=16,
-                enable_interatomic_potential=True,
-                energy_weight=1.0,
-                energy_peratom_weight=1.0,
-                force_weight=1.0,
+                domain_loss_config={
+                    "enabled": True,
+                    "provider": "interatomic_potential",
+                    "supervised": {
+                        "default_metric": "mse",
+                        "terms": [
+                            {
+                                "variable": "energy",
+                                "weight": 1.0,
+                                "normalization": "per_structure",
+                            },
+                            {
+                                "variable": "energy_per_atom",
+                                "weight": 1.0,
+                                "normalization": "per_atom",
+                            },
+                            {
+                                "variable": "forces",
+                                "weight": 1.0,
+                                "prediction": {
+                                    "operator": "negative_gradient",
+                                    "of": "energy",
+                                    "with_respect_to": "positions",
+                                },
+                            },
+                        ],
+                    },
+                    "constraints": [],
+                    "constraint_optimizer": {"type": "fixed_penalty"},
+                },
                 use_gpu=True,
             )
 
-            assert (
-                model.__class__.__name__ == "EnhancedModelWrapper"
-            ), "Model must use HydraGNN EnhancedModelWrapper"
+            assert isinstance(model, InteratomicPotentialDomainLoss)
 
             model = get_distributed_model(model, verbosity=0)
 

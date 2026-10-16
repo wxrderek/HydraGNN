@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -55,7 +55,7 @@ class PNAEqStack(Base):
         *args,
         **kwargs,
     ):
-
+        self.equivariant_attn_adapter_type = "PNAEq"
         self.x_aggregators = ["mean", "min", "max", "std"]
         self.x_scalers = [
             "identity",
@@ -145,7 +145,9 @@ class PNAEqStack(Base):
             nn.Linear(output_dim, output_dim),
         )
         vec_embed_out = (
-            geom_nn.Linear(input_dim, output_dim) if not last_layer else None
+            geom_nn.Linear(input_dim, output_dim, bias=False)
+            if not last_layer
+            else None
         )
 
         if not last_layer:
@@ -193,6 +195,7 @@ class PNAEqStack(Base):
 
     def _embedding(self, data):
         super()._embedding(data)
+        node_features = self._input_node_features(data)
 
         assert (
             data.pos is not None
@@ -210,6 +213,9 @@ class PNAEqStack(Base):
             "edge_vec": norm_edge_vec,
         }
 
+        if self.global_attn_engine == "EquivariantTransformer":
+            conv_args.update(self._equivariant_attention_geometry(data))
+
         if self.use_edge_attr:
             assert (
                 data.edge_attr is not None
@@ -217,21 +223,27 @@ class PNAEqStack(Base):
             conv_args.update({"edge_attr": data.edge_attr})
 
         if self.use_global_attn:
-            # encode node positional embeddings
-            x = self.pos_emb(data.pe)
-            # if node features are available, genrate mebeddings, concatenate with positional embeddings and map to hidden dim
-            if self.input_dim:
-                x = torch.cat((self.node_emb(data.x.float()), x), 1)
-                x = self.node_lin(x)
-            # repeat for edge features and relative edge encodings
-            if self.is_edge_model:
+            if self.global_attn_engine == "EquivariantTransformer":
+                if not self.input_dim:
+                    raise ValueError(
+                        "EquivariantTransformer requires invariant node features"
+                    )
+                x = self.node_emb(node_features.float())
+            else:
+                # GPS combines learned node and positional encodings.
+                x = self.pos_emb(data.pe)
+                if self.input_dim:
+                    x = torch.cat((self.node_emb(node_features.float()), x), 1)
+                    x = self.node_lin(x)
+
+            if self.is_edge_model and self.global_attn_engine == "GPS":
                 e = self.rel_pos_emb(data.rel_pe)
                 if self.use_edge_attr:
                     e = torch.cat((self.edge_emb(conv_args["edge_attr"]), e), 1)
                     e = self.edge_lin(e)
                 conv_args.update({"edge_attr": e})
         else:
-            x = data.x
+            x = node_features
         # Instantiate tensor to hold equivariant traits
         v = torch.zeros(x.size(0), 3, x.size(1), device=x.device)
         return x, v, conv_args
@@ -426,8 +438,8 @@ class PainnUpdate(MessagePassing):
     def __init__(self, node_size: int, last_layer=False):
         super().__init__()
 
-        self.update_X = nn.Linear(node_size, node_size)
-        self.update_V = nn.Linear(node_size, node_size)
+        self.update_X = nn.Linear(node_size, node_size, bias=False)
+        self.update_V = nn.Linear(node_size, node_size, bias=False)
         self.last_layer = last_layer
 
         if not self.last_layer:

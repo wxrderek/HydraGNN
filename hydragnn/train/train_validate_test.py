@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2021, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -13,14 +13,26 @@ from tqdm import tqdm
 import numpy as np
 import torch
 
-from hydragnn.preprocess.serialized_dataset_loader import SerializedDataLoader
 from hydragnn.postprocess.postprocess import output_denormalize
 from hydragnn.postprocess.visualizer import Visualizer
 from hydragnn.utils.print.print_utils import print_distributed, iterate_tqdm
 from hydragnn.utils.profiling_and_tracing.time_utils import Timer
 from hydragnn.utils.profiling_and_tracing.profile import Profiler
-from hydragnn.utils.distributed import get_device, check_remaining
+from hydragnn.utils.distributed import (
+    get_device,
+    check_remaining,
+    synchronize_local_sgd_parameters,
+)
 from hydragnn.utils.model.model import Checkpoint, EarlyStopping
+from hydragnn.globalAtt.gps import redraw_performer_projections
+from hydragnn.utils.input_config_parsing.variable_schema import parse_variable_schema
+from hydragnn.loss_reporting import (
+    accumulate_loss_report,
+    configure_supervised_components,
+    finalize_loss_report,
+    format_loss_report,
+    reset_loss_report,
+)
 
 import os
 import logging
@@ -50,6 +62,16 @@ PRECISION_MAP = {
 }
 
 
+def _print_named_task_losses(verbosity, task_names, losses_by_split):
+    """Print each task loss with its name and a consistent split format."""
+    for task_index, task_name in enumerate(task_names):
+        fields = [
+            f"{split_name} Loss: {losses[task_index].item():.8f}"
+            for split_name, losses in losses_by_split.items()
+        ]
+        print_distributed(verbosity, f"{task_name} " + ", ".join(fields))
+
+
 def resolve_precision(precision: str):
     """Normalize precision string and return parameter/autocast dtypes."""
 
@@ -76,13 +98,26 @@ def move_batch_to_device(data, param_dtype):
     device = get_device()
 
     if isinstance(data, torch.Tensor):
-        data = data.to(dtype=param_dtype)
+        return data.to(device=device, dtype=param_dtype)
     else:
-        for key, value in data.items():
-            if isinstance(value, torch.Tensor) and torch.is_floating_point(value):
-                data[key] = value.to(dtype=param_dtype)
+        data = data.to(device)
+        if hasattr(data, "stores"):
+            for store in data.stores:
+                for key, value in store.items():
+                    if isinstance(value, torch.Tensor):
+                        value = value.to(device=device)
+                        if torch.is_floating_point(value):
+                            value = value.to(dtype=param_dtype)
+                        store[key] = value
+        else:
+            for key, value in data.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.to(device=device)
+                    if torch.is_floating_point(value):
+                        value = value.to(dtype=param_dtype)
+                    data[key] = value
 
-    return data.to(device)
+    return data
 
 
 def get_autocast_and_scaler(precision):
@@ -170,12 +205,48 @@ def _set_reshard_after_backward(model, enabled):
     return False
 
 
+def _verify_fsdp2_sharding(model, phase):
+    """Assert that FSDP2 parameters or gradients use sharded DTensors."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    tensors = []
+    unsharded = []
+    for name, parameter in model.named_parameters():
+        tensor = parameter if phase == "parameters" else parameter.grad
+        if tensor is None:
+            continue
+        tensors.append(tensor)
+        if not isinstance(tensor, DTensor) or not any(
+            isinstance(placement, Shard) for placement in tensor.placements
+        ):
+            unsharded.append(name)
+
+    if not tensors:
+        raise RuntimeError(f"FSDP2 sharding verification found no {phase}")
+    if unsharded:
+        names = ", ".join(unsharded[:5])
+        raise RuntimeError(
+            f"FSDP2 sharding verification found unsharded {phase}: {names}"
+        )
+
+    global_numel = sum(tensor.numel() for tensor in tensors)
+    local_numel = sum(tensor.to_local().numel() for tensor in tensors)
+    if dist.get_world_size() > 1 and local_numel >= global_numel:
+        raise RuntimeError(
+            f"FSDP2 {phase} were not partitioned: "
+            f"local_numel={local_numel}, global_numel={global_numel}"
+        )
+    if dist.get_rank() == 0:
+        print(
+            f"[fsdp2-sharding] phase={phase} tensors={len(tensors)} "
+            f"local_numel={local_numel} global_numel={global_numel} "
+            "placement=Shard(0)"
+        )
+
+
 def get_nbatch(loader):
-    ## calculate numbrer of batches for a given loader
-    m = len(loader.sampler)
-    nbatch = (m - 1) // loader.batch_size + 1
-    extra = -1 if m - nbatch * loader.batch_size > 0 and loader.drop_last else 0
-    nbatch = nbatch + extra
+    """Calculate the number of batches produced by a loader."""
+    nbatch = len(loader)
 
     if os.getenv("HYDRAGNN_MAX_NUM_BATCH") is not None:
         nbatch = min(nbatch, int(os.environ["HYDRAGNN_MAX_NUM_BATCH"]))
@@ -202,6 +273,8 @@ def train_validate_test(
     compute_grad_energy=False,
     precision="fp32",
 ):
+    variable_schema = parse_variable_schema(config["Variables"])
+    config = config["NeuralNetwork"]
     num_epoch = config["Training"]["num_epoch"]
     EarlyStop = (
         config["Training"]["EarlyStopping"]
@@ -222,26 +295,21 @@ def train_validate_test(
     )
 
     precision, _, _ = resolve_precision(precision)
+    configured_output_names = [spec.name for spec in variable_schema.outputs]
+    configure_supervised_components(model.module, variable_schema.outputs)
 
     device = get_device()
     if compute_grad_energy:
-        num_tasks = 3  # [energy, energy per atom, forces]
-        task_dims = [1, 1, 1]
-        task_weights = [
-            model.module.energy_weight,
-            model.module.energy_peratom_weight,
-            model.module.force_weight,
-        ]
-        output_names = [
-            config["Variables_of_interest"]["output_names"][0],
-            "energy_peratom",
-            "forces",
-        ]
+        num_tasks = len(model.module.task_names)
+        task_dims = [1] * num_tasks
+        task_weights = model.module.task_weights
+        output_names = list(model.module.task_names)
     else:
         num_tasks = model.module.num_heads
         task_dims = model.module.head_dims
         task_weights = model.module.loss_weights
-        output_names = config["Variables_of_interest"]["output_names"]
+        output_names = configured_output_names
+    task_names = output_names
 
     # total loss tracking for train/vali/test
     total_loss_train = torch.zeros(num_epoch, device=device)
@@ -312,6 +380,37 @@ def train_validate_test(
                 use_deepspeed=use_deepspeed,
             )
 
+    ## inference only
+    if int(os.getenv("HYDRAGNN_EVALONLY", "0")) == 1:
+        for loader, dataset_name in zip(
+            [train_loader, val_loader, test_loader], ["trainset", "valset", "testset"]
+        ):
+            loss, taskserr, true_values, predicted_values = test(
+                loader,
+                model,
+                verbosity,
+                num_tasks=num_tasks,
+                reduce_ranks=True,
+                return_samples=plot_hist_solution,
+                compute_grad_energy=compute_grad_energy,
+                precision=precision,
+            )
+            print_distributed(
+                verbosity,
+                f"Loss for {dataset_name}: {loss:.8f}",
+            )
+            _print_named_task_losses(verbosity, task_names, {dataset_name: taskserr})
+            print_distributed(
+                verbosity,
+                format_loss_report(
+                    -1,
+                    dataset_name.removesuffix("set"),
+                    loss,
+                    model.module.last_epoch_loss_report,
+                ),
+            )
+        return
+
     timer = Timer("train_validate_test")
     timer.start()
 
@@ -322,8 +421,13 @@ def train_validate_test(
         t0 = time.time()
         profiler.set_current_epoch(epoch)
         for dataloader in [train_loader, val_loader, test_loader]:
-            if getattr(dataloader.sampler, "set_epoch", None) is not None:
-                dataloader.sampler.set_epoch(epoch)
+            sampler = getattr(dataloader, "batch_sampler", None)
+            if getattr(sampler, "set_epoch", None) is not None:
+                sampler.set_epoch(epoch)
+            else:
+                sampler = dataloader.sampler
+                if getattr(sampler, "set_epoch", None) is not None:
+                    sampler.set_epoch(epoch)
 
         if getattr(model.module, "set_epoch", None) is not None:
             model.module.set_epoch(epoch)
@@ -342,11 +446,21 @@ def train_validate_test(
                 compute_grad_energy=compute_grad_energy,
                 precision=precision,
                 epoch=epoch,
+                performer_redraw_interval=config["Training"].get(
+                    "global_attn_redraw_interval", 1000
+                ),
             )
+            train_loss_report = dict(model.module.last_epoch_loss_report)
             tr.stop("train")
             tr.disable()
             if epoch == 0:
                 tr.reset()
+
+        # Validation, checkpoints, and the model returned after the final
+        # epoch must observe one globally consistent replica. Avoid a redundant
+        # collective when the last optimizer step already performed its
+        # scheduled post-local-SGD parameter average.
+        synchronize_local_sgd_parameters(optimizer)
 
         if int(os.getenv("HYDRAGNN_VALTEST", "1")) == 0:
             continue
@@ -365,6 +479,7 @@ def train_validate_test(
             compute_grad_energy=compute_grad_energy,
             precision=precision,
         )
+        val_loss_report = dict(model.module.last_epoch_loss_report)
         test_loss, test_taskserr, true_values, predicted_values = test(
             test_loader,
             model,
@@ -375,31 +490,38 @@ def train_validate_test(
             compute_grad_energy=compute_grad_energy,
             precision=precision,
         )
+        test_loss_report = dict(model.module.last_epoch_loss_report)
         scheduler.step(val_loss)
         if writer is not None:
             writer.add_scalar("train error", train_loss, epoch)
             writer.add_scalar("validate error", val_loss, epoch)
             writer.add_scalar("test error", test_loss, epoch)
-            for ivar in range(num_tasks):
+            for ivar, task_name in enumerate(task_names):
                 writer.add_scalar(
-                    "train error of task" + str(ivar), train_taskserr[ivar], epoch
+                    "train error of " + task_name, train_taskserr[ivar], epoch
                 )
         print_distributed(
             verbosity,
             f"Epoch: {epoch:02d}, Train Loss: {train_loss:.8f}, Val Loss: {val_loss:.8f}, "
             f"Test Loss: {test_loss:.8f}",
         )
-        print_distributed(
+        _print_named_task_losses(
             verbosity,
-            "Tasks Train Loss:",
-            [taskerr.item() for taskerr in train_taskserr],
+            task_names,
+            {
+                "Train": train_taskserr,
+                "Val": val_taskserr,
+                "Test": test_taskserr,
+            },
         )
-        print_distributed(
-            verbosity, "Tasks Val Loss:", [taskerr.item() for taskerr in val_taskserr]
-        )
-        print_distributed(
-            verbosity, "Tasks Test Loss:", [taskerr.item() for taskerr in test_taskserr]
-        )
+        for split, total, report in (
+            ("train", train_loss, train_loss_report),
+            ("validation", val_loss, val_loss_report),
+            ("test", test_loss, test_loss_report),
+        ):
+            print_distributed(
+                verbosity, format_loss_report(epoch, split, total, report)
+            )
 
         total_loss_train[epoch] = train_loss
         total_loss_val[epoch] = val_loss
@@ -465,14 +587,6 @@ def train_validate_test(
                 compute_grad_energy=compute_grad_energy,
                 num_tasks=num_tasks,
             )
-
-            ##output predictions with unit/not normalized
-            if config["Variables_of_interest"]["denormalize_output"]:
-                true_values, predicted_values = output_denormalize(
-                    config["Variables_of_interest"]["y_minmax"],
-                    true_values,
-                    predicted_values,
-                )
 
     _, rank = get_comm_size_and_rank()
     if create_plots and rank == 0:
@@ -629,9 +743,9 @@ def gather_tensor_ranks(head_values):
             start_idx = i * max_size
             end_idx = start_idx + size.item()
             if end_idx > start_idx:
-                head_values[
-                    size_all[:i].sum() : size_all[:i].sum() + size.item()
-                ] = tensor_list[start_idx:end_idx]
+                head_values[size_all[:i].sum() : size_all[:i].sum() + size.item()] = (
+                    tensor_list[start_idx:end_idx]
+                )
 
     return head_values
 
@@ -647,6 +761,7 @@ def train(
     compute_grad_energy=False,
     precision="fp32",
     epoch=None,
+    performer_redraw_interval=1000,
 ):
     if profiler is None:
         profiler = Profiler()
@@ -658,6 +773,7 @@ def train(
     tasks_error = torch.zeros(num_tasks, device=get_device())
     num_samples_local = 0
     model.train()
+    reset_loss_report(model.module)
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
     model_param_dtype = None
@@ -678,6 +794,13 @@ def train(
     )
     fsdp2_force_workaround = compute_grad_energy and _is_fsdp2_enabled()
     fsdp2_workaround_available = True
+    verify_fsdp2_sharding = bool(int(os.getenv("HYDRAGNN_VERIFY_FSDP2_SHARDING", "0")))
+    if verify_fsdp2_sharding:
+        if not _is_fsdp2_enabled():
+            raise ValueError(
+                "HYDRAGNN_VERIFY_FSDP2_SHARDING requires FSDP2 to be enabled"
+            )
+        _verify_fsdp2_sharding(model, "parameters")
 
     local_nbatch = get_nbatch(loader)
     nbatch = MPI.COMM_WORLD.allreduce(local_nbatch, op=MPI.MIN)
@@ -727,6 +850,10 @@ def train(
         tr.stop("get_head_indices")
         tr.start("forward", **syncopt)
         with record_function("forward"):
+            # Advance Performer redraw schedules once per training batch. Keep
+            # this outside model.forward(), which may be replayed by activation
+            # checkpointing and would otherwise advance the schedule twice.
+            redraw_performer_projections(model, performer_redraw_interval)
             if trace_level > 0:
                 tr.start("h2d", **syncopt)
             data = move_batch_to_device(data, param_dtype)
@@ -773,6 +900,8 @@ def train(
         with record_function("backward"):
             if fsdp2_force_workaround and fsdp2_workaround_available:
                 _set_reshard_after_backward(model, True)
+            if verify_fsdp2_sharding and ibatch == 0:
+                _verify_fsdp2_sharding(model, "gradients")
             if use_deepspeed:
                 model.backward(loss)
             else:
@@ -851,6 +980,7 @@ def train(
             num_samples_local += data.num_graphs
             for itask in range(len(tasks_loss)):
                 tasks_error[itask] += tasks_loss[itask] * data.num_graphs
+            accumulate_loss_report(model.module, data.num_graphs)
         if ibatch < (nbatch - 1):
             tr.start("dataload", **syncopt)
         if use_ddstore:
@@ -867,6 +997,7 @@ def train(
 
     train_error = reduce_values_ranks(train_error)
     tasks_error = reduce_values_ranks(tasks_error)
+    finalize_loss_report(model.module, get_device())
 
     return train_error, tasks_error
 
@@ -888,6 +1019,7 @@ def validate(
     tasks_error = torch.zeros(num_tasks, device=get_device())
     num_samples_local = 0
     model.eval()
+    reset_loss_report(model.module)
     use_ddstore = (
         hasattr(loader.dataset, "ddstore")
         and hasattr(loader.dataset.ddstore, "epoch_begin")
@@ -940,6 +1072,7 @@ def validate(
         num_samples_local += data.num_graphs
         for itask in range(len(tasks_loss)):
             tasks_error[itask] += tasks_loss[itask] * data.num_graphs
+        accumulate_loss_report(model.module, data.num_graphs)
         if use_ddstore:
             loader.dataset.ddstore.epoch_begin()
     if use_ddstore:
@@ -950,6 +1083,7 @@ def validate(
     if reduce_ranks:
         val_error = reduce_values_ranks(val_error)
         tasks_error = reduce_values_ranks(tasks_error)
+    finalize_loss_report(model.module, get_device())
     return val_error, tasks_error
 
 
@@ -967,16 +1101,18 @@ def test(
     precision, param_dtype, _ = resolve_precision(precision)
     autocast_context, scaler = get_autocast_and_scaler(precision)
 
-    if compute_grad_energy:
-        import torch_scatter
-
     if num_tasks is None:
-        num_tasks = 3 if compute_grad_energy else model.module.num_heads
+        num_tasks = (
+            len(model.module.task_names)
+            if compute_grad_energy
+            else model.module.num_heads
+        )
 
     total_error = torch.tensor(0.0, device=get_device())
     tasks_error = torch.zeros(num_tasks, device=get_device())
     num_samples_local = 0
     model.eval()
+    reset_loss_report(model.module)
     use_ddstore = (
         hasattr(loader.dataset, "ddstore")
         and hasattr(loader.dataset.ddstore, "epoch_begin")
@@ -1066,6 +1202,7 @@ def test(
         num_samples_local += data.num_graphs
         for itask in range(len(tasks_loss)):
             tasks_error[itask] += tasks_loss[itask] * data.num_graphs
+        accumulate_loss_report(model.module, data.num_graphs)
         if use_ddstore:
             loader.dataset.ddstore.epoch_begin()
     if use_ddstore:
@@ -1096,62 +1233,13 @@ def test(
                     data.pos.requires_grad = True
                     with autocast_context:
                         pred = model(data)
-                        # Support both node and graph heads; enforce sum pooling for graph heads
-                        if model.module.head_type[0] == "node":
-                            node_energy_pred = pred[0]
-                            graph_energy_pred = (
-                                torch_scatter.scatter_add(
-                                    node_energy_pred, data.batch, dim=0
-                                )
-                                .squeeze()
-                                .float()
-                            )
-                        elif model.module.head_type[0] == "graph":
-                            if getattr(
-                                model.module.model, "graph_pooling", "mean"
-                            ) not in ["add"]:
-                                raise ValueError(
-                                    "Graph head force loss requires sum pooling (graph_pooling='add')."
-                                )
-                            if isinstance(pred, dict) and "graph" in pred:
-                                graph_energy_pred = pred["graph"][0].squeeze().float()
-                            elif isinstance(pred, (list, tuple)):
-                                graph_energy_pred = pred[0].squeeze().float()
-                            else:
-                                graph_energy_pred = pred.squeeze().float()
-                        else:
-                            raise ValueError(
-                                "Force predictions are only supported for node or graph energy heads."
-                            )
-
-                        graph_energy_true = data.energy.squeeze().float()
-
-                        ncount = torch.bincount(data.batch)
-                        graph_energy_peratom_pred = graph_energy_pred / ncount
-                        graph_energy_peratom_true = graph_energy_true / ncount
-
-                        forces_true = data.forces.float()
-                        forces_pred = torch.autograd.grad(
-                            graph_energy_pred,
-                            data.pos,
-                            grad_outputs=torch.ones_like(graph_energy_pred),
-                            retain_graph=graph_energy_pred.requires_grad,
-                            create_graph=False,
-                        )[0].float()
-                        assert (
-                            forces_pred is not None
-                        ), "No gradients were found for data.pos. Does your model use positions for prediction?"
-                        forces_pred = -forces_pred
-                        forces_true = forces_true.flatten()
-                        forces_pred = forces_pred.flatten()
-                        true_values[0].append(graph_energy_true.reshape(-1, 1))
-                        true_values[1].append(graph_energy_peratom_true.reshape(-1, 1))
-                        true_values[2].append(forces_true.reshape(-1, 1))
-                        predicted_values[0].append(graph_energy_pred.reshape(-1, 1))
-                        predicted_values[1].append(
-                            graph_energy_peratom_pred.reshape(-1, 1)
+                        values = model.module.prediction_target_pairs(
+                            pred, data, create_graph=False
                         )
-                        predicted_values[2].append(forces_pred.reshape(-1, 1))
+                        for itask, name in enumerate(model.module.task_names):
+                            task_pred, task_true = values[name]
+                            true_values[itask].append(task_true.reshape(-1, 1))
+                            predicted_values[itask].append(task_pred.reshape(-1, 1))
             else:
                 head_index = get_head_indices(model, data)
                 ytrue = data.y
@@ -1180,5 +1268,7 @@ def test(
             for itask in range(num_tasks):
                 true_values[itask] = gather_tensor_ranks(true_values[itask])
                 predicted_values[itask] = gather_tensor_ranks(predicted_values[itask])
+
+    finalize_loss_report(model.module, get_device())
 
     return test_error, tasks_error, true_values, predicted_values

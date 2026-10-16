@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os, random, torch, glob, sys, shutil, pdb
 import numpy as np
 from fairchem.core.datasets import AseDBDataset
@@ -17,7 +27,6 @@ from hydragnn.preprocess.graph_samples_checks_and_updates import (
     gather_deg,
 )
 from hydragnn.utils.distributed import nsplit
-
 
 # transform_coordinates = Spherical(norm=False, cat=False)
 # transform_coordinates = LocalCartesian(norm=False, cat=False)
@@ -162,8 +171,6 @@ class OMol2025(AbstractBaseDataset):
                 cell = torch.eye(3, dtype=torch.float32)
                 pbc = torch.tensor([False, False, False], dtype=torch.bool)
 
-            x = torch.cat([atomic_numbers, pos, forces], dim=1)
-
             # Calculate chemical composition
             atomic_number_list = atomic_numbers.tolist()
             assert len(atomic_number_list) == natoms
@@ -174,8 +181,6 @@ class OMol2025(AbstractBaseDataset):
             # charge and spinfrom dataset info
             charge = atoms.info.get("charge", 0)
             spin = atoms.info.get("spin", 1)
-            graph_attr = torch.tensor([charge, spin], dtype=torch.float32)
-
             data_object = Data(
                 dataset_name="omol25",
                 natoms=natoms,
@@ -184,20 +189,13 @@ class OMol2025(AbstractBaseDataset):
                 pbc=pbc,
                 edge_index=None,
                 edge_attr=None,
-                atomic_numbers=atomic_numbers,
+                atomic_numbers=atomic_numbers.long().view(-1),
                 chemical_composition=chemical_composition,
                 smiles_string=None,
-                x=x,
                 energy=energy,
                 energy_per_atom=energy_per_atom,
                 forces=forces,
-                graph_attr=graph_attr,
             )
-
-            if self.energy_per_atom:
-                data_object.y = data_object.energy_per_atom
-            else:
-                data_object.y = data_object.energy
 
             if data_object.pbc.any():
                 try:
@@ -216,7 +214,7 @@ class OMol2025(AbstractBaseDataset):
 
                 # Skip samples that still contain self-loops
                 if should_skip_self_loops(data_object, context="omol25"):
-                    continue
+                    return
 
             # Default edge_shifts for when radius_graph_pbc is not activated
             if not hasattr(data_object, "edge_shifts"):

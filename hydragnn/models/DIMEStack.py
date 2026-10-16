@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -55,6 +55,7 @@ class DIMEStack(Base):
         max_neighbours: Optional[int] = None,
         **kwargs
     ):
+        self.equivariant_attn_adapter_type = "DimeNet"
         self.basis_emb_size = basis_emb_size
         self.int_emb_size = int_emb_size
         self.out_emb_size = out_emb_size
@@ -126,7 +127,7 @@ class DIMEStack(Base):
         )
 
         if self.use_edge_attr or (
-            self.use_global_attn and self.is_edge_model
+            self.global_attn_engine == "GPS" and self.is_edge_model
         ):  # check if gps is being used and mpnn can handle edge feats
             return Sequential(
                 self.input_args,
@@ -161,6 +162,7 @@ class DIMEStack(Base):
 
     def _embedding(self, data):
         super()._embedding(data)
+        node_features = self._input_node_features(data)
 
         assert (
             data.pos is not None
@@ -199,6 +201,9 @@ class DIMEStack(Base):
             "num_nodes": data.x.size(0),
         }
 
+        if self.global_attn_engine == "EquivariantTransformer":
+            conv_args.update(self._equivariant_attention_geometry(data))
+
         if self.use_edge_attr:
             assert (
                 data.edge_attr is not None
@@ -206,11 +211,21 @@ class DIMEStack(Base):
             conv_args.update({"edge_attr": data.edge_attr})
 
         if self.use_global_attn:
-            x = self.pos_emb(data.pe)
-            if self.input_dim:
-                x = torch.cat((self.node_emb(data.x.float()), x), 1)
-                x = self.node_lin(x)
-            if self.is_edge_model:
+            if self.global_attn_engine == "EquivariantTransformer":
+                if not self.input_dim:
+                    raise ValueError(
+                        "EquivariantTransformer requires invariant node features"
+                    )
+                node_features = node_features.to(self.node_emb.weight.dtype)
+                x = self.node_emb(node_features)
+            else:
+                x = self.pos_emb(data.pe)
+                if self.input_dim:
+                    node_features = node_features.to(self.node_emb.weight.dtype)
+                    x = torch.cat((self.node_emb(node_features), x), 1)
+                    x = self.node_lin(x)
+
+            if self.is_edge_model and self.global_attn_engine == "GPS":
                 e = self.rel_pos_emb(data.rel_pe)
                 if self.use_edge_attr:
                     e = torch.cat((self.edge_emb(conv_args["edge_attr"]), e), 1)
@@ -218,7 +233,7 @@ class DIMEStack(Base):
                 conv_args.update({"edge_attr": e})
             return x, data.pos, conv_args
         else:
-            return data.x, data.pos, conv_args
+            return node_features, data.pos, conv_args
 
 
 """

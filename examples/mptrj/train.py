@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os, json
 import logging
 import sys
@@ -28,6 +38,7 @@ from hydragnn.utils.datasets.pickledataset import (
     SimplePickleWriter,
     SimplePickleDataset,
 )
+from hydragnn.utils.materials import normalize_stress, validate_materials_sample
 from hydragnn.preprocess.graph_samples_checks_and_updates import gather_deg
 from hydragnn.preprocess.graph_samples_checks_and_updates import (
     RadiusGraph,
@@ -71,7 +82,6 @@ transform_coordinates_pbc = PBCDistance(norm=False, cat=False)
 # charge and spin are constant across MPTrj dataset
 charge = 0.0  # neutral
 spin = 1.0  # singlet
-graph_attr = torch.tensor([charge, spin], dtype=torch.float32)
 
 
 class MPTrjDataset(AbstractBaseDataset):
@@ -187,8 +197,11 @@ class MPTrjDataset(AbstractBaseDataset):
                 energy = torch.tensor(total_energy, dtype=torch.float32).unsqueeze(0)
                 energy_per_atom = energy.detach().clone() / natoms
                 forces = torch.tensor(forces, dtype=torch.float32)
-                x = torch.cat([atomic_numbers, pos, forces], dim=1)
-
+                stress = normalize_stress(
+                    stresses,
+                    source_unit="kbar",
+                    source_sign="compression_positive",
+                )
                 # Calculate chemical composition
                 atomic_number_list = atomic_numbers.tolist()
                 assert len(atomic_number_list) == natoms
@@ -205,22 +218,15 @@ class MPTrjDataset(AbstractBaseDataset):
                     pbc=pbc,
                     edge_index=None,
                     edge_attr=None,
-                    atomic_numbers=atomic_numbers,  # Reshaping atomic_numbers to Nx1 tensor
+                    atomic_numbers=atomic_numbers.long().view(-1),
                     chemical_composition=chemical_composition,
                     smiles_string=None,
-                    x=x,
                     energy=energy,
                     energy_per_atom=energy_per_atom,
-                    # stress=torch.tensor(stresses, dtype=torch.float32),
+                    stress=stress,
                     # magmom=torch.tensor(magmom, dtype=torch.float32),
                     forces=forces,
-                    graph_attr=graph_attr,
                 )
-
-                if self.energy_per_atom:
-                    data_object.y = data_object.energy_per_atom
-                else:
-                    data_object.y = data_object.energy
 
                 if data_object.pbc.any():
                     try:
@@ -237,15 +243,11 @@ class MPTrjDataset(AbstractBaseDataset):
                     data_object = self.radius_graph(data_object)
                     data_object = transform_coordinates(data_object)
 
-                # Skip samples that still contain self-loops
-                if data_object.edge_index is not None:
-                    loop_mask = data_object.edge_index[0] != data_object.edge_index[1]
-                    if not torch.all(loop_mask):
-                        print(
-                            "Skipping sample: self-loops detected in edge_index.",
-                            flush=True,
-                        )
-                        continue
+                try:
+                    validate_materials_sample(data_object, require_stress=True)
+                except ValueError as error:
+                    print(f"Skipping sample: {error}", flush=True)
+                    continue
 
                 # Default edge_shifts for when radius_graph_pbc is not activated
                 if not hasattr(data_object, "edge_shifts"):
@@ -312,9 +314,6 @@ if __name__ == "__main__":
     parser.add_argument("--everyone", action="store_true", help="gptimer")
     parser.add_argument("--modelname", help="model name")
     parser.add_argument(
-        "--compute_grad_energy", type=bool, help="compute_grad_energy", default=False
-    )
-    parser.add_argument(
         "--precision",
         type=str,
         choices=["fp32", "fp64", "bf16"],
@@ -357,11 +356,7 @@ if __name__ == "__main__":
     with open(input_filename, "r") as f:
         config = json.load(f)
     verbosity = config["Verbosity"]["level"]
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+    var_config = config["Variables"]
 
     # Transformation to create positional and structural laplacian encoders
     """
@@ -527,7 +522,11 @@ if __name__ == "__main__":
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
 
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+    ) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
 
@@ -556,7 +555,7 @@ if __name__ == "__main__":
     )
 
     model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
+        model, optimizer, verbosity, config=config
     )
 
     # Print details of neural network architecture
@@ -576,13 +575,11 @@ if __name__ == "__main__":
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         create_plots=False,
-        compute_grad_energy=config["NeuralNetwork"]["Architecture"].get(
-            "enable_interatomic_potential", False
-        ),
+        compute_grad_energy=hydragnn.domain_losses.uses_interatomic_potential(config),
         precision=precision,
     )
 

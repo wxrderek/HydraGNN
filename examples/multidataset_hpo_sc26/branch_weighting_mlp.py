@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 """Train a composition-conditioned MLP to weight branch predictions.
 
 This script loads a pretrained multi-branch HydraGNN model, computes per-branch
@@ -528,7 +538,7 @@ def main():
         config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
 
     configure_variable_names(config)
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
+    var_config = config["Variables"]
 
     hydragnn.utils.distributed.setup_ddp()
 
@@ -588,15 +598,24 @@ def main():
     )
     loss_fn = F.mse_loss
 
+    loss_terms = {
+        term["variable"]: term
+        for term in config["NeuralNetwork"]["Training"]["loss"]["supervised"]["terms"]
+    }
+    energy_term = loss_terms.get("energy") or loss_terms.get("energy_per_atom")
+    if energy_term is None:
+        raise ValueError(
+            "Branch weighting requires an energy or energy_per_atom loss term."
+        )
     energy_weight = (
         args.energy_weight
         if args.energy_weight is not None
-        else config["NeuralNetwork"]["Architecture"].get("energy_weight", 1.0)
+        else energy_term.get("weight", 1.0)
     )
     force_weight = (
         args.force_weight
         if args.force_weight is not None
-        else config["NeuralNetwork"]["Architecture"].get("force_weight", 1.0)
+        else loss_terms["forces"].get("weight", 1.0)
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

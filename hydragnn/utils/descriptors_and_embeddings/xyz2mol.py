@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 """
 Module for generating rdkit molobj/smiles/molecular graph from free atoms
 
@@ -827,9 +837,9 @@ def xyz2AC_huckel(atomicNumList, xyz, charge):
     passed, result = rdEHTTools.RunMol(mol_huckel)
     opop = result.GetReducedOverlapPopulationMatrix()
     tri = np.zeros((num_atoms, num_atoms))
-    tri[
-        np.tril(np.ones((num_atoms, num_atoms), dtype=bool))
-    ] = opop  # lower triangular to square matrix
+    tri[np.tril(np.ones((num_atoms, num_atoms), dtype=bool))] = (
+        opop  # lower triangular to square matrix
+    )
     for i in range(num_atoms):
         for j in range(i + 1, num_atoms):
             pair_pop = abs(tri[j, i])

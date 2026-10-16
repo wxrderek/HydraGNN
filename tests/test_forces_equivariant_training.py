@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -21,10 +21,10 @@ import subprocess
 
 @pytest.mark.parametrize("example", ["LennardJones"])
 @pytest.mark.parametrize(
-    "mpnn_type", ["SchNet", "EGNN", "DimeNet", "PAINN", "PNAPlus", "MACE"]
+    "mpnn_type", ["SchNet", "EGNN", "DimeNet", "PAINN", "PNAPlus", "MACE", "UMA"]
 )
 @pytest.mark.mpi_skip()
-def pytest_examples(example, mpnn_type):
+def test_examples(example, mpnn_type):
     path = os.path.join(os.path.dirname(__file__), "..", "examples", example)
     file_path = os.path.join(path, example + ".py")  # Assuming different model scripts
     python_exec = sys.executable
@@ -54,10 +54,13 @@ def pytest_examples(example, mpnn_type):
         ("DimeNet", "graph", None, "add"),
         ("PAINN", "graph", None, "add"),
         ("MACE", "graph", None, "add"),
+        # UMA is a graph-level model; its energy = sum of L=0 (invariant)
+        # node features, and forces come from autograd of that energy.
+        ("UMA", "graph", None, "add"),
     ],
 )
 @pytest.mark.mpi_skip()
-def pytest_equivariant_heads(example, mpnn_type, head_level, head_type, graph_pooling):
+def test_equivariant_heads(example, mpnn_type, head_level, head_type, graph_pooling):
     """Test equivariant models with different head placements (node vs graph) and pooling choices."""
     path = os.path.join(os.path.dirname(__file__), "..", "examples", example)
     file_path = os.path.join(path, example + ".py")
@@ -86,10 +89,9 @@ def pytest_equivariant_heads(example, mpnn_type, head_level, head_type, graph_po
             }
         }
         config["NeuralNetwork"]["Architecture"]["task_weights"] = [1]
-        var_cfg = config["NeuralNetwork"]["Variables_of_interest"]
-        var_cfg["type"] = ["graph"]
-        var_cfg["output_dim"] = [1]
-        var_cfg["output_index"] = [0]
+        config["Variables"]["outputs"] = [
+            {"name": "energy", "level": "graph", "dim": 1}
+        ]
 
     # Create temporary config file
     temp_dir = tempfile.mkdtemp()
@@ -126,7 +128,7 @@ def pytest_equivariant_heads(example, mpnn_type, head_level, head_type, graph_po
     ],
 )
 @pytest.mark.mpi_skip()
-def pytest_expanded_x_features(example, mpnn_type, head_type):
+def test_expanded_x_features(example, mpnn_type, head_type):
     """Test that MLP heads work correctly with expanded x features (including equiv_norm)."""
     path = os.path.join(os.path.dirname(__file__), "..", "examples", example)
     file_path = os.path.join(path, example + ".py")

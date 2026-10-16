@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 """Inference on randomly generated atomistic structures using a trained HydraGNN model.
 
 Generates random structures with variable numbers of atoms, atom types, and
@@ -38,7 +48,6 @@ from hydragnn.train.train_validate_test import (
     get_autocast_and_scaler,
 )
 from hydragnn.utils.distributed import get_device
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,6 +98,7 @@ def build_random_structure(
 
     data = Data(
         x=x,
+        atomic_numbers=torch.tensor(atomic_numbers, dtype=torch.long),
         pos=pos,
         chemical_composition=chemical_composition,
         graph_attr=graph_attr,
@@ -350,7 +360,7 @@ def main():
     arch = config["NeuralNetwork"]["Architecture"]
     radius = arch.get("radius", 5.0)
     max_neighbours = arch.get("max_neighbours", 20)
-    enable_ip = arch.get("enable_interatomic_potential", False)
+    enable_ip = hydragnn.domain_losses.uses_interatomic_potential(config)
 
     structures = generate_structures(
         args.num_structures,

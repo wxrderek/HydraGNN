@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2021, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -24,7 +24,6 @@ import numpy as np
 import os
 from typing import Tuple
 
-from .dataset_descriptors import AtomFeatures
 from hydragnn.utils.distributed import get_device
 
 import vesin
@@ -599,135 +598,3 @@ def gather_deg_mpi(dataset):
         deg += torch.bincount(d, minlength=deg.numel())
     deg = MPI.COMM_WORLD.allreduce(deg.numpy(), op=MPI.SUM)
     return deg
-
-
-def update_predicted_values(
-    type: list, index: list, graph_feature_dim: list, node_feature_dim: list, data: Data
-):
-    """Updates values of the structure we want to predict. Predicted value is represented by integer value.
-    Parameters
-    ----------
-    type: "graph" level or "node" level
-    index: index/location in data.y for graph level and in data.x for node level
-    graph_feature_dim: list of integers to trak the dimension of each graph level feature
-    data: Data
-        A Data object representing a structure that has atoms.
-    """
-    output_feature = []
-    output_mask = []
-    output_test_mask = []
-    raw_y_mask = getattr(data, 'y_mask', None)
-    raw_y_mask_loc = getattr(data, 'y_mask_loc', None)
-    raw_y_test_mask = getattr(data, 'y_test_mask', None)
-    raw_y_test_mask_loc = getattr(data, 'y_test_mask_loc', None)
-    compact_y_mask = raw_y_mask is not None and raw_y_mask.numel() != data.y.numel()
-    compact_y_test_mask = raw_y_test_mask is not None and raw_y_test_mask.numel() != data.y.numel()
-    if compact_y_mask and raw_y_mask_loc is None:
-        if len(type) != 1 or type[0] != "graph":
-            raise ValueError("Compact graph-level y_mask requires y_mask_loc for multi-head outputs")
-        raw_y_mask_loc = torch.tensor(
-            [[0, raw_y_mask.numel()]], dtype=torch.int64, device=data.x.device
-        )
-    if compact_y_test_mask and raw_y_test_mask_loc is None:
-        if len(type) != 1 or type[0] != "graph":
-            raise ValueError("Compact graph-level y_test_mask requires y_test_mask_loc for multi-head outputs")
-        raw_y_test_mask_loc = torch.tensor(
-            [[0, raw_y_test_mask.numel()]], dtype=torch.int64, device=data.x.device
-        )
-    if raw_y_mask_loc is not None:
-        raw_y_mask_loc = raw_y_mask_loc.to(device=data.x.device, dtype=torch.int64).reshape(1, -1)
-    if raw_y_test_mask_loc is not None:
-        raw_y_test_mask_loc = raw_y_test_mask_loc.to(device=data.x.device, dtype=torch.int64).reshape(1, -1)
-    data.y_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
-    data.y_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
-    data.y_test_mask_loc = torch.zeros(1, len(type) + 1, dtype=torch.int64, device=data.x.device)
-    for item in range(len(type)):
-        if type[item] == "graph":
-            index_counter_global_y = sum(graph_feature_dim[: index[item]])
-
-            feat_ = torch.reshape(
-                data.y[
-                    index_counter_global_y : index_counter_global_y
-                    + graph_feature_dim[index[item]]
-                ],
-                (graph_feature_dim[index[item]], 1),
-            )
-            
-            # process mask as needed
-            if raw_y_mask is not None:
-                if compact_y_mask:
-                    mask_start = int(raw_y_mask_loc[0, item].item())
-                    mask_end = int(raw_y_mask_loc[0, item + 1].item())
-                    # compact graph mask has shape (n_mask_entries, 1), with n_mask_entries <= graph_feature_dim
-                    mask_ = torch.reshape(raw_y_mask.reshape(-1)[mask_start:mask_end], (-1, 1))
-                else:
-                    mask_ = torch.reshape(
-                        raw_y_mask[
-                            index_counter_global_y : index_counter_global_y
-                            + graph_feature_dim[index[item]]
-                        ],
-                        (graph_feature_dim[index[item]], 1),
-                    )
-            
-                output_mask.append(mask_)
-                data.y_mask_loc[0, item + 1] = data.y_mask_loc[0, item] + mask_.shape[0] * mask_.shape[1]
-            
-            # process test mask as needed
-            if raw_y_test_mask is not None:
-                if compact_y_test_mask:
-                    test_mask_start = int(raw_y_test_mask_loc[0, item].item())
-                    test_mask_end = int(raw_y_test_mask_loc[0, item + 1].item())
-                    # compact graph test mask has shape (n_mask_entries, 1)
-                    test_mask_ = torch.reshape(raw_y_test_mask.reshape(-1)[test_mask_start:test_mask_end], (-1, 1))
-                else:
-                    test_mask_ = torch.reshape(
-                        raw_y_test_mask[
-                            index_counter_global_y : index_counter_global_y
-                            + graph_feature_dim[index[item]]
-                        ],
-                        (graph_feature_dim[index[item]], 1),
-                    )
-            
-                output_test_mask.append(test_mask_)
-                data.y_test_mask_loc[0, item + 1] = data.y_test_mask_loc[0, item] + test_mask_.shape[0] * test_mask_.shape[1]
-
-            # after the global features are spanned, we need to iterate over the nodal features
-            # to do so, the counter of the nodal features need to start from the last value of counter for the graph nodel feature
-        elif type[item] == "node":
-            if compact_y_mask or compact_y_test_mask:
-                raise ValueError("Compact masks are supported only for graph-level outputs")
-            index_counter_nodal_y = sum(node_feature_dim[: index[item]])
-            feat_ = torch.reshape(
-                data.x[
-                    :,
-                    index_counter_nodal_y : (
-                        index_counter_nodal_y + node_feature_dim[index[item]]
-                    ),
-                ],
-                (-1, 1),
-            )
-        else:
-            raise ValueError("Unknown output type", type[item])
-        output_feature.append(feat_)
-        data.y_loc[0, item + 1] = data.y_loc[0, item] + feat_.shape[0] * feat_.shape[1]
-    
-    if raw_y_mask is not None: 
-        data.y_mask = torch.cat(output_mask, 0)
-    if raw_y_test_mask is not None: 
-        data.y_test_mask = torch.cat(output_test_mask, 0)
-    
-    data.y = torch.cat(output_feature, 0)
-
-
-def update_atom_features(atom_features: [AtomFeatures], data: Data):
-    """Updates atom features of a structure. An atom is represented with x,y,z coordinates and associated features.
-
-    Parameters
-    ----------
-    atom_features: [AtomFeatures]
-        List of features to update. Each feature is instance of Enum AtomFeatures.
-    data: Data
-        A Data object representing a structure that has atoms.
-    """
-    feature_indices = [i for i in atom_features]
-    data.x = data.x[:, feature_indices]

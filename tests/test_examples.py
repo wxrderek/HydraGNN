@@ -10,9 +10,12 @@
 ##############################################################################
 
 import os
+import sys
 import pytest
 import pdb
 import subprocess
+
+from tests.md17_fixture import create_md17_raw_fixture
 
 
 @pytest.mark.parametrize(
@@ -38,13 +41,21 @@ import subprocess
 )
 @pytest.mark.parametrize("example", ["qm9", "md17"])
 @pytest.mark.mpi_skip()
-def pytest_examples_energy(example, mpnn_type, global_attn_engine, global_attn_type):
+def test_examples_energy(
+    tmp_path, example, mpnn_type, global_attn_engine, global_attn_type
+):
     path = os.path.join(os.path.dirname(__file__), "..", "examples", example)
     file_path = os.path.join(path, example + ".py")
     # Add the --mpnn_type argument for the subprocess call
+    env = os.environ.copy()
+    if example == "md17":
+        cache_root = tmp_path / "md17"
+        create_md17_raw_fixture(cache_root)
+        env["HYDRAGNN_MD17_ROOT"] = str(cache_root)
+
     return_code = subprocess.call(
         [
-            "python",
+            sys.executable,
             file_path,
             "--mpnn_type",
             mpnn_type,
@@ -52,7 +63,8 @@ def pytest_examples_energy(example, mpnn_type, global_attn_engine, global_attn_t
             global_attn_engine,
             "--global_attn_type",
             global_attn_type,
-        ]
+        ],
+        env=env,
     )
 
     # Check the file ran without error.
@@ -76,12 +88,12 @@ def pytest_examples_energy(example, mpnn_type, global_attn_engine, global_attn_t
 )
 @pytest.mark.parametrize("example", ["LennardJones"])
 @pytest.mark.mpi_skip()
-def pytest_examples_grad_forces(example, mpnn_type):
+def test_examples_grad_forces(example, mpnn_type):
     path = os.path.join(os.path.dirname(__file__), "..", "examples", example)
     file_path = os.path.join(path, example + ".py")
 
     # Add the --mpnn_type argument for the subprocess call
-    return_code = subprocess.call(["python", file_path, "--mpnn_type", mpnn_type])
+    return_code = subprocess.call([sys.executable, file_path, "--mpnn_type", mpnn_type])
 
     # Check the file ran without error.
     assert return_code == 0

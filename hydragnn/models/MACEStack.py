@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2025, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -72,6 +72,10 @@ import math
 
 @compile_mode("script")
 class MACEStack(Base):
+    # MACE performs its own staged readouts and does not use Base's pooled
+    # graph-conditioning path.
+    supports_graph_pool_conditioning = False
+
     def __init__(
         self,
         input_args,
@@ -113,6 +117,7 @@ class MACEStack(Base):
         ## Passed
         self.max_ell = max_ell
         self.node_max_ell = node_max_ell
+        self.equivariant_attn_adapter_type = "MACE"
         num_interactions = kwargs["num_conv_layers"]
         self.edge_dim = edge_dim
         self.avg_num_neighbors = avg_num_neighbors
@@ -227,15 +232,16 @@ class MACEStack(Base):
         )
 
         # First Conv and Decoder
+        first_conv = self.get_conv(
+            self.hidden_dim,
+            self.hidden_dim,
+            first_layer=True,
+            last_layer=last_layer,
+        )  # Node features are already converted to hidden_dim via one-hot embedding
         self.graph_convs.append(
-            self._apply_global_attn(
-                self.get_conv(
-                    self.hidden_dim,
-                    self.hidden_dim,
-                    first_layer=True,
-                    last_layer=last_layer,
-                )  # Node features are already converted to hidden_dim via one-hot embedding
-            )
+            first_conv
+            if last_layer and self.global_attn_engine == "EquivariantTransformer"
+            else self._apply_global_attn(first_conv, irreps=str(hidden_irreps))
         )
         irreps = hidden_irreps if not last_layer else final_hidden_irreps
         self.multihead_decoders.append(
@@ -255,12 +261,13 @@ class MACEStack(Base):
         # Variable number of convolutions and decoders
         for i in range(self.num_conv_layers - 1):
             last_layer = i == self.num_conv_layers - 2
+            conv = self.get_conv(
+                self.hidden_dim, self.hidden_dim, last_layer=last_layer
+            )
             self.graph_convs.append(
-                self._apply_global_attn(
-                    self.get_conv(
-                        self.hidden_dim, self.hidden_dim, last_layer=last_layer
-                    )
-                )
+                conv
+                if last_layer and self.global_attn_engine == "EquivariantTransformer"
+                else self._apply_global_attn(conv, irreps=str(hidden_irreps))
             )
             irreps = hidden_irreps if not last_layer else final_hidden_irreps
             self.multihead_decoders.append(
@@ -450,7 +457,15 @@ class MACEStack(Base):
         # Create node_attrs from atomic numbers. Later on it may contain more information
         ## Node attrs are intrinsic properties of the atoms. Currently, MACE only supports atomic number node attributes
         ## data.node_attrs is already used in another place, so has been renamed to data.node_attributes from MACE and same with other data variable names
-        data.node_attributes = process_node_attributes(data["x"], self.num_elements).to(
+        if self.atomistic_mode_enabled:
+            species = self._atomic_numbers(data)
+        else:
+            species = (
+                data.atomic_numbers
+                if hasattr(data, "atomic_numbers") and data.atomic_numbers is not None
+                else data["x"]
+            )
+        data.node_attributes = process_node_attributes(species, self.num_elements).to(
             device=param_device, dtype=param_dtype
         )
 
@@ -475,14 +490,22 @@ class MACEStack(Base):
             "edge_index": data.edge_index,
         }
 
+        if self.global_attn_engine == "EquivariantTransformer":
+            conv_args.update(self._equivariant_attention_geometry(data))
+
         if self.use_global_attn:
-            # encode node positional embeddings
+            if self.global_attn_engine == "EquivariantTransformer":
+                return (
+                    data.node_features[:, : self.hidden_dim],
+                    data.node_features[:, self.hidden_dim :],
+                    conv_args,
+                )
+
+            # GPS combines learned node and positional encodings.
             x = self.pos_emb(data.pe)
-            # if node features are available, genrate mebeddings, concatenate with positional embeddings and map to hidden dim
             if self.input_dim:
                 x = torch.cat((data.node_features, x), 1)
                 x = self.node_lin(x)
-            # repeat for edge features and relative edge encodings
             if self.is_edge_model:
                 e = self.rel_pos_emb(data.rel_pe)
                 if self.use_edge_attr:

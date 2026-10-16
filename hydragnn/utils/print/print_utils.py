@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2021, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -15,7 +15,6 @@ import torch.distributed as dist
 
 import logging
 import os
-
 
 """
 Verbosity options for printing

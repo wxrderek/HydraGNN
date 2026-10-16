@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2021, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -15,7 +15,6 @@ import numpy as np
 
 import torch
 import torch.distributed as dist
-from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.utils import degree
 from hydragnn.utils.print.print_utils import print_master, iterate_tqdm
 
@@ -31,6 +30,8 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 def activation_function_selection(activation_function_string: str):
     if activation_function_string == "relu":
         return torch.nn.ReLU()
+    elif activation_function_string == "silu":
+        return torch.nn.SiLU()
     elif activation_function_string == "selu":
         return torch.nn.SELU()
     elif activation_function_string == "prelu":
@@ -53,11 +54,13 @@ def loss_function_selection(loss_function_string: str):
     elif loss_function_string == "mae":
         return torch.nn.functional.l1_loss
     elif loss_function_string == "smooth_l1":
-        return torch.nn.functional.smooth_l1_loss
+        return torch.nn.SmoothL1Loss()
     elif loss_function_string == "rmse":
         return lambda x, y: torch.sqrt(torch.nn.functional.mse_loss(x, y))
     elif loss_function_string == "GaussianNLLLoss":
         return torch.nn.GaussianNLLLoss()
+    elif loss_function_string == "binary_cross_entropy":
+        return torch.nn.functional.binary_cross_entropy_with_logits
     else:
         raise ImportError()
 
@@ -220,6 +223,8 @@ def get_summary_writer(name, path="./logs/"):
     _, world_rank = get_comm_size_and_rank()
     writer = None
     if world_rank == 0:
+        from torch.utils.tensorboard import SummaryWriter
+
         path_name = os.path.join(path, name)
         writer = SummaryWriter(path_name)
     return writer
@@ -275,6 +280,14 @@ def load_existing_model(
                 concat_cond_key = key
             if key.endswith("graph_pool_projector.0.weight"):
                 pool_cond_key = key
+        supports_pool_conditioning = "graph" in getattr(
+            target_model, "head_type", ()
+        ) and getattr(target_model, "supports_graph_pool_conditioning", True)
+        if pool_cond_key and not supports_pool_conditioning:
+            raise ValueError(
+                "Checkpoint contains pooled graph-conditioning parameters, but the "
+                f"{target_model.__class__.__name__} output path has no supported graph head"
+            )
         if graph_cond_key and hasattr(target_model, "_ensure_graph_conditioner"):
             if getattr(target_model, "graph_conditioner", None) is None:
                 graph_attr_dim = state_dict[graph_cond_key].shape[1]
@@ -306,6 +319,23 @@ def load_existing_model(
                     graph_attr_dim=graph_attr_dim,
                     channel_dim=channel_dim,
                     device=target_model.device,
+                )
+
+        # Ensure per-edge-type projectors (e.g. HeteroHEATStack.edge_lin_dict)
+        # exist before strict load: they are created lazily on first forward
+        # pass, so a freshly constructed model won't have these keys yet.
+        if hasattr(target_model, "_ensure_edge_projector"):
+            edge_lin_marker = "edge_lin_dict."
+            for key, tensor in state_dict.items():
+                if edge_lin_marker not in key or not key.endswith(".weight"):
+                    continue
+                edge_type_key = key.split(edge_lin_marker, 1)[1][: -len(".weight")]
+                existing = getattr(target_model, "edge_lin_dict", None)
+                if existing is not None and edge_type_key in existing:
+                    continue
+                edge_attr_dim = tensor.shape[1]
+                target_model._ensure_edge_projector(
+                    edge_type_key, edge_attr_dim, target_model.device
                 )
 
         ## Load with FSDP

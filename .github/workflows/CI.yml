@@ -11,15 +11,31 @@ on:
 
 jobs:
   build:
-
+    name: ${{ matrix.suite }} (${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.10", "3.11", "3.12"]
+        include:
+          - suite: serial
+            python: "3.11"
+          - suite: serial
+            python: "3.12"
+          - suite: serial
+            python: "3.13"
+          - suite: serial
+            python: "3.14"
+          - suite: mpi
+            python: "3.11"
+          - suite: mpi
+            python: "3.12"
+          - suite: mpi
+            python: "3.13"
+          - suite: mpi
+            python: "3.14"
 
     steps:
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Checkout GCNN
@@ -33,35 +49,62 @@ jobs:
         uses: actions/cache@v4
         id: cache
         with:
-          path: ${{ env.pythonLocation }}
-          key: ${{ env.pythonLocation }}-${{ hashFiles('requirements-base.txt') }}-${{ hashFiles('requirements-dev.txt') }}-${{ hashFiles('requirements-torch.txt') }}-${{ hashFiles('requirements-pyg.txt') }}-${{ hashFiles('requirements-deepspeed.txt') }}
+          path: ~/.cache/pip
+          key: ${{ env.pythonLocation }}-${{ hashFiles('requirements-base.txt') }}-${{ hashFiles('requirements-dev.txt') }}-${{ hashFiles('requirements-specific-models.txt') }}-${{ hashFiles('requirements-torch.txt') }}-${{ hashFiles('requirements-pyg.txt') }}-${{ hashFiles('requirements-deepspeed.txt') }}
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --no-build-isolation -v --upgrade -r requirements-base.txt -r requirements-dev.txt
-          python -m pip install --no-build-isolation -v --upgrade -r requirements-torch.txt --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
-          python -m pip install --no-build-isolation -v --upgrade -r requirements-pyg.txt --find-links https://data.pyg.org/whl/torch-2.8.0+cpu.html
-          python -m pip install --no-build-isolation -v --upgrade -r requirements-deepspeed.txt || echo "DeepSpeed installation failed, continuing without it"
+          python -m pip install --upgrade pip setuptools wheel meson-python ninja cython
+          python -m pip install numpy==2.4.6
+          # Install HydraGNN's pinned PyTorch (from requirements-torch.txt)
+          # before fairchem-core (pulled in by requirements-dev.txt) so
+          # dependency resolution cannot select a different torch build for
+          # the native parity tests.
+          python -m pip install --upgrade --no-build-isolation -v \
+            -r requirements-torch.txt \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+          python -m pip install --upgrade --no-build-isolation -v -r requirements-base.txt -r requirements-dev.txt
+          # Model-specific backbone deps (e.g. FAIRChem UMA). Installed WITH
+          # build isolation so omegaconf's sdist-only antlr4-python3-runtime
+          # dependency can build its own backend -- see the file header.
+          python -m pip install -v --upgrade -r requirements-specific-models.txt
+          # pyg-lib is not published on PyPI. Build the 0.8.0 release from its
+          # pinned commit so CI does not depend on the data.pyg.org wheel host.
+          python -m pip install --no-build-isolation -v "pyg_lib @ git+https://github.com/pyg-team/pyg-lib.git@26a2d1a06a4714da9bb804c19049afb4796971d7"
+          # Derive the find-links wheel URL from the torch actually installed
+          # above so it can never drift from requirements-torch.txt.
+          TORCH_VERSION="$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+          python -m pip install --upgrade --no-build-isolation -v -r requirements-pyg.txt --find-links "https://data.pyg.org/whl/torch-${TORCH_VERSION}+cpu.html"
+          python -m pip install --upgrade --no-build-isolation -v -r requirements-deepspeed.txt || echo "DeepSpeed installation failed, continuing without it"
       - name: Show installed packages
         run: |
           echo "=== Installed package versions ==="
-          pip list | grep -E "(numpy|scipy|torch|scikit-learn|matplotlib|ase|tensorboard)"
+          pip list | grep -E "(fairchem|numpy|scipy|torch|scikit-learn|matplotlib|ase|tensorboard)"
       - name: Format black
         run: |
           black .
           git diff --exit-code
-      - name: Run pytest
+      - name: Run serial pytest
+        if: matrix.suite == 'serial'
         run: |
           # FIXME: install
           export PYTHONPATH=$PYTHONPATH:~/HydraGNN
           pip list
+          # Run native parity once, serially, and fail if the frozen FAIR-Chem
+          # reference is missing or resolves to an unexpected version.
+          python -c "import importlib.metadata as m; assert m.version('fairchem-core') == '2.22.0'"
+          python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native -m fairchem tests/test_fairchem_native_parity.py
           # Check if DeepSpeed is available
           if python -c "import deepspeed" 2>/dev/null; then
-            echo "DeepSpeed available - running all tests"
-            python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native
-            mpirun -n 2 --oversubscribe python -m pytest -rfEP -W error -W ignore::DeprecationWarning  -W ignore::UserWarning --tb=native --with-mpi
+            echo "DeepSpeed available - running serial tests"
+            python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native -m "not mpi and not fairchem" tests examples/opflearn/opflearn_pipeline/tests
           else
             echo "DeepSpeed not available - skipping GPU/DeepSpeed tests"
-            python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native -m "not gpu and not deepspeed"
-            mpirun -n 2 --oversubscribe python -m pytest -rfEP -W error -W ignore::DeprecationWarning  -W ignore::UserWarning --tb=native --with-mpi -m "not gpu and not deepspeed"
+            python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native -m "not mpi and not gpu and not deepspeed and not fairchem" tests examples/opflearn/opflearn_pipeline/tests
           fi
+      - name: Run MPI pytest
+        if: matrix.suite == 'mpi'
+        run: |
+          # FIXME: install
+          export PYTHONPATH=$PYTHONPATH:~/HydraGNN
+          mpirun -n 2 --oversubscribe python -m pytest -rfEP -W error -W ignore::DeprecationWarning -W ignore::UserWarning --tb=native --with-mpi -m "mpi and not gpu and not deepspeed and not fairchem" tests

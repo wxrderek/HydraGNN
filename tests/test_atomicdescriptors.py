@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2021, Oak Ridge National Laboratory                          #
+# Copyright (c) 2024, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -16,7 +16,7 @@ import subprocess
 
 
 @pytest.mark.mpi_skip()
-def pytest_atomicdescriptors():
+def test_atomicdescriptors():
     file_path = os.path.join(
         os.path.dirname(__file__),
         "..",

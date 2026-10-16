@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os, json
 import logging
 import sys
@@ -109,11 +119,7 @@ def main():
     with open(input_filename, "r") as f:
         config = json.load(f)
     verbosity = config["Verbosity"]["level"]
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dims
-    var_config["node_feature_names"] = node_feature_names
-    var_config["node_feature_dims"] = node_feature_dims
+    var_config = config["Variables"]
 
     # Update the config dictionary with the suggested hyperparameters
     config["NeuralNetwork"]["Architecture"]["model_type"] = args.parameters[
@@ -356,7 +362,11 @@ def main():
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
 
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+    ) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
 
@@ -385,7 +395,7 @@ def main():
     )
 
     model, optimizer = hydragnn.utils.distributed.distributed_model_wrapper(
-        model, optimizer, verbosity
+        model, optimizer, verbosity, config=config
     )
 
     # Print details of neural network architecture
@@ -405,7 +415,7 @@ def main():
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         create_plots=False,

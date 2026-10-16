@@ -1,3 +1,13 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import mpi4py
 
 mpi4py.rc.thread_level = "serialized"
@@ -19,7 +29,6 @@ from hydragnn.utils.profiling_and_tracing.time_utils import Timer
 
 # from hydragnn.utils.adiosdataset import AdiosWriter, AdiosDataset
 from hydragnn.utils.descriptors_and_embeddings.smiles_utils import (
-    get_node_attribute_name,
     generate_graphdata_from_rdkit_molecule,
 )
 from hydragnn.utils.distributed import get_device
@@ -65,7 +74,7 @@ def dftb_to_graph(moldir, dftb_node_types, var_config):
     ytarget = np.loadtxt(spectrum_filename, usecols=1, dtype=np.float32)
     ytarget = torch.tensor(ytarget)
     data = generate_graphdata_from_rdkit_molecule(
-        mol, ytarget, dftb_node_types, var_config
+        mol, ytarget, dftb_node_types, var_config=var_config
     )
     data.ID = torch.tensor((int(os.path.basename(moldir).replace("mol_", "")),))
     return data
@@ -171,17 +180,7 @@ if __name__ == "__main__":
     with open(input_filename, "r") as f:
         config = json.load(f)
     verbosity = config["Verbosity"]["level"]
-    var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    var_config["output_names"] = [
-        graph_feature_names[item]
-        for ihead, item in enumerate(var_config["output_index"])
-    ]
-    var_config["graph_feature_names"] = graph_feature_names
-    var_config["graph_feature_dims"] = graph_feature_dim
-    (
-        var_config["input_node_feature_names"],
-        var_config["input_node_feature_dims"],
-    ) = get_node_attribute_name(dftb_node_types)
+    var_config = config["Variables"]
     if args.batch_size is not None:
         config["NeuralNetwork"]["Training"]["batch_size"] = args.batch_size
     ##################################################################################################################
@@ -315,7 +314,11 @@ if __name__ == "__main__":
         os.environ["HYDRAGNN_AGGR_BACKEND"] = "mpi"
         os.environ["HYDRAGNN_USE_ddstore"] = "1"
 
-    (train_loader, val_loader, test_loader,) = hydragnn.preprocess.create_dataloaders(
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+    ) = hydragnn.preprocess.create_dataloaders(
         trainset, valset, testset, config["NeuralNetwork"]["Training"]["batch_size"]
     )
 
@@ -353,7 +356,7 @@ if __name__ == "__main__":
         test_loader,
         writer,
         scheduler,
-        config["NeuralNetwork"],
+        config,
         log_name,
         verbosity,
         create_plots=False,
@@ -378,8 +381,8 @@ if __name__ == "__main__":
             ihead = 0
             head_true = np.asarray(true_values[ihead].cpu()).squeeze()
             head_pred = np.asarray(predicted_values[ihead].cpu()).squeeze()
-            ifeat = var_config["output_index"][ihead]
-            outtype = var_config["type"][ihead]
+            ifeat = ihead
+            outtype = var_config["outputs"][ihead]["level"]
             varname = graph_feature_names[ifeat]
 
             ax = axs[isub]

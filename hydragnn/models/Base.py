@@ -1,5 +1,5 @@
 ##############################################################################
-# Copyright (c) 2024, Oak Ridge National Laboratory                          #
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
 # All rights reserved.                                                       #
 #                                                                            #
 # This file is part of HydraGNN and is distributed under a BSD 3-clause      #
@@ -12,7 +12,7 @@
 import logging
 
 import torch
-from torch.nn import ModuleList, Sequential, ReLU, Linear, Module, ModuleDict, Identity
+from torch.nn import Embedding, ModuleList, Sequential, ReLU, Linear, Module, ModuleDict, Identity
 import torch.nn.functional as F
 from torch_geometric.nn import (
     BatchNorm,
@@ -31,7 +31,9 @@ import pdb
 from hydragnn.utils.distributed import get_device
 from hydragnn.utils.print.print_utils import print_master
 from hydragnn.utils.model.operations import get_edge_vectors_and_lengths
-from hydragnn.globalAtt.gps import GPSConv
+from hydragnn.globalAtt.gps import HydraGPSConv
+from hydragnn.globalAtt.equivariant_local_global import EquivariantLocalGlobalConv
+from hydragnn.loss_reporting import supervised_loss_report
 import hydragnn.utils.profiling_and_tracing.tracer as tr
 
 import inspect
@@ -66,6 +68,18 @@ class Base(Module):
         max_nodes: int = None,
         use_graph_attr_conditioning: bool = False,
         graph_attr_conditioning_mode: str = "concat_node",
+        equivariant_attn_lmax: int = 1,
+        equivariant_attn_num_radial: int = 16,
+        equivariant_attn_feedforward_multiplier: int = 2,
+        equivariant_attn_allow_scalar_only: bool = False,
+        equivariant_attn_require_tensor_coupling: bool = True,
+        equivariant_attn_chunk_size: int | None = 512,
+        equivariant_attn_coupling_mode: str = "parallel",
+        equivariant_attn_periodic: bool = False,
+        equivariant_attn_periodic_replication: int | list[int] = 1,
+        attn_only: bool = False,
+        *,
+        equivariant_attn_num_hidden_layers: int = 1,
     ):
         super().__init__()
         self.device = get_device()
@@ -73,12 +87,29 @@ class Base(Module):
         self.conv_args = conv_args
         self.global_attn_engine = global_attn_engine
         self.global_attn_type = global_attn_type
+        self.attn_only = bool(attn_only)
         self.input_dim = input_dim
         self.pe_dim = pe_dim
         self.global_attn_heads = global_attn_heads
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.global_attn_dropout = dropout
+        self.equivariant_attn_lmax = equivariant_attn_lmax
+        self.equivariant_attn_num_radial = equivariant_attn_num_radial
+        self.equivariant_attn_num_hidden_layers = equivariant_attn_num_hidden_layers
+        self.equivariant_attn_feedforward_multiplier = (
+            equivariant_attn_feedforward_multiplier
+        )
+        self.equivariant_attn_allow_scalar_only = equivariant_attn_allow_scalar_only
+        self.equivariant_attn_require_tensor_coupling = (
+            equivariant_attn_require_tensor_coupling
+        )
+        self.equivariant_attn_chunk_size = equivariant_attn_chunk_size
+        self.equivariant_attn_coupling_mode = equivariant_attn_coupling_mode
+        self.equivariant_attn_periodic = equivariant_attn_periodic
+        self.equivariant_attn_periodic_replication = (
+            equivariant_attn_periodic_replication
+        )
         self.num_conv_layers = num_conv_layers
         self.graph_convs = ModuleList()
         self.feature_layers = ModuleList()
@@ -189,6 +220,10 @@ class Base(Module):
             self.pooled_shape = self.graph_pool.pooled_shape
             self.pooled_dim = self.graph_pool.pooled_dim
 
+        self.input_feature_encoders = ModuleDict()
+        self.input_feature_encoding_config = []
+        self.atomistic_mode_enabled = False
+
         def _pool_graph_features(x_tensor, batch_tensor, data=None):
             # x_tensor is (num_nodes_in_batch, hidden_dim)
             # data field is for a priori metadata to condition on
@@ -216,10 +251,17 @@ class Base(Module):
         # if model can handle edge features, enforce use of relative edge encodings
         if self.global_attn_engine:
             self.use_global_attn = True
-            self.embed_dim = (
-                self.edge_embed_dim
-            ) = hidden_dim  # ensure that all input to gps have the same dimensionality
-            if self.is_edge_model:
+            self.embed_dim = hidden_dim
+            self.edge_embed_dim = (
+                hidden_dim
+                if self.global_attn_engine == "GPS"
+                else (
+                    self.edge_dim
+                    if hasattr(self, "edge_dim") and self.edge_dim is not None
+                    else None
+                )
+            )
+            if self.is_edge_model and self.global_attn_engine == "GPS":
                 if "edge_attr" not in self.input_args:
                     self.input_args += ", edge_attr"
                 if "edge_attr" not in self.conv_args:
@@ -240,11 +282,15 @@ class Base(Module):
 
         # Specify learnable embeddings
         if self.use_global_attn or self.use_encodings:
-            self.pos_emb = Linear(self.pe_dim, self.hidden_dim, bias=False)
+            if self.global_attn_engine == "GPS":
+                self.pos_emb = Linear(self.pe_dim, self.hidden_dim, bias=False)
             if self.input_dim:
                 self.node_emb = Linear(self.input_dim, self.hidden_dim, bias=False)
-                self.node_lin = Linear(2 * self.hidden_dim, self.hidden_dim, bias=False)
-            if self.is_edge_model:
+                if self.global_attn_engine == "GPS":
+                    self.node_lin = Linear(
+                        2 * self.hidden_dim, self.hidden_dim, bias=False
+                    )
+            if self.is_edge_model and self.global_attn_engine == "GPS":
                 self.rel_pos_emb = Linear(self.pe_dim, self.hidden_dim, bias=False)
                 if self.use_edge_attr:
                     self.edge_emb = Linear(self.edge_dim, self.hidden_dim, bias=False)
@@ -269,18 +315,49 @@ class Base(Module):
 
         self.conv_checkpointing = False
 
-    def _apply_global_attn(self, mpnn):
+    def _apply_global_attn(self, mpnn, irreps=None):
         # choose to use global attention or mpnn
         if self.use_global_attn:
             # specify global attention engine; use this to support more engines in future
             if self.global_attn_engine == "GPS":
-                return GPSConv(
+                return HydraGPSConv(
                     channels=self.hidden_dim,
-                    conv=mpnn,
+                    conv=None if self.attn_only else mpnn,
                     heads=self.global_attn_heads,
                     dropout=self.global_attn_dropout,
                     attn_type=self.global_attn_type,
                 )
+            if self.global_attn_engine == "EquivariantTransformer":
+                if not hasattr(self, "equivariant_attn_adapter_type"):
+                    raise ValueError(
+                        f"{self.__class__.__name__} does not yet support "
+                        "EquivariantTransformer"
+                    )
+                return EquivariantLocalGlobalConv(
+                    channels=self.hidden_dim,
+                    conv=mpnn,
+                    mpnn_type=self.equivariant_attn_adapter_type,
+                    heads=self.global_attn_heads,
+                    lmax=self.equivariant_attn_lmax,
+                    num_radial=self.equivariant_attn_num_radial,
+                    num_hidden_layers=self.equivariant_attn_num_hidden_layers,
+                    feedforward_multiplier=(
+                        self.equivariant_attn_feedforward_multiplier
+                    ),
+                    allow_scalar_only=self.equivariant_attn_allow_scalar_only,
+                    require_tensor_coupling=(
+                        self.equivariant_attn_require_tensor_coupling
+                    ),
+                    local_equivariance=self.equivariance,
+                    chunk_size=self.equivariant_attn_chunk_size,
+                    periodic=self.equivariant_attn_periodic,
+                    periodic_replication=(self.equivariant_attn_periodic_replication),
+                    coupling_mode=self.equivariant_attn_coupling_mode,
+                    irreps=irreps,
+                )
+            raise ValueError(
+                f"Unknown global attention engine: {self.global_attn_engine}"
+            )
         else:
             return mpnn
 
@@ -500,24 +577,94 @@ class Base(Module):
             )
             self.feature_layers.append(BatchNorm(self.hidden_dim))
 
+    def configure_input_feature_encoders(self, encodings: list[dict] | None) -> None:
+        """Build schema-configured encoders for arbitrary scalar node inputs."""
+        self.input_feature_encoding_config = list(encodings or [])
+        for index, encoding in enumerate(self.input_feature_encoding_config):
+            if encoding["type"] == "embedding":
+                self.input_feature_encoders[str(index)] = Embedding(
+                    encoding["num_categories"], encoding["embedding_dim"]
+                )
+
+    @staticmethod
+    def _atomic_numbers(data) -> torch.Tensor:
+        """Return canonical atomic numbers for native atomistic encoders."""
+        if not hasattr(data, "atomic_numbers") or data.atomic_numbers is None:
+            raise ValueError("native atomistic encoding requires data.atomic_numbers")
+        values = data.atomic_numbers
+        if not torch.is_tensor(values):
+            raise TypeError("data.atomic_numbers must be a torch.Tensor")
+        return values.long().view(-1)
+
+    def _input_node_features(self, data) -> torch.Tensor:
+        """Apply configured categorical encoders to raw named node features."""
+        if not self.input_feature_encoding_config:
+            return data.x
+        pieces = []
+        cursor = 0
+        for index, encoding in enumerate(self.input_feature_encoding_config):
+            start = encoding["start"]
+            if start > cursor:
+                pieces.append(data.x[:, cursor:start])
+            raw = data.x[:, start]
+            rounded = raw.round()
+            if not torch.equal(raw, rounded):
+                raise TypeError(
+                    f"encoded node feature '{encoding['name']}' must contain integers"
+                )
+            values = rounded.long()
+            minimum = encoding["min_value"]
+            maximum = minimum + encoding["num_categories"] - 1
+            if values.numel() and not torch.all(
+                (values >= minimum) & (values <= maximum)
+            ):
+                raise ValueError(
+                    f"encoded node feature '{encoding['name']}' must satisfy "
+                    f"{minimum} <= value <= {maximum}"
+                )
+            category_indices = values - minimum
+            if encoding["type"] == "embedding":
+                pieces.append(self.input_feature_encoders[str(index)](category_indices))
+            else:
+                pieces.append(
+                    F.one_hot(
+                        category_indices, num_classes=encoding["num_categories"]
+                    ).float()
+                )
+            cursor = start + encoding["dim"]
+        if cursor < data.x.shape[1]:
+            pieces.append(data.x[:, cursor:])
+        return torch.cat(pieces, dim=1)
+
     def _embedding(self, data):
         if not hasattr(data, "edge_shifts"):
             data.edge_shifts = torch.zeros(
                 (data.edge_index.size(1), 3), device=data.edge_index.device
             )
         conv_args = {"edge_index": data.edge_index.to(torch.long)}
+        if self.use_global_attn:
+            conv_args["graph_batch"] = getattr(data, "batch", None)
         if self.use_edge_attr:
             assert (
                 data.edge_attr is not None
             ), "Data must have edge attributes if use_edge_attributes is set."
             conv_args.update({"edge_attr": data.edge_attr})
 
+        node_features = self._input_node_features(data)
         if self.use_global_attn:
+            if self.global_attn_engine == "EquivariantTransformer":
+                if not self.input_dim:
+                    raise ValueError(
+                        "EquivariantTransformer requires invariant node features"
+                    )
+                node_features = node_features.to(self.node_emb.weight.dtype)
+                return self.node_emb(node_features), data.pos, conv_args
             # encode node positional embeddings
             x = self.pos_emb(data.pe)
             # if node features are available, generate mebeddings, concatenate with positional embeddings and map to hidden dim
             if self.input_dim:
-                x = torch.cat((self.node_emb(data.x.float()), x), 1)
+                node_features = node_features.to(self.node_emb.weight.dtype)
+                x = torch.cat((self.node_emb(node_features), x), 1)
                 x = self.node_lin(x)
             # repeat for edge features and relative edge encodings
             if self.is_edge_model:
@@ -528,7 +675,32 @@ class Base(Module):
                 conv_args.update({"edge_attr": e})
             return x, data.pos, conv_args
         else:
-            return data.x, data.pos, conv_args
+            return node_features, data.pos, conv_args
+
+    def _equivariant_attention_geometry(self, data):
+        """Collect global-attention geometry under the configured PBC policy."""
+        batch = (
+            data.batch
+            if data.batch is not None
+            else torch.zeros(
+                data.pos.shape[0], dtype=torch.long, device=data.pos.device
+            )
+        )
+        has_periodic_edges = hasattr(data, "edge_shifts") and torch.any(
+            data.edge_shifts != 0
+        )
+        if has_periodic_edges and not self.equivariant_attn_periodic:
+            raise ValueError(
+                "nonzero periodic edge shifts require " "equivariant_attn_periodic=true"
+            )
+        geometry = {"positions": data.pos, "graph_batch": batch}
+        if self.equivariant_attn_periodic:
+            if not hasattr(data, "cell") or not hasattr(data, "pbc"):
+                raise ValueError(
+                    "periodic equivariant attention requires data.cell and data.pbc"
+                )
+            geometry.update({"cell": data.cell, "pbc": data.pbc})
+        return geometry
 
     def _freeze_conv(self):
         for module in [self.graph_convs, self.feature_layers]:
@@ -720,9 +892,11 @@ class Base(Module):
                             hidden_dim_node,
                             node_NN_type,
                             self.activation_function,
-                            num_nodes=self.num_nodes
-                            if node_NN_type == "mlp_per_node"
-                            else None,
+                            num_nodes=(
+                                self.num_nodes
+                                if node_NN_type == "mlp_per_node"
+                                else None
+                            ),
                         )
                     elif node_NN_type == "conv":
                         head_NN[branchtype] = ModuleList()
@@ -757,6 +931,19 @@ class Base(Module):
         print_master("Enabling checkpointing")
         self.conv_checkpointing = True
 
+    def _postprocess_conv_output(self, inv_node_feat, batch, data, feat_layer):
+        """Apply HydraGNN processing after one convolution layer.
+
+        Monolithic external backbones skip the generic normalization and
+        activation because their encoder output is already final, but explicit
+        graph conditioning must still affect that output.
+        """
+        if getattr(self, "use_graph_attr_conditioning", False):
+            inv_node_feat = self._apply_graph_conditioning(inv_node_feat, batch, data)
+        if getattr(self, "skip_post_conv_processing", False):
+            return inv_node_feat
+        return self.activation_function(feat_layer(inv_node_feat))
+
     def encode(self, data):
         """Run the message-passing trunk and pooling, returning node embeddings v and graph embedding G."""
 
@@ -788,10 +975,12 @@ class Base(Module):
                     **conv_args,
                 )
 
-            inv_node_feat = self._apply_graph_conditioning(
-                inv_node_feat, batch_for_cond, data
+            # External/monolithic backbones may already have completed their
+            # encoder in ``_embedding``.  Their identity conv must be a genuine
+            # no-op rather than an extra HydraGNN conditioning/activation step.
+            inv_node_feat = self._postprocess_conv_output(
+                inv_node_feat, batch_for_cond, data, feat_layer
             )
-            inv_node_feat = self.activation_function(feat_layer(inv_node_feat))
 
         x = inv_node_feat
         tr.stop("enc_forward")
@@ -803,8 +992,10 @@ class Base(Module):
         else:
             x_graph = self._pool_graph_features(x, data.batch, data)
 
-        # Optional pool-level fusion of graph_attr into pooled embedding
-        x_graph = self._apply_graph_pool_conditioning(x_graph, data)
+        # A node-only model does not consume the pooled representation.  Do not
+        # run a pool conditioner whose parameters cannot contribute to its loss.
+        if "graph" in self.head_type:
+            x_graph = self._apply_graph_pool_conditioning(x_graph, data)
 
         # x is (num_nodes_in_batch, hidden_dim), x_graph is (num_graphs, pooled_dim); the node
         # heads still need equiv_node_feat and conv_args, so they are returned alongside
@@ -850,7 +1041,7 @@ class Base(Module):
                         # print("Pei debugging:", branchtype, data.dataset_name, mask, data.dataset_name[mask])
                         x_graph_head = self.graph_shared[branchtype](x_graph[mask, :])
                         output_head = headloc[branchtype](x_graph_head)
-                        head[mask] = output_head[:, :head_dim]
+                        head[mask] = output_head[:, :head_dim].to(dtype=out_dtype)
                         headvar[mask] = (output_head[:, head_dim:] ** 2).to(
                             dtype=out_dtype
                         )
@@ -912,8 +1103,10 @@ class Base(Module):
                             x_node = headloc[branchtype](
                                 x=x[mask_nodes, :], batch=data.batch[mask_nodes]
                             )
-                        head[mask_nodes] = x_node[:, :head_dim]
-                        headvar[mask_nodes] = x_node[:, head_dim:] ** 2
+                        head[mask_nodes] = x_node[:, :head_dim].to(dtype=out_dtype)
+                        headvar[mask_nodes] = (x_node[:, head_dim:] ** 2).to(
+                            dtype=out_dtype
+                        )
                 outputs.append(head)
                 outputs_var.append(headvar)
         tr.stop("branch_forward")
@@ -1234,6 +1427,9 @@ class Base(Module):
                 )
                 tasks_loss.append(self.loss_function(head_pre, head_val, head_var))
 
+        self.last_loss_components = supervised_loss_report(
+            self, pred, value, head_index, tasks_loss, var=var
+        )
         return tot_loss, tasks_loss
 
     def __str__(self):

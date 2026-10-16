@@ -1,5 +1,15 @@
+##############################################################################
+# Copyright (c) 2026, Oak Ridge National Laboratory                          #
+# All rights reserved.                                                       #
+#                                                                            #
+# This file is part of HydraGNN and is distributed under a BSD 3-clause      #
+# license. For the licensing terms see the LICENSE file in the top-level     #
+# directory.                                                                 #
+#                                                                            #
+# SPDX-License-Identifier: BSD-3-Clause                                      #
+##############################################################################
 import os
-from setuptools import setup, find_packages
+from setuptools import setup, find_namespace_packages
 
 # Note: setup() has access to cmd arguments of the setup.py script via sys.argv
 
@@ -45,16 +55,40 @@ def get_install_requires():
 
 install_requires = get_install_requires()
 test_requires = parse_requirements("requirements-dev.txt")
+version_namespace = {}
+with open(os.path.join(os.path.dirname(__file__), "hydragnn", "_version.py")) as f:
+    exec(f.read(), version_namespace)
 
 setup(
     name="HydraGNN",
-    version="4.0rc1",
+    version=version_namespace["__version__"],
+    python_requires=">=3.11,<3.15",
+    classifiers=[
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+    ],
     package_dir={"hydragnn": "hydragnn"},
-    packages=find_packages(),
+    packages=find_namespace_packages(include=["hydragnn", "hydragnn.*"]),
+    # Vendored FairChem UMA backbone ships non-Python resources (spherical
+    # harmonic / Wigner-D coefficient tensors and model metadata) that must be
+    # packaged alongside the sources so the backbone can be constructed.
+    include_package_data=True,
+    package_data={
+        "hydragnn": [
+            "utils/model/uma/_vendored/**/*.pt",
+            "utils/model/uma/_vendored/**/*.json",
+            "utils/model/uma/_vendored/*.md",
+            "utils/model/uma/_vendored/**/*.md",
+        ]
+    },
     install_requires=install_requires,
     extras_require={"test": test_requires},
     description="Distributed PyTorch implementation of multi-headed graph neural networks",
     license="BSD-3",
+    license_files=["LICENSE", "LICENSES/PYG-MIT.txt"],
     long_description_content_type="text/markdown",
     long_description=read("README.md"),
     url="https://github.com/ORNL/HydraGNN",

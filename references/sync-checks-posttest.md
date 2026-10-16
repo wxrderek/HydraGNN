@@ -10,7 +10,7 @@ Results of the checks specified in `references/sync-checks.md`, run on DCC on 20
   - collector handlers
 
   No pipeline or `hydragnn/` file changed after submission.
-- **Pre-merge reference tree:** `/work/xw262/HydraGNN-premerge`, worktree at `d86486f`. E1b, E2, E3 and U2_premerge import from it.
+- **Pre-merge reference tree:** `/work/xw262/HydraGNN-premerge`, worktree at `d86486f`. E1b, E2, E3 and U2_premerge import from it. It was removed after the run (user decision); `git worktree add --detach <dir> d86486f` recreates it. Its one untracked byproduct, `timer.dat`, is kept as `logs/sync-checks/premerge-worktree-timer.dat`.
 - **Ledger and raw results:**
   - `logs/sync-checks/STATUS.md`: running analysis, the source of every number below;
   - `logs/sync-checks/jobs.tsv`: check id → SLURM id → exact submission command; a later row for the same check supersedes an earlier one;
@@ -55,7 +55,7 @@ Results of the checks specified in `references/sync-checks.md`, run on DCC on 20
 | I2 | 58774961 | 20 | 37:15 | FAIL (pre-existing) | inference and downstream complete; in-process figures deadlock with 4 ranks |
 | I3 | 58774756 | 20 | 0:51 | PASS | inference from the FSDP2 checkpoint |
 | I4 | 58774766 | 21 | 1:27 | PASS | raw path, no baseline add-back |
-| F1 | 58795783 (first 58774962 cancelled) | see §7 | see §7 | see §7 | standalone figures on I2's outputs |
+| F1 | 58796970 (58774962, 58795783 cancelled) | 17 (youlab-gpu, user decision) | 2:24 | PASS | all metric and sample figures written; the sample-figure path works with 1 rank |
 
 **Bottom line.**
 - Every comparison between the merged and the pre-merge code agrees to within float32 summation order or better:
@@ -63,7 +63,7 @@ Results of the checks specified in `references/sync-checks.md`, run on DCC on 20
   - preprocessing of the main dataset (P1_compare, apart from the pre-existing `natoms` bug);
   - dataset statistics (U4);
   - the Schur unit suite (U2, apart from 1 ulp that the pre-merge tree shows too).
-- Training from scratch lands inside the pre-merge bands (T1, T2, T4). Resume works (T5), FSDP2 saving works (T3), and inference works on all paths (I1, I3, I4, and I2 up to figures).
+- Training from scratch lands inside the pre-merge bands (T1, T2, T4). Resume works (T5), FSDP2 saving works (T3), and inference works on all paths (I1, I3, I4, and I2 up to figures), as do standalone figures (F1).
 - The defects found all predate the sync:
   - the `natoms` tensor;
   - the in-process figures deadlock;
@@ -336,9 +336,15 @@ All of these runs use `sync_checks/eval_checkpoint.py`. It runs hydragnn's `vali
 - The first F1 (58774962) was cancelled, because it depended `afterok` on I2. It was resubmitted once, without the dependency, as 58795783 on I2's completed outputs.
 - It runs as 1 rank, so the reduce of §6/I2 is trivial. It also exercises the sample-figure path that I2 could not reach.
 
-**Status at writing (2026-10-16 ≈12:30): not run, still PENDING (Resources).**
-- `qmugs_figs_dcc.sh` requests the `youlab` CPU partition, which has one node. Another user's 7-day job (58718624) holds that node; it has been running for 1 day 5 h.
-- This section will be completed when F1 has run. Until then, the sample-figure path is untested on the merged code.
+**PASS.**
+- The run was 58796970 (aa25-17, 2:24, exit 0:0).
+- Partition: `qmugs_figs_dcc.sh` requests the single-node `youlab` CPU partition. Another user's 7-day job (58718624) held that node, so by user decision F1 was submitted with `-p youlab-gpu --exclude=dcc-youlab-gpu-ferc-s-aa25-19`, keeping the script's 1 task, 32 cores, 128G and 20 min. The second attempt, 58795783, was cancelled while pending.
+- There is no exception in the log.
+- Written under `logs/qmugs-inference-58774961-NN1-DCC/figs/`:
+  - 31 metric-vs-`natoms` plots (png + pdf), covering matrix, electron-density and dipole metrics;
+  - for the 2 sampled conformers (CHEMBL3747039 conf_02, CHEMBL3957223 conf_02): true, predicted, difference and |difference| density matrices; molecule, true, predicted and difference electron-density isosurfaces; dipole and normalized-dipole plots.
+- The sample rerun of inference (1 rank) completed.
+- A visual check of `CHEMBL3747039_conf_02_density_matrix_difference.png` shows a symmetric error pattern concentrated in the on-atom blocks.
 
 ---
 
@@ -381,7 +387,7 @@ None of these was introduced by the sync, and none was fixed.
     - 58774936: the aa25-7/8 pair places ranks correctly.
   - Block X was resubmitted once by `sync_checks/resubmit_blockX.sh`, excluding aa25-19 and aa25-21 and gated on the end of both lanes. Those are the job ids in this report.
   - Single-node jobs on aa25-21 (I4, P4_raw_uptr, P1_compare_ignore_natoms) are unaffected.
-- **F1** was resubmitted once after its dependency cancelled it (§7).
+- **F1** was resubmitted after its dependency cancelled it. That attempt stayed pending on the occupied `youlab` node, and it was run on youlab-gpu by user decision (§7).
 - No numerical result was resubmitted.
 - **Extra diagnostic jobs**, not in `sync-checks.md` and each submitted to resolve a failed criterion:
   - P1_compare_ignore_natoms 58776278;

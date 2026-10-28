@@ -220,7 +220,7 @@ export HYDRAGNN_GRAD_NORM_STRIDE=${HYDRAGNN_GRAD_NORM_STRIDE:-0}
 #   target       total | delta      ("delta" needs a dataset preprocessed with a
 #                                    density_matrix_delta_* output name)
 
-SCHUR_MODELNAME=${SCHUR_MODELNAME:-QMugs001_max800_delta_uptr_decodercmp}
+SCHUR_MODELNAME=${SCHUR_MODELNAME:-QMugs001_max800_delta_uptr_decodercmp_overlap}
 SCHUR_MAX_DENSITY_MATRIX_SIZE=${SCHUR_MAX_DENSITY_MATRIX_SIZE:-800}
 SCHUR_UPDATE_MAX_PADDED_DIMENSION=${SCHUR_UPDATE_MAX_PADDED_DIMENSION:-1}
 SCHUR_PERC_LOAD=${SCHUR_PERC_LOAD:-0.01}
@@ -241,7 +241,16 @@ if [ "$SCHUR_UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
     SCHUR_SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
 fi
 
+# Both optional; unset, the run is exactly as before.
+#   SCHUR_LEARNING_RATE_OVERRIDE  learning rate to use after loading a checkpoint
+#   SCHUR_TRAIN_SCRIPT            Python entry point, e.g. schur_long/monitor.py, which runs
+#                                 qmugs_densmat_train.py unchanged with probes attached
+SCHUR_TRAIN_SCRIPT=${SCHUR_TRAIN_SCRIPT:-$EXAMPLE_DIR/qmugs_densmat_train.py}
+
 SCHUR_DECODER_ARGS=()
+if [ -n "${SCHUR_LEARNING_RATE_OVERRIDE:-}" ]; then
+    SCHUR_DECODER_ARGS+=(--learning_rate_override="$SCHUR_LEARNING_RATE_OVERRIDE")
+fi
 if [ -n "${SCHUR_ROUTING:-}" ]; then
     SCHUR_DECODER_ARGS+=(--schur_routing="$SCHUR_ROUTING")
 fi
@@ -265,7 +274,7 @@ SCHUR_RUN_NAME=qmugs-schur-train-$SLURM_JOB_ID-NN$SLURM_JOB_NUM_NODES-DCC-$SCHUR
 # per-rank shim is needed.
 cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     "$EXAMPLE_DIR/scripts/dcc/mpi_rank_env.sh" \
-    python -u "$EXAMPLE_DIR/qmugs_densmat_train.py" \
+    python -u "$SCHUR_TRAIN_SCRIPT" \
     --log="$SCHUR_RUN_NAME" --everyone \
     --inputfile="${SCHUR_INPUTFILE:-$EXAMPLE_DIR/qmugs_schur.json}" \
     --batch_size=$SCHUR_BATCH_SIZE --num_epoch=$SCHUR_NUM_EPOCH \

@@ -101,7 +101,7 @@
       "perc_train": 0.8,
       "loss_function_type": "mae",
       "batch_size": 8,
-      "continue": 1,
+      "continue": 0,
       "startfrom": "qmugs-schur-train-53692804-NN1-DCC-teacher_forcing-joint-total",
       "Optimizer": {
         "type": "AdamW",

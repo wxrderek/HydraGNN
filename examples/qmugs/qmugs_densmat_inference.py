@@ -149,6 +149,8 @@ def _save_inference_run_config(args, random_state: int):
         'artifacts_dir': args.artifacts_dir,
         'log': args.log,
         'batch_size': args.batch_size,
+        'schur_routing': args.schur_routing,
+        'schur_trace_normalization': args.schur_trace_normalization,
         'run_downstream_calculation': args.run_downstream_calculation,
         'downstream_calculations': args.downstream_calculations,
         'run_downstream_prediction': args.run_downstream_prediction,
@@ -264,6 +266,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log", help="log name", default="QMugs_inference")
     parser.add_argument("--batch_size", type=int, help="batch size", default=1)
+    parser.add_argument(
+        "--schur_routing",
+        choices=["free_running", "teacher_forcing"],
+        default=None,
+        help="Schur decoder models only: free_running (default) feeds D_hat back at every step; "
+        "teacher_forcing feeds the ground truth, as in training",
+    )
+    parser.add_argument(
+        "--schur_trace_normalization",
+        choices=["config", "on", "off"],
+        default="config",
+        help="Schur decoder models only: scale each prediction to the number of electrons; "
+        "config (default) takes the setting the model was trained with",
+    )
     parser.add_argument(
         "--perc_downsample_test",
         type=float,
@@ -528,6 +544,7 @@ if __name__ == "__main__":
 
     log("Command: {0}\n".format(" ".join([x for x in sys.argv])), rank=0)
     log(f'Random seed used for run: {random_state}', rank=0)
+    log(f'hydragnn imported from: {hydragnn.__file__}', rank=0)
     log(f'Artifacts directory: {args.artifacts_dir}', rank=0)
     if run_config_path is not None:
         log(f'Inference run config: {run_config_path}', rank=0)
@@ -544,10 +561,20 @@ if __name__ == "__main__":
     pretrained_model = QMugsInference(
         model_dir=args.model_dir,
         checkpoint_path=args.checkpoint_path,
+        schur_routing=args.schur_routing if args.schur_routing is not None else "free_running",
+        schur_trace_normalization=args.schur_trace_normalization,
     )
     config = pretrained_model.config
     var_config = config["NeuralNetwork"]["Variables_of_interest"]
-    max_size = _density_matrix_max_size_from_var_config(var_config=var_config)
+    if pretrained_model.is_schur:
+        # the Schur decoder unpads inside its forward; its stub head width is not N_pad
+        max_size = None
+    else:
+        if args.schur_routing is not None:
+            raise ValueError("--schur_routing applies only to Schur decoder models")
+        if args.schur_trace_normalization != "config":
+            raise ValueError("--schur_trace_normalization applies only to Schur decoder models")
+        max_size = _density_matrix_max_size_from_var_config(var_config=var_config)
 
     log(f"[DONE] Loaded HydraGNN pretrained model from {pretrained_model.checkpoint_path}", rank=0)
     if max_size is not None:
@@ -676,11 +703,12 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------------------------------------------
     # reduce streaming metrics across ranks
 
-    def _reduce_metric_block(local_block):
+    def _reduce_metric_block(local_block, local_count=None):
         '''reduce one streaming metric block across MPI ranks'''
 
         # reconstruct local first and second moments
-        local_count = float(local_evaluation['count'])
+        if local_count is None:
+            local_count = float(local_evaluation['count'])
         local_sum = float(local_block['mean']) * local_count
         local_sumsq = (
             float(local_block['std']) ** 2
@@ -701,14 +729,26 @@ if __name__ == "__main__":
             'std': global_var ** 0.5,
         }
 
-    # reduce all streaming metrics
+    # reduce all streaming metrics, over the union of metric names on all ranks in one fixed
+    # order, so every rank issues the same sequence of allreduce calls. A rank lacking a metric
+    # (no finite Schur prediction there) contributes count 0 to it
+    local_keys = [
+        key for key, value in local_evaluation.items()
+        if isinstance(value, dict) and 'mean' in value and 'std' in value
+    ]
+    all_keys = sorted(set().union(*comm.allgather(local_keys)))
     global_evaluation = {}
-    for key, value in local_evaluation.items():
-        if isinstance(value, dict) and 'mean' in value and 'std' in value:
-            global_evaluation[key] = _reduce_metric_block(value)
+    for key in all_keys:
+        if key in local_evaluation:
+            global_evaluation[key] = _reduce_metric_block(local_evaluation[key])
+        else:
+            global_evaluation[key] = _reduce_metric_block({'mean': 0.0, 'std': 0.0}, local_count=0.0)
 
-    # reduce total sample count
+    # reduce total sample count, and the predictions excluded for non-finite entries
     global_evaluation['count'] = int(comm.allreduce(local_evaluation['count'], op=MPI.SUM))
+    global_evaluation['nonfinite_count'] = int(
+        comm.allreduce(local_evaluation.get('nonfinite_count', 0), op=MPI.SUM)
+    )
 
     # store inference time of slowest rank
     global_evaluation['inference_time'] = comm.allreduce(
@@ -755,8 +795,11 @@ if __name__ == "__main__":
     if args.run_figs and rank == 0:
         log("[START] Generating inference figures", rank=0)
         figs_main = _load_figs_main()
-        # plotting is outside streaming inference and uses saved per-matrix JSONs
+        # plotting is outside streaming inference and uses saved per-matrix JSONs.
+        # the loaded model is passed on: rebuilding it on rank 0 alone would hang, because
+        # create_model_config's Timer reduces over all ranks while the others wait at the barrier
         figs_main(
+            inference_runner=pretrained_model,
             log_dir=os.path.abspath(os.path.join("logs", log_name)),
             artifacts_dir=args.artifacts_dir,
             run_sample_visuals=args.run_sample_figs,

@@ -31,16 +31,23 @@ def dipole_moment_from_density_matrix(density_matrix, psi4_wfn):
     # ground truth Psi4 molecular geometry
     psi4_mol = psi4_wfn.molecule()
     positions_bohr = psi4_matrix_to_array(psi4_mol.geometry()).astype(np.float64) # (n_atoms, 3)
+    # effective nuclear charges, i.e. atomic numbers minus the core electrons that def2-SVP replaces
+    # by an effective core potential, since those electrons are not in the density matrix
+    nuclear_charges = np.asarray(
+        [psi4_mol.Z(i) for i in range(psi4_mol.natom())],
+        dtype=np.float64,
+    ) # (n_atoms,)
     atomic_numbers = np.asarray(
         [psi4_mol.ftrue_atomic_number(i) for i in range(psi4_mol.natom())],
         dtype=np.float64,
     ) # (n_atoms,)
     assert positions_bohr.shape == (psi4_mol.natom(), 3)
-    assert atomic_numbers.shape == (psi4_mol.natom(),)
+    assert nuclear_charges.shape == (psi4_mol.natom(),)
+    assert int(round(np.sum(atomic_numbers - nuclear_charges))) == int(psi4_wfn.basisset().n_ecp_core())
 
     # nuclear contribution to dipole moment
     nuclear_dipole = np.sum(
-        atomic_numbers[:, None] * positions_bohr,
+        nuclear_charges[:, None] * positions_bohr,
         axis=0,
     ) # (3,)
 

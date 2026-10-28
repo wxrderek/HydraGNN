@@ -117,6 +117,8 @@ export BATCH_SIZE=8
 export NUM_EPOCH=5
 export MAX_DENSITY_MATRIX_SIZE=${MAX_DENSITY_MATRIX_SIZE:-800}
 export UPDATE_MAX_PADDED_DIMENSION=1
+# 1 also stores the overlap matrix and the number of electrons of each conformer
+export STORE_OVERLAP=${STORE_OVERLAP:-0}
 
 export HYDRAGNN_DDSTORE_METHOD=1
 export HYDRAGNN_CUSTOM_DATALOADER=0
@@ -148,6 +150,9 @@ if [ -n "${MAX_DENSITY_MATRIX_SIZE:-}" ]; then
 fi
 if [ "$UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
     SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
+fi
+if [ "$STORE_OVERLAP" = "1" ]; then
+    SIZE_AWARE_ARGS+=(--store_overlap_matrix)
 fi
 
 # ----------------------------------------------------------------------------------------------------

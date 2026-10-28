@@ -224,4 +224,4 @@ cmd mpirun -np $((SLURM_JOB_NUM_NODES*4)) --map-by ppr:4:node --bind-to none \
     --perc_load=${PERC_LOAD:-0.01} \
     --perc_train=0.8 \
     "${SIZE_AWARE_ARGS[@]}" \
-    --modelname="${MODELNAME:-QMugs001_max800_delta_uptr_decodercmp}"
+    --modelname="${MODELNAME:-QMugs001_max800_delta_uptr_decodercmp_overlap}"

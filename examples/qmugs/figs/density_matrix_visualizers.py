@@ -152,3 +152,50 @@ def density_matrix_heatmap_with_mask(
 
     fig.tight_layout()
     return _save_figure(fig=fig, output_path=output_path, dpi=dpi)
+
+
+def eigenvalue_spectrum_plot(
+    true_matrix: np.ndarray,
+    predicted_matrix: np.ndarray,
+    output_path: str,
+    title: str = None,
+    negative_threshold: float = -1.0e-6,
+    figure_size: float = 6.0,
+    dpi: int = 300,
+):
+    '''plot and save the sorted eigenvalues of a true and a predicted density matrix'''
+
+    true_matrix = _validate_square_matrix(true_matrix, "true_matrix") # (n_basis, n_basis)
+    predicted_matrix = _validate_square_matrix(predicted_matrix, "predicted_matrix") # (n_basis, n_basis)
+    if true_matrix.shape != predicted_matrix.shape:
+        raise ValueError(f"shapes differ: {true_matrix.shape} and {predicted_matrix.shape}")
+
+    # eigvalsh reads the lower triangle only, so the matrices are symmetrized first;
+    # descending order puts the occupied part on the left
+    true_eigenvalues = np.linalg.eigvalsh(0.5 * (true_matrix + true_matrix.T).astype(np.float64))[::-1] # (n_basis,)
+    predicted_eigenvalues = np.linalg.eigvalsh(0.5 * (predicted_matrix + predicted_matrix.T).astype(np.float64))[::-1] # (n_basis,)
+
+    # a stored float32 D has eigenvalues down to about -1e-7 from round-off alone, so a count
+    # with threshold 0 would call it non-PSD; the threshold is stated in the legend instead
+    legend = []
+    for name, eigenvalues in (("true", true_eigenvalues), ("predicted", predicted_eigenvalues)):
+        n_negative = int(np.sum(eigenvalues < negative_threshold))
+        legend.append(f"{name}: min {eigenvalues.min():.2e}, {n_negative} below {negative_threshold:.0e}")
+
+    fig, ax = plt.subplots(figsize=(figure_size, 0.7 * figure_size))
+    index = np.arange(1, true_eigenvalues.size + 1)
+    ax.plot(index, true_eigenvalues, color="#1f77b4", lw=1.5, label=legend[0])
+    ax.plot(index, predicted_eigenvalues, color="#d62728", lw=1.2, ls="--", label=legend[1])
+    ax.axhline(0.0, color="#999999", lw=0.8)
+    # linear near zero so negative eigenvalues stay visible next to the O(1) occupied ones
+    ax.set_yscale("symlog", linthresh=1.0e-4)
+    ax.set_xlabel("eigenvalue index (descending)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("eigenvalue of D (AO basis)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.legend(fontsize=AXIS_LABEL_FONTSIZE, frameon=False)
+    ax.tick_params(labelsize=AXIS_LABEL_FONTSIZE)
+    ax.grid(alpha=0.3, lw=0.5)
+    if title is not None:
+        ax.set_title(title, fontsize=TITLE_FONTSIZE)
+
+    fig.tight_layout()
+    return _save_figure(fig=fig, output_path=output_path, dpi=dpi)

@@ -1,5 +1,6 @@
 import os, json
 import logging
+import math
 import time
 import pickle
 import gc
@@ -27,6 +28,9 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import Distance
 
 import hydragnn
+from hydragnn.decoders import SchurDecoderModel
+from hydragnn.decoders.schur.losses import relative_errors
+from hydragnn.decoders.schur.model import trace_normalize
 from hydragnn.train.train_validate_test import move_batch_to_device, resolve_precision, get_autocast_and_scaler
 from hydragnn.utils.datasets.abstractbasedataset import AbstractBaseDataset
 from hydragnn.utils.model import print_model, loss_function_selection
@@ -49,7 +53,7 @@ from utils.inference_utils import (
     wavefunction_from_total_density_matrix,
     dipole_moment_from_density_matrix,
 )
-from utils import density_matrix_variables, DensityMatrixDataset
+from utils import density_matrix_variables, DensityMatrixDataset, triangular_side
 
 try:
     import psi4
@@ -111,6 +115,7 @@ class QMugsDataset(AbstractBaseDataset):
         density_matrix_delta=False,
         upper_triangle=False,
         artifacts_dir=None,
+        store_overlap_matrix=False,
         normalize=False, # NOT IMPLEMENTED YET
     ):
         super().__init__()
@@ -127,6 +132,8 @@ class QMugsDataset(AbstractBaseDataset):
         self.upper_triangle = upper_triangle
         self.normalize=normalize
         self.artifacts_dir = os.path.abspath(artifacts_dir) if artifacts_dir is not None else None
+        # when True, also store the overlap matrix and the number of electrons of each conformer
+        self.store_overlap_matrix = store_overlap_matrix
 
         if self.density_matrix_delta and self.predict_alpha_beta:
             raise NotImplementedError("Delta learning is implemented only for total density matrices")
@@ -391,6 +398,27 @@ class QMugsDataset(AbstractBaseDataset):
                 )
             ).to(torch.float32) # (T(promolecular_pad),)
 
+        # the overlap matrix uses the same padded upper-triangle layout as the promolecular baseline,
+        # so utils/add_overlap.py and this path write identical fields
+        overlap_upper_triangle = None
+        n_electrons = None
+        if self.store_overlap_matrix:
+            from utils import overlap_matrix, number_of_electrons
+            overlap_pad = (
+                self.__class__.max_padded_density_matrix_dimension
+                if self.pad_density_matrix else density_matrix_dim_int
+            )
+            overlap = overlap_matrix(psi4_wfn) # (n_basis, n_basis)
+            assert overlap.shape == (density_matrix_dim_int, density_matrix_dim_int)
+            overlap_upper_triangle = torch.from_numpy(
+                upper_triangle_vector(
+                    np.asarray(overlap, dtype=np.float32),
+                    overlap_pad,
+                    triu_indices=np.triu_indices(density_matrix_dim_int),
+                )
+            ).to(torch.float32) # (T(overlap_pad),)
+            n_electrons = torch.tensor(number_of_electrons(psi4_wfn), dtype=torch.int32)
+
         # charge and multiplicity
         charge = torch.tensor(
             int(psi4_mol.molecular_charge()),
@@ -591,6 +619,11 @@ class QMugsDataset(AbstractBaseDataset):
         # in which the Schur decoder can be run against the delta target
         if promolecular_upper_triangle is not None:
             data_object.promolecular_upper_triangle = promolecular_upper_triangle
+
+        # only present when preprocessing with store_overlap_matrix
+        if overlap_upper_triangle is not None:
+            data_object.overlap_upper_triangle = overlap_upper_triangle
+            data_object.n_electrons = n_electrons
 
         # apply graph transforms
         data_object = self.radius_graph(data_object)
@@ -1096,9 +1129,16 @@ class QMugsInference:
         self,
         model_dir,
         checkpoint_path=None,
+        schur_routing: str = 'free_running',
+        schur_trace_normalization: str = 'config',
     ):
         # dir and path setup
         self.model_dir = model_dir
+        # routing of the Schur decoder at inference; ignored for the dense head. Free running
+        # feeds D_hat_{k-1} back, so no ground truth enters the prediction
+        self.schur_routing = schur_routing
+        # 'config' keeps the trained setting, 'on' or 'off' replaces it
+        self.schur_trace_normalization = schur_trace_normalization
         self._qmugs_archive_maps = {}
         self._find_checkpoint(checkpoint_path)
         self._load_config()
@@ -1138,6 +1178,19 @@ class QMugsInference:
         with open(config_path, "r") as f:
             config = json.load(f)
         self.config = config
+
+        # sequential Schur decoder instead of the dense output head
+        self.schur_config = config["NeuralNetwork"].get("SchurDecoder", None)
+        self.is_schur = self.schur_config is not None and self.schur_config.get("enable", False)
+
+        # dense trace normalization, set in the composite loss block and applied in training before the loss
+        loss_config = config["NeuralNetwork"]["Training"].get("loss") or {}
+        self.dense_trace_normalization = (
+            not self.is_schur
+            and bool(loss_config.get("enabled", False))
+            and loss_config.get("provider") == "composite"
+            and bool(loss_config.get("density_matrix", {}).get("trace_normalization", False))
+        )
 
         # named data schema applied to stored samples by DensityMatrixDataset. Configs saved
         # before the schema existed lack it; their output_dim is the padded head width, since
@@ -1179,6 +1232,28 @@ class QMugsInference:
             verbosity=self.config["Verbosity"]["level"],
         )
 
+        # attach the sequential Schur decoder as qmugs_densmat_train.py does. The saved config
+        # carries every constructor argument, including the orbital metadata widths written by
+        # training; only the routing is replaced, and the per-call report line is switched off
+        if self.is_schur:
+            if self.schur_routing not in ('free_running', 'teacher_forcing'):
+                raise ValueError(f"schur_routing must be 'free_running' or 'teacher_forcing', got {self.schur_routing}")
+            decoder_kwargs = {k: v for k, v in self.schur_config.items() if k != "enable"}
+            log(f"[INFO] Schur decoder trained with routing={decoder_kwargs.get('routing')}; "
+                f"inference uses routing={self.schur_routing}", rank=0)
+            decoder_kwargs["routing"] = self.schur_routing
+            if self.schur_trace_normalization not in ('config', 'on', 'off'):
+                raise ValueError(f"schur_trace_normalization must be 'config', 'on' or 'off', got {self.schur_trace_normalization}")
+            if self.schur_trace_normalization != 'config':
+                decoder_kwargs["trace_normalization"] = self.schur_trace_normalization == 'on'
+            log(f"[INFO] Schur decoder trace normalization: {decoder_kwargs.get('trace_normalization', False)}", rank=0)
+            decoder_kwargs["report_stride"] = 0
+            backbone_dtype = next(self.model.parameters()).dtype
+            backbone_device = next(self.model.parameters()).device
+            self.model = SchurDecoderModel(self.model, **decoder_kwargs).to(
+                device=backbone_device, dtype=backbone_dtype
+            )
+
         # load state dict
         checkpoint = torch.load(self.checkpoint_path, map_location=device)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -1186,7 +1261,9 @@ class QMugsInference:
             (k[len("module."):] if k.startswith("module.") else k, v)
             for k, v in state_dict.items()
         )
-        missing, unexpected = self.model.load_state_dict(clean_state, strict=False)
+        # strict for the Schur decoder: a missing decoder weight would silently give a
+        # randomly initialized head
+        missing, unexpected = self.model.load_state_dict(clean_state, strict=self.is_schur)
         if missing:
             log(f"[WARNING] missing keys when loading model: {missing}", rank=0)
         if unexpected:
@@ -1484,24 +1561,26 @@ class QMugsInference:
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         inference_start_time = time.time()
 
-        # max_size is the padded matrix dimension N_pad used by the trained model
-        if max_size is None:
-            var_config = self.config["NeuralNetwork"]["Variables_of_interest"]
-            if var_config["output_names"] in DENSITY_MATRIX_OUTPUT_NAMES:
-                output_dim = int(var_config["output_dim"][0])
-                if is_upper_triangle:
-                    # upper-triangle head length is T(N_pad) = N_pad(N_pad+1)/2
-                    from utils import triangular_side
-                    max_size = triangular_side(output_dim)
+        # max_size is the padded matrix dimension N_pad used by the trained model. The Schur
+        # decoder unpads inside its forward, and its stub head width says nothing about N_pad
+        if not self.is_schur:
+            if max_size is None:
+                var_config = self.config["NeuralNetwork"]["Variables_of_interest"]
+                if var_config["output_names"] in DENSITY_MATRIX_OUTPUT_NAMES:
+                    output_dim = int(var_config["output_dim"][0])
+                    if is_upper_triangle:
+                        # upper-triangle head length is T(N_pad) = N_pad(N_pad+1)/2
+                        from utils import triangular_side
+                        max_size = triangular_side(output_dim)
+                    else:
+                        max_size = int(round(output_dim ** 0.5))
+                        if max_size * max_size != output_dim:
+                            raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
                 else:
-                    max_size = int(round(output_dim ** 0.5))
-                    if max_size * max_size != output_dim:
-                        raise ValueError(f"Density matrix output_dim must be a square, got {output_dim}")
-            else:
-                max_size = QMugsDataset.max_padded_density_matrix_dimension
-        max_size = int(max_size)
-        if max_size <= 0:
-            raise ValueError(f"max_size must be a positive integer, got {max_size}")
+                    max_size = QMugsDataset.max_padded_density_matrix_dimension
+            max_size = int(max_size)
+            if max_size <= 0:
+                raise ValueError(f"max_size must be a positive integer, got {max_size}")
 
         # initialize local metric accumulators
         streaming_state = None
@@ -1538,91 +1617,232 @@ class QMugsInference:
             local_batch_count += 1
             batch = batch.to(self.device)
 
+            forward_start = time.time()
             with torch.no_grad():
                 with self.autocast_ctx:
                     pred = self.model(batch)
 
-                # total density matrix prediction
-                if output_names in DENSITY_MATRIX_OUTPUT_NAMES:
-                    dims_batch = batch.density_matrix_dim
-                    if is_upper_triangle:
-                        # pred and target are padded upper-triangle vectors of length T(N_pad)
-                        tri_len = max_size * (max_size + 1) // 2
-                        pred_batch = pred[0].reshape(-1, tri_len) # (batch, T(N_pad))
-                        true_batch = batch.y.reshape(-1, tri_len) # (batch, T(N_pad))
-                    else:
-                        pred_batch = pred[0].reshape(-1, max_size, max_size)
-                        true_batch = batch.y.reshape(-1, max_size, max_size)
+                if self.is_schur:
+                    # the decoder unpads inside forward and returns, for every kept conformer,
+                    # D_hat and D as dense (n_basis, n_basis) totals: the promolecular baseline is
+                    # already added from the batch, so no delta reconstruction happens here
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    forward_seconds = (time.time() - forward_start) / max(len(pred['graph_index']), 1)
+                    num_dropped = int(batch.num_graphs) - len(pred['graph_index'])
+                    if num_dropped > 0:
+                        log(f"[WARNING] Rank {rank}: Schur decoder dropped {num_dropped} conformers above max_basis_dim")
+
+                    for position, batch_index in enumerate(pred['graph_index']):
+                        pred_mat = pred['D_hat'][position] # (n_basis, n_basis)
+                        true_mat = pred['D'][position] # (n_basis, n_basis)
+                        promolecular_mat = pred['promolecular'][position] # (n_basis, n_basis) or None
+                        dim = int(batch.density_matrix_dim[batch_index].item())
+                        assert pred_mat.shape == (dim, dim) and true_mat.shape == (dim, dim)
+
+                        promolecular_path = None
+                        if output_names in DELTA_OUTPUT_NAMES:
+                            promolecular_path = self._resolve_promolecular_density_matrix_path(
+                                batch=batch,
+                                batch_index=batch_index,
+                                artifacts_dir=artifacts_dir,
+                            )
+                            # once per rank: the baseline stored in the batch, which the decoder
+                            # adds, must be the one in the artifacts, which the dense path adds
+                            if local_matrix_count == 0 and promolecular_mat is not None and os.path.isfile(promolecular_path):
+                                artifact_mat = torch.as_tensor(
+                                    np.load(promolecular_path), dtype=promolecular_mat.dtype, device=promolecular_mat.device
+                                ) # (n_basis, n_basis)
+                                baseline_difference = float((artifact_mat - promolecular_mat).abs().max())
+                                assert baseline_difference <= 1e-6, (
+                                    f"promolecular baseline in the batch differs from {promolecular_path} "
+                                    f"by {baseline_difference:.3e}"
+                                )
+                                log(f"[INFO] Rank {rank}: batch and artifact promolecular baselines agree "
+                                    f"to {baseline_difference:.3e}")
+                        local_matrix_count += 1
+
+                        # a free-running D_hat can overflow; such a conformer is recorded and
+                        # counted but enters no metric, since eigvalsh and the downstream
+                        # calculations are undefined on it
+                        finite = torch.isfinite(pred_mat)
+                        if not bool(finite.all()):
+                            # 1-based step k of the first leading block D_hat_k with a non-finite entry
+                            bad = torch.nonzero(~finite)
+                            first_nonfinite_step = int(bad.max(dim=1).values.min()) + 1
+                            log(f"[WARNING] Rank {rank}: non-finite Schur prediction for "
+                                f"{batch.chembl_id[batch_index]} conf {batch.conformer_id[batch_index]}, "
+                                f"n_basis={dim}, first non-finite at step {first_nonfinite_step}")
+                            if evaluate:
+                                streaming_state['nonfinite_count'] += 1
+                            if save_per_matrix_metrics:
+                                per_matrix_metrics.append({
+                                    'chembl_id': batch.chembl_id[batch_index],
+                                    'conformer_id': batch.conformer_id[batch_index],
+                                    'density_matrix_dim': dim,
+                                    'natoms': int(batch.natoms_int[batch_index].item()),
+                                    'schur_routing': self.schur_routing,
+                                    'prediction_finite': False,
+                                    'first_nonfinite_step': first_nonfinite_step,
+                                })
+                            del pred_mat
+                            del true_mat
+                            continue
+
+                        # decoder-specific scalars travel with the downstream metrics, which are
+                        # aggregated and reduced by name
+                        downstream_metric_values = _schur_metrics(
+                            pred_mat=pred_mat,
+                            true_mat=true_mat,
+                            promolecular_mat=promolecular_mat,
+                            z_pairs=pred['z'][position],
+                            delta=pred['delta'][position],
+                        )
+                        downstream_metric_values['schur_forward_seconds'] = forward_seconds
+                        # scale applied by trace normalization, the number of electrons over the raw electron count
+                        if pred['trace_scale'][position] is not None:
+                            downstream_metric_values['schur_trace_scale'] = float(pred['trace_scale'][position])
+                        downstream_record_values = {
+                            'schur_routing': self.schur_routing,
+                            'prediction_finite': True,
+                        }
+                        if run_downstream_calculation:
+                            calculation_metrics, calculation_records = self.run_downstream_calculations(
+                                downstream_calculations=downstream_calculations,
+                                pred_mat=pred_mat,
+                                true_mat=true_mat,
+                                batch=batch,
+                                batch_index=batch_index,
+                                qmugs_data_dir=qmugs_data_dir,
+                                artifacts_dir=artifacts_dir,
+                                electron_density_method=electron_density_method,
+                                cubeprop_grid_spacing=cubeprop_grid_spacing,
+                                cubeprop_num_grid_points=cubeprop_num_grid_points,
+                                manual_density_padding_angstrom=manual_density_padding_angstrom,
+                                manual_density_spacing_angstrom=manual_density_spacing_angstrom,
+                                manual_density_num_grid_points=manual_density_num_grid_points,
+                                manual_density_block_size=manual_density_block_size,
+                            )
+                            downstream_metric_values.update(calculation_metrics)
+                            downstream_record_values.update(calculation_records)
+
+                        # evaluate and update streaming metrics
+                        if evaluate:
+                            self._update_streaming_metric_state(
+                                state=streaming_state,
+                                pred_mat=pred_mat,
+                                true_mat=true_mat,
+                                batch=batch,
+                                batch_index=batch_index,
+                                criterions=criterions,
+                                save_per_matrix_metrics=save_per_matrix_metrics,
+                                per_matrix_metrics=per_matrix_metrics,
+                                downstream_metric_values=downstream_metric_values,
+                                downstream_record_values=downstream_record_values,
+                                promolecular_density_matrix_path=promolecular_path,
+                            )
+
+                        # release matrices from memory
+                        del pred_mat
+                        del true_mat
+
                 else:
-                    raise NotImplementedError
-
-                # postprocess matrices
-                for batch_index, (raw_pred_mat, raw_true_mat, dim) in enumerate(zip(
-                    pred_batch,
-                    true_batch,
-                    dims_batch,
-                )):
-                    assert(raw_pred_mat.shape == raw_true_mat.shape)
-
-                    dim = int(dim.item())
-                    if is_upper_triangle:
-                        # fold each padded upper triangle into a full symmetric (dim, dim) matrix
-                        pred_mat = self._fold_padded_upper_triangle(raw_pred_mat, dim, max_size) # (dim, dim)
-                        true_mat = self._fold_padded_upper_triangle(raw_true_mat, dim, max_size) # (dim, dim)
+                    # total density matrix prediction
+                    if output_names in DENSITY_MATRIX_OUTPUT_NAMES:
+                        dims_batch = batch.density_matrix_dim
+                        if is_upper_triangle:
+                            # pred and target are padded upper-triangle vectors of length T(N_pad)
+                            tri_len = max_size * (max_size + 1) // 2
+                            pred_batch = pred[0].reshape(-1, tri_len) # (batch, T(N_pad))
+                            true_batch = batch.y.reshape(-1, tri_len) # (batch, T(N_pad))
+                        else:
+                            pred_batch = pred[0].reshape(-1, max_size, max_size)
+                            true_batch = batch.y.reshape(-1, max_size, max_size)
                     else:
-                        assert(raw_pred_mat.shape[0] == max_size)
-                        # unpad matrices to original size
-                        pred_mat = raw_pred_mat[:dim, :dim]
-                        true_mat = raw_true_mat[:dim, :dim]
-                    pred_mat, true_mat, promolecular_path = self._reconstruct_total_density_if_delta(
-                        pred_mat=pred_mat,
-                        true_mat=true_mat,
-                        batch=batch,
-                        batch_index=batch_index,
-                        artifacts_dir=artifacts_dir,
-                        dim=dim,
-                    )
-                    local_matrix_count += 1
+                        raise NotImplementedError
 
-                    downstream_metric_values = None
-                    downstream_record_values = None
-                    if run_downstream_calculation:
-                        downstream_metric_values, downstream_record_values = self.run_downstream_calculations(
-                            downstream_calculations=downstream_calculations,
+                    # postprocess matrices
+                    for batch_index, (raw_pred_mat, raw_true_mat, dim) in enumerate(zip(
+                        pred_batch,
+                        true_batch,
+                        dims_batch,
+                    )):
+                        assert(raw_pred_mat.shape == raw_true_mat.shape)
+
+                        dim = int(dim.item())
+                        if is_upper_triangle:
+                            # fold each padded upper triangle into a full symmetric (dim, dim) matrix
+                            pred_mat = self._fold_padded_upper_triangle(raw_pred_mat, dim, max_size) # (dim, dim)
+                            true_mat = self._fold_padded_upper_triangle(raw_true_mat, dim, max_size) # (dim, dim)
+                        else:
+                            assert(raw_pred_mat.shape[0] == max_size)
+                            # unpad matrices to original size
+                            pred_mat = raw_pred_mat[:dim, :dim]
+                            true_mat = raw_true_mat[:dim, :dim]
+                        pred_mat, true_mat, promolecular_path = self._reconstruct_total_density_if_delta(
                             pred_mat=pred_mat,
                             true_mat=true_mat,
                             batch=batch,
                             batch_index=batch_index,
-                            qmugs_data_dir=qmugs_data_dir,
                             artifacts_dir=artifacts_dir,
-                            electron_density_method=electron_density_method,
-                            cubeprop_grid_spacing=cubeprop_grid_spacing,
-                            cubeprop_num_grid_points=cubeprop_num_grid_points,
-                            manual_density_padding_angstrom=manual_density_padding_angstrom,
-                            manual_density_spacing_angstrom=manual_density_spacing_angstrom,
-                            manual_density_num_grid_points=manual_density_num_grid_points,
-                            manual_density_block_size=manual_density_block_size,
+                            dim=dim,
                         )
+                        local_matrix_count += 1
 
-                    # evaluate and update streaming metrics
-                    if evaluate:
-                        self._update_streaming_metric_state(
-                            state=streaming_state,
-                            pred_mat=pred_mat,
-                            true_mat=true_mat,
-                            batch=batch,
-                            batch_index=batch_index,
-                            criterions=criterions,
-                            save_per_matrix_metrics=save_per_matrix_metrics,
-                            per_matrix_metrics=per_matrix_metrics,
-                            downstream_metric_values=downstream_metric_values,
-                            downstream_record_values=downstream_record_values,
-                            promolecular_density_matrix_path=promolecular_path,
-                        )
+                        # the same scaling of the total to the number of electrons as in training
+                        dense_trace_scale = None
+                        if self.dense_trace_normalization:
+                            overlap_rows = batch.overlap_upper_triangle.reshape(batch.num_graphs, -1)
+                            overlap_mat = self._fold_padded_upper_triangle(
+                                overlap_rows[batch_index], dim, triangular_side(int(overlap_rows.shape[1]))
+                            ).to(pred_mat.dtype) # (dim, dim)
+                            pred_mat, dense_trace_scale = trace_normalize(
+                                pred_mat, overlap_mat, batch.n_electrons[batch_index].to(pred_mat.dtype)
+                            )
+                            dense_trace_scale = float(dense_trace_scale)
 
-                    # release matrices from memory
-                    del pred_mat
-                    del true_mat
+                        downstream_metric_values = None
+                        downstream_record_values = None
+                        if run_downstream_calculation:
+                            downstream_metric_values, downstream_record_values = self.run_downstream_calculations(
+                                downstream_calculations=downstream_calculations,
+                                pred_mat=pred_mat,
+                                true_mat=true_mat,
+                                batch=batch,
+                                batch_index=batch_index,
+                                qmugs_data_dir=qmugs_data_dir,
+                                artifacts_dir=artifacts_dir,
+                                electron_density_method=electron_density_method,
+                                cubeprop_grid_spacing=cubeprop_grid_spacing,
+                                cubeprop_num_grid_points=cubeprop_num_grid_points,
+                                manual_density_padding_angstrom=manual_density_padding_angstrom,
+                                manual_density_spacing_angstrom=manual_density_spacing_angstrom,
+                                manual_density_num_grid_points=manual_density_num_grid_points,
+                                manual_density_block_size=manual_density_block_size,
+                            )
+                        if dense_trace_scale is not None:
+                            downstream_metric_values = dict(downstream_metric_values or {})
+                            downstream_metric_values['dense_trace_scale'] = dense_trace_scale
+
+                        # evaluate and update streaming metrics
+                        if evaluate:
+                            self._update_streaming_metric_state(
+                                state=streaming_state,
+                                pred_mat=pred_mat,
+                                true_mat=true_mat,
+                                batch=batch,
+                                batch_index=batch_index,
+                                criterions=criterions,
+                                save_per_matrix_metrics=save_per_matrix_metrics,
+                                per_matrix_metrics=per_matrix_metrics,
+                                downstream_metric_values=downstream_metric_values,
+                                downstream_record_values=downstream_record_values,
+                                promolecular_density_matrix_path=promolecular_path,
+                            )
+
+                        # release matrices from memory
+                        del pred_mat
+                        del true_mat
 
             del batch
             del pred
@@ -2052,6 +2272,9 @@ class QMugsInference:
 
         state = {
             'count': 0,
+            # predictions excluded from every metric because they hold a non-finite entry;
+            # only a free-running Schur decoder can produce them
+            'nonfinite_count': 0,
 
             # loss metrics usable in training
             'losses': {
@@ -2267,6 +2490,37 @@ class QMugsInference:
             record['cosine_similarity'] = cosine_similarity
 
         # ----------------------------------------------------------------------------------------------------
+        # electron count, overlap-weighted error and idempotency, only for datasets that store the overlap matrix
+        if hasattr(batch, 'overlap_upper_triangle'):
+            dim = int(batch.density_matrix_dim[batch_index].item())
+            overlap_rows = batch.overlap_upper_triangle.reshape(batch.num_graphs, -1) # (batch, T(N_pad))
+            overlap_mat = self._fold_padded_upper_triangle(
+                overlap_rows[batch_index],
+                dim,
+                triangular_side(int(overlap_rows.shape[1])),
+            ) # (dim, dim)
+            n_electrons = int(batch.n_electrons[batch_index].item())
+            overlap_metric_values = _overlap_metrics(
+                pred_mat=pred_mat,
+                true_mat=true_mat,
+                overlap_mat=overlap_mat,
+                n_electrons=n_electrons,
+            )
+            for name, value in overlap_metric_values.items():
+                self._ensure_streaming_metric(state=state, name=name)
+                self._update_scalar_metric(state=state, name=name, value=value)
+
+            if save_per_matrix_metrics:
+                record.update(overlap_metric_values)
+                record['n_electrons'] = n_electrons
+                record['predicted_electron_count'] = n_electrons + overlap_metric_values['electron_count_error']
+                record['true_electron_count'] = n_electrons + overlap_metric_values['true_electron_count_error']
+        elif not getattr(self, '_warned_missing_overlap', False):
+            log("[WARNING] dataset stores no overlap matrix; electron count, overlap-weighted error "
+                "and idempotency metrics are skipped")
+            self._warned_missing_overlap = True
+
+        # ----------------------------------------------------------------------------------------------------
         # downstream calculation metrics
         if downstream_metric_values is not None:
             for name, value in downstream_metric_values.items():
@@ -2299,7 +2553,11 @@ class QMugsInference:
 
         count = state['count']
         if count == 0:
-            raise ValueError('Cannot finalize streaming metrics with zero samples')
+            # possible only when every local prediction was non-finite; the metric blocks are
+            # then absent and contribute nothing to the cross-rank reduction
+            if state['nonfinite_count'] == 0:
+                raise ValueError('Cannot finalize streaming metrics with zero samples')
+            return {'count': 0, 'nonfinite_count': state['nonfinite_count']}
 
         results = {}
 
@@ -2339,6 +2597,7 @@ class QMugsInference:
             }
 
         results['count'] = count
+        results['nonfinite_count'] = state['nonfinite_count']
 
         return results
 
@@ -2526,5 +2785,76 @@ def _cosine_similarity(pred_mat, true_mat, eps=1e-12):
     denominator = np.linalg.norm(pred_flat) * np.linalg.norm(true_flat) + eps
 
     return float(numerator / denominator)
+
+
+def _schur_metrics(pred_mat, true_mat, promolecular_mat, z_pairs, delta, eps=1e-12):
+    '''Schur decoder scalars for one conformer: error of the leading blocks, delta-relative error, latents'''
+
+    # The recursion grows D_hat by bordering, so its leading k x k block IS the step-k
+    # reconstruction D_hat_k. The block error at k = ceil(f K) is therefore the error profile
+    # along the sequence (logs/qmugs-schur-diagnostics/schur_decomp_test.md, Section 10.5),
+    # read off the final matrix; at f = 1 it is relative_frobenius_error.
+    n_basis = int(pred_mat.shape[0])
+    assert pred_mat.shape == (n_basis, n_basis) and true_mat.shape == (n_basis, n_basis)
+    assert z_pairs.shape == (n_basis, n_basis) and delta.shape == (n_basis,)
+
+    pred_64 = pred_mat.double() # (n_basis, n_basis)
+    true_64 = true_mat.double() # (n_basis, n_basis)
+    values = {}
+    for percent in (10, 25, 50, 75):
+        k = max(1, math.ceil(percent * n_basis / 100))
+        numerator = torch.linalg.norm(pred_64[:k, :k] - true_64[:k, :k])
+        denominator = torch.linalg.norm(true_64[:k, :k]) + eps
+        values[f'schur_block_relative_error_k{percent}'] = float(numerator / denominator)
+
+    # ||D_hat - D|| / ||D - D_pro||, the more demanding figure, as reported during training
+    if promolecular_mat is not None:
+        _, relative_delta = relative_errors(pred_64, true_64, promolecular_mat.double())
+        if relative_delta is not None:
+            values['schur_relative_delta_error'] = relative_delta
+
+    # latents: z_pairs is strictly lower triangular with row k holding z_{k+1}, delta the pivots
+    values['schur_max_abs_z'] = float(z_pairs.abs().max())
+    values['schur_min_pivot'] = float(delta.min())
+    values['schur_max_pivot'] = float(delta.max())
+    return values
+
+
+def _overlap_metrics(pred_mat, true_mat, overlap_mat, n_electrons: int, eps=1e-12):
+    '''electron count, overlap-weighted error and idempotency defect of one predicted density matrix, in float64'''
+
+    # definitions as in the 2026-10-21 calibration, calibrate_constraints.py in the archive
+    n_basis = int(pred_mat.shape[0])
+    assert pred_mat.shape == (n_basis, n_basis) and true_mat.shape == (n_basis, n_basis)
+    assert overlap_mat.shape == (n_basis, n_basis)
+
+    pred_64 = pred_mat.double() # (n_basis, n_basis)
+    true_64 = true_mat.double() # (n_basis, n_basis)
+    overlap_64 = overlap_mat.double() # (n_basis, n_basis)
+
+    # electron count is the trace of the overlap matrix times the density matrix, both symmetric
+    predicted_count = float(torch.sum(overlap_64 * pred_64))
+    true_count = float(torch.sum(overlap_64 * true_64))
+
+    # relative error of the density matrix in the norm weighted by the overlap matrix
+    residual_overlap = (pred_64 - true_64) @ overlap_64 # (n_basis, n_basis)
+    true_overlap = true_64 @ overlap_64 # (n_basis, n_basis)
+    s_metric = torch.sqrt(
+        torch.trace(residual_overlap @ residual_overlap) / (torch.trace(true_overlap @ true_overlap) + eps)
+    )
+
+    # closed-shell idempotency, zero for a density matrix of doubly occupied orbitals
+    true_norm = torch.linalg.norm(true_64) + eps
+    pred_defect = torch.linalg.norm(pred_64 @ overlap_64 @ pred_64 - 2.0 * pred_64) / true_norm
+    true_defect = torch.linalg.norm(true_overlap @ true_64 - 2.0 * true_64) / true_norm
+
+    return {
+        'electron_count_error': predicted_count - n_electrons,
+        'electron_count_relative_error': abs(predicted_count - n_electrons) / n_electrons,
+        'true_electron_count_error': true_count - n_electrons,
+        's_metric_relative_error': float(s_metric),
+        'idempotency_relative_defect': float(pred_defect),
+        'true_idempotency_relative_defect': float(true_defect),
+    }
 
 # ----------------------------------------------------------------------------------------------------

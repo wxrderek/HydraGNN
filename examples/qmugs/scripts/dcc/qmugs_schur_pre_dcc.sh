@@ -178,6 +178,9 @@ SCHUR_PERC_TRAIN=${SCHUR_PERC_TRAIN:-0.8}
 # only used to size the dataloaders during preprocessing; training reads its own
 SCHUR_BATCH_SIZE=${SCHUR_BATCH_SIZE:-8}
 SCHUR_NUM_EPOCH=${SCHUR_NUM_EPOCH:-5}
+# 1 also stores the overlap matrix and the number of electrons of each conformer
+# (overlap_upper_triangle, n_electrons), about 1.3 MB more per conformer at a padding of 800
+SCHUR_STORE_OVERLAP=${SCHUR_STORE_OVERLAP:-0}
 
 SCHUR_SIZE_AWARE_ARGS=()
 if [ -n "${SCHUR_MAX_DENSITY_MATRIX_SIZE:-}" ]; then
@@ -185,6 +188,9 @@ if [ -n "${SCHUR_MAX_DENSITY_MATRIX_SIZE:-}" ]; then
 fi
 if [ "$SCHUR_UPDATE_MAX_PADDED_DIMENSION" = "1" ]; then
     SCHUR_SIZE_AWARE_ARGS+=(--update_max_padded_dimension)
+fi
+if [ "$SCHUR_STORE_OVERLAP" = "1" ]; then
+    SCHUR_SIZE_AWARE_ARGS+=(--store_overlap_matrix)
 fi
 
 # --- More paths ---

@@ -286,6 +286,43 @@ def orbital_metadata(wfn):
     return to_atom, angular_momentum, within_shell, shell_ordinal
 
 
+def overlap_matrix(wfn):
+    '''atomic orbital overlap matrix of the wavefunction basis, in the orbital order of Da and Db'''
+
+    # built from the same basis object that orders the stored density matrix
+    overlap = psi4.core.MintsHelper(wfn.basisset()).ao_overlap()
+    overlap = np.asarray(_psi4_matrix_to_array(overlap), dtype=np.float64) # (n_basis, n_basis)
+
+    n_basis = int(wfn.basisset().nbf())
+    if overlap.shape != (n_basis, n_basis):
+        raise ValueError(f"Overlap matrix has shape {overlap.shape}, expected ({n_basis}, {n_basis})")
+    if not np.array_equal(overlap, overlap.T):
+        raise ValueError("Overlap matrix is not exactly symmetric")
+
+    return overlap
+
+
+def number_of_electrons(wfn):
+    '''number of electrons described by the density matrix, checked against the wavefunction'''
+
+    # def2-SVP replaces the core electrons of atoms beyond krypton, e.g. 28 for iodine, by an
+    # effective core potential, so those electrons are not in the density matrix
+    molecule = wfn.molecule()
+    n_electrons = sum(int(molecule.ftrue_atomic_number(i)) for i in range(molecule.natom()))
+    n_electrons -= int(molecule.molecular_charge())
+    n_electrons -= int(wfn.basisset().n_ecp_core())
+
+    # both counts must agree, since the wavefunction occupations define the true density matrix
+    n_occupied = int(wfn.nalpha()) + int(wfn.nbeta())
+    if n_electrons != n_occupied:
+        raise ValueError(
+            f"Sum of atomic numbers minus charge minus core potential electrons is {n_electrons}, "
+            f"but the wavefunction has {n_occupied} electrons"
+        )
+
+    return n_electrons
+
+
 # ----------------------------------------------------------------------------------------------------
 # promolecular density matrix computation (baseline for delta learning)
 

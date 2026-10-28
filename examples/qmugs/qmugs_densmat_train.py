@@ -118,6 +118,11 @@ if __name__ == "__main__":
         action="store_true",
         help="set the padded density matrix dimension to max_density_matrix_size",
     )
+    parser.add_argument(
+        "--store_overlap_matrix",
+        action="store_true",
+        help="also store the overlap matrix and the number of electrons of each conformer during preprocessing",
+    )
 
     # Schur decoder overrides. Everything else about the decoder is configured in the JSON;
     # these three are exposed because sweeping them is the point of the first runs, and
@@ -141,6 +146,12 @@ if __name__ == "__main__":
         type=str,
         choices=["total", "delta"],
         help="override SchurDecoder.target from the config file",
+        default=None,
+    )
+    parser.add_argument(
+        "--learning_rate_override",
+        type=float,
+        help="learning rate to use after loading a checkpoint, in place of the one the checkpoint restores",
         default=None,
     )
 
@@ -286,6 +297,29 @@ if __name__ == "__main__":
     log_name = "QMugs" if args.log is None else args.log
     hydragnn.utils.print.setup_log(log_name)
     writer = hydragnn.utils.model.get_summary_writer(log_name)
+
+    # placed after setup_log so the lines below reach run.log
+    # a dense head output is the delta against the promolecular matrix exactly for delta output names
+    loss_config = config["NeuralNetwork"]["Training"].get("loss") or {}
+    if loss_config.get("enabled", False) and loss_config.get("provider") == "composite":
+        loss_config.setdefault("density_matrix", {})
+        loss_config["density_matrix"]["dense_target"] = "delta" if density_matrix_delta else "total"
+        log(f"[INFO] composite loss: density_matrix.dense_target={loss_config['density_matrix']['dense_target']}, "
+            f"from output_names={var_config['output_names']}", rank=0)
+        active_terms = {term["name"] for term in loss_config.get("terms", []) if float(term.get("weight", 0.0)) != 0.0}
+    else:
+        active_terms = set()
+    # trace normalization alone leaves the raw scale free and diverged in job 59258340
+    dense_trace_normalization = bool(loss_config.get("density_matrix", {}).get("trace_normalization", False))
+    if dense_trace_normalization and not (loss_config.get("enabled", False) and loss_config.get("provider") == "composite"):
+        raise ValueError("density_matrix.trace_normalization needs the composite loss provider enabled")
+    if use_schur_decoder and dense_trace_normalization:
+        raise ValueError("density_matrix.trace_normalization is for the dense head; set SchurDecoder.trace_normalization instead")
+    schur_trace_normalization = use_schur_decoder and schur_config.get("trace_normalization", False)
+    if (schur_trace_normalization or dense_trace_normalization) and "electron_count" not in active_terms:
+        log("[WARNING] trace_normalization is on without an active electron_count composite loss term; "
+            "the raw scale of the prediction is then unconstrained and training diverged in job 59258340", rank=0)
+
     
     log("Command: {0}\n".format(" ".join([x for x in sys.argv])), rank=0)
     log(f'Random seed used for run: {random_state}', rank=0)
@@ -310,6 +344,7 @@ if __name__ == "__main__":
             density_matrix_delta=density_matrix_delta,
             upper_triangle=upper_triangle,
             artifacts_dir=args.artifacts_dir,
+            store_overlap_matrix=args.store_overlap_matrix,
         )
 
         if args.streaming_preonly:
@@ -687,6 +722,14 @@ if __name__ == "__main__":
     hydragnn.utils.model.load_existing_model_config(
         model, config["NeuralNetwork"]["Training"], optimizer=optimizer
     )
+
+    # A resumed optimizer carries the learning rate saved in its checkpoint, so the config's
+    # learning_rate has no effect on a resume. This is the way to change it at a resume, e.g.
+    # after the LR 1e-3 blow-up of the Schur 400-epoch campaign (schur_long/README.md).
+    if args.learning_rate_override is not None:
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate_override
+        log(f"[INFO] learning rate overridden to {args.learning_rate_override} after loading", rank=0)
 
     log("[START] Training HydraGNN model", rank=0)
     hydragnn.train.train_validate_test(

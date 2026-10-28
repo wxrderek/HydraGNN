@@ -16,6 +16,8 @@ from .utils import (
     physical_upper_triangle_indices,
     symmetric_matrix_from_upper_triangle_vector,
     orbital_metadata,
+    overlap_matrix,
+    number_of_electrons,
     density_matrix_variables,
     DensityMatrixDataset,
 )
@@ -38,6 +40,8 @@ __all__ = [
     'physical_upper_triangle_indices',
     'symmetric_matrix_from_upper_triangle_vector',
     'orbital_metadata',
+    'overlap_matrix',
+    'number_of_electrons',
     'density_matrix_variables',
     'DensityMatrixDataset',
 ]

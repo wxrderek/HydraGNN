@@ -30,6 +30,7 @@ if QMUGS_EXAMPLE_DIR not in sys.path:
 from figs.density_matrix_visualizers import (
     density_matrix_heatmap,
     density_matrix_heatmap_with_mask,
+    eigenvalue_spectrum_plot,
 )
 from figs.density_visualizers import (
     density_isosurface_visual,
@@ -41,6 +42,11 @@ from figs.dipole_moment_visualizers import multiple_dipole_moment_visual
 from figs.metrics_visualizers import (
     plot_metric_by_feature,
     reconstruction_scatter,
+)
+from figs.schur_decoder_visualizers import (
+    block_error_curve_plot,
+    leading_block_relative_errors,
+    pivot_latent_plot,
 )
 
 
@@ -197,8 +203,74 @@ def _load_sdf_bonds(sample, qmugs_data_dir: str = None):
 # ----------------------------------------------------------------------------------------------------
 # sampled inference
 
+def schur_sample_inference(pretrained_model, dataset, selected_records):
+    '''rerun a Schur decoder model on selected samples, in its own routing and teacher forced'''
+
+    # SchurDecoderModel.forward already unpads to n_basis and rebuilds totals (it adds D_pro
+    # itself when the target is stored as a delta), so nothing here adds D_pro again
+    from utils import DensityMatrixDataset
+    loader = DataLoader(DensityMatrixDataset(dataset, pretrained_model.variables), batch_size=1, shuffle=False)
+    model = pretrained_model.model
+    routing = model.routing
+
+    sample_results = []
+    for i_sample, batch in enumerate(loader):
+        record = selected_records[i_sample]
+
+        # batch_size is one, so node-level arrays correspond to one conformer
+        positions_angstrom = batch.pos.detach().cpu().numpy().astype(np.float64) # (n_atoms, 3)
+        atomic_numbers = batch.atomic_numbers.detach().cpu().numpy().reshape(-1).astype(int) # (n_atoms,)
+        wfn_path = str(_batch_attr_value(batch=batch, name="wfn_path")) if hasattr(batch, "wfn_path") else None
+        promolecular_path = None
+        if hasattr(batch, "promolecular_density_matrix_path"):
+            promolecular_path = str(_batch_attr_value(batch=batch, name="promolecular_density_matrix_path"))
+
+        batch = batch.to(pretrained_model.device)
+        dim = int(batch.density_matrix_dim.reshape(-1)[0].item())
+        with torch.no_grad():
+            with pretrained_model.autocast_ctx:
+                pred = model(batch)
+                # the same conformer teacher forced, i.e. fed D_{k-1} instead of D_hat_{k-1}
+                try:
+                    model.routing = "teacher_forcing"
+                    pred_teacher_forced = model(batch)
+                finally:
+                    model.routing = routing
+
+        pred_mat = pred["D_hat"][0].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+        true_mat = pred["D"][0].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+        teacher_forced_mat = pred_teacher_forced["D_hat"][0].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+        assert pred_mat.shape == (dim, dim) and true_mat.shape == (dim, dim) and teacher_forced_mat.shape == (dim, dim)
+        if not np.all(np.isfinite(pred_mat)):
+            log(f"[WARNING] Non-finite {routing} prediction for {_sample_base_name(record)}; "
+                "left out of the sampled figures", rank=0)
+            continue
+
+        # row k of the strictly lower z block holds z_{k+1}, so its norm is ||z_{k+1}||; row 0 is the empty z_1
+        z_pairs = pred["z"][0].detach().cpu().numpy().astype(np.float64) # (n_basis, n_basis)
+        sample_results.append({
+            "record": record,
+            "pred_matrix": pred_mat,
+            "true_matrix": true_mat,
+            "pred_matrix_teacher_forced": teacher_forced_mat,
+            "schur_routing": routing,
+            "schur_delta": pred["delta"][0].detach().cpu().numpy().astype(np.float64), # (n_basis,)
+            "schur_z_norms": np.linalg.norm(z_pairs, axis=1), # (n_basis,)
+            "mask": None,
+            "positions_angstrom": positions_angstrom,
+            "atomic_numbers": atomic_numbers,
+            "wfn_path": wfn_path,
+            "promolecular_density_matrix_path": promolecular_path,
+        })
+
+    return sample_results
+
+
 def sample_inference(pretrained_model, dataset, selected_records, artifacts_dir: str = None):
     '''rerun inference on a small selected dataset and return unpadded matrices'''
+
+    if getattr(pretrained_model, "is_schur", False):
+        return schur_sample_inference(pretrained_model, dataset, selected_records)
 
     # output_dim is N_pad ** 2 for the full head, or T(N_pad) for the upper-triangle head
     var_config = pretrained_model.config["NeuralNetwork"]["Variables_of_interest"]
@@ -513,6 +585,18 @@ def plot_density_matrix_visuals(
                     vmax=vmax,
                 )
 
+        # PSD at a glance: free-running Schur predictions have no negative eigenvalue, dense ones do
+        predicted_minimum = float(np.linalg.eigvalsh(0.5 * (pred_matrix + pred_matrix.T)).min())
+        recorded_minimum = record.get("minimum_eigenvalue", None)
+        log(f"[INFO] {base_name} minimum eigenvalue of the prediction: figure {predicted_minimum:.6e}, "
+            f"record {'—' if recorded_minimum is None else format(recorded_minimum, '.6e')}", rank=0)
+        eigenvalue_spectrum_plot(
+            true_matrix=true_matrix,
+            predicted_matrix=pred_matrix,
+            output_path=os.path.join(sample_dir, f"{base_name}_eigenvalue_spectrum"),
+            title=f"{base_name} eigenvalues of the true and predicted density matrix",
+        )
+
         # reconstruction_scatter(
         #     true_matrices=true_matrix,
         #     predicted_matrices=pred_matrix,
@@ -530,6 +614,54 @@ def plot_density_matrix_visuals(
     #         title="Sampled reconstruction scatter",
     #         zscore=True,
     #     )
+
+
+def plot_schur_decoder_visuals(sample_results, output_dir: str):
+    '''plot leading-block errors, pivots and latent norms for sampled Schur decoder conformers'''
+
+    curves = []
+    for sample in sample_results:
+        record = sample["record"]
+        base_name = _sample_base_name(record)
+        sample_dir = _sample_output_dir(output_dir=output_dir, record=record)
+
+        # the leading k x k block of a free-running D_hat is the recursion's state at step k,
+        # so this is the error profile along the recursion; teacher forced for comparison
+        free_running = leading_block_relative_errors(sample["pred_matrix"], sample["true_matrix"]) # (n_basis,)
+        teacher_forced = leading_block_relative_errors(
+            sample["pred_matrix_teacher_forced"], sample["true_matrix"]
+        ) # (n_basis,)
+        curves.append((base_name, free_running, teacher_forced))
+
+        # the inference recorded the same error at k = ceil(p n / 100); a mismatch would mean the
+        # figure and the metrics do not describe the same prediction
+        n_basis = free_running.size
+        comparison = []
+        for percent in (10, 25, 50, 75):
+            k = max(1, int(np.ceil(percent * n_basis / 100)))
+            recorded = record.get(f"schur_block_relative_error_k{percent}", None)
+            comparison.append(f"k{percent}: figure {free_running[k - 1]:.6e} record "
+                              f"{'—' if recorded is None else format(recorded, '.6e')}")
+        log(f"[INFO] {base_name} block errors, figure against inference record: " + "; ".join(comparison), rank=0)
+
+        block_error_curve_plot(
+            curves=[("", free_running, teacher_forced)],
+            output_path=os.path.join(sample_dir, f"{base_name}_block_error_curve"),
+            title=f"{base_name} leading-block relative error along the recursion",
+        )
+        pivot_latent_plot(
+            delta=sample["schur_delta"],
+            z_norms=sample["schur_z_norms"],
+            output_path=os.path.join(sample_dir, f"{base_name}_pivots_and_latent_norms"),
+            title=f"{base_name} predicted pivots and latent norms ({sample['schur_routing']})",
+        )
+
+    if len(curves) > 0:
+        block_error_curve_plot(
+            curves=curves,
+            output_path=os.path.join(output_dir, "sampled_block_error_curves"),
+            title="Leading-block relative error along the recursion, sampled conformers",
+        )
 
 
 def plot_electron_density_visuals(
@@ -613,9 +745,34 @@ def plot_electron_density_visuals(
                     first_cube_metadata=true_metadata,
                     second_cube_metadata=pred_metadata,
                 )
-                return true_density, pred_density, true_metadata
             except Exception as exc:
                 log(f"[WARNING] Failed to read cubeprops from {true_dir} and {pred_dir}: {exc}", rank=0)
+                continue
+
+            # Cube paths name neither the run nor the model, so a later inference run with the
+            # same artifacts_dir overwrites them. The cubes are used only if their integrals
+            # are the ones this run's inference recorded; otherwise they belong to another run.
+            voxel_volume = record.get("electron_density_voxel_volume_au3", None)
+            recorded = (
+                record.get("electron_density_true_integral", None),
+                record.get("electron_density_predicted_integral", None),
+            )
+            if voxel_volume is None or None in recorded:
+                log(f"[WARNING] {_sample_base_name(record)}: no recorded cube integrals to check the "
+                    f"cubes in {pred_dir} against; using them unchecked", rank=0)
+                return true_density, pred_density, true_metadata
+            integrals = (
+                float(np.sum(true_density)) * float(voxel_volume),
+                float(np.sum(pred_density)) * float(voxel_volume),
+            )
+            if all(abs(a - b) <= 1e-6 * abs(b) for a, b in zip(integrals, recorded)):
+                log(f"[INFO] {_sample_base_name(record)}: reusing cubes, integrals match the record "
+                    f"(true {integrals[0]:.6f}, predicted {integrals[1]:.6f})", rank=0)
+                return true_density, pred_density, true_metadata
+            log(f"[WARNING] {_sample_base_name(record)}: cubes in {pred_dir} integrate to "
+                f"(true {integrals[0]:.6f}, predicted {integrals[1]:.6f}) but this run recorded "
+                f"({recorded[0]:.6f}, {recorded[1]:.6f}); they were overwritten by another run "
+                "and are not used", rank=0)
 
         return None
 
@@ -1100,9 +1257,11 @@ def main(
         if local_inference_runner is None:
             from qmugs import QMugsInference
             # standalone plotting redeclares the inference wrapper from saved config
+            # a Schur run is replotted in the routing it was evaluated in; dense models ignore it
             local_inference_runner = QMugsInference(
                 model_dir=model_dir,
                 checkpoint_path=checkpoint_path,
+                schur_routing=inference_config_local.get("schur_routing") or "free_running",
             )
 
         var_config = local_inference_runner.config["NeuralNetwork"]["Variables_of_interest"]
@@ -1167,6 +1326,7 @@ def main(
         "density_matrices": os.path.join(base_figure_dir, "density_matrices"),
         "electron_density": os.path.join(base_figure_dir, "electron_density"),
         "dipole_moments": os.path.join(base_figure_dir, "dipole_moments"),
+        "schur_decoder": os.path.join(base_figure_dir, "schur_decoder"),
     }
     for directory in figure_dirs.values():
         os.makedirs(directory, exist_ok=True)
@@ -1247,6 +1407,13 @@ def main(
         output_dir=figure_dirs["density_matrices"],
         matrix_pool_size=matrix_pool_size,
     )
+
+    # only Schur samples carry the teacher-forced matrix, pivots and latent norms
+    if "pred_matrix_teacher_forced" in sample_results[0]:
+        plot_schur_decoder_visuals(
+            sample_results=sample_results,
+            output_dir=figure_dirs["schur_decoder"],
+        )
 
     qmugs_data_dir = inference_config.get("qmugs_data_dir", None)
     if run_electron_density_visuals:

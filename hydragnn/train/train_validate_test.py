@@ -11,6 +11,7 @@
 
 from tqdm import tqdm
 import numpy as np
+import inspect
 import torch
 
 from hydragnn.postprocess.postprocess import output_denormalize
@@ -61,6 +62,17 @@ PRECISION_MAP = {
     "fp64": {"param_dtype": torch.float64, "autocast_dtype": None},
 }
 
+
+
+def _loss_data_kwargs(model, data):
+    """pass the batch to model.module.loss only when that loss method takes a data argument"""
+    # the composite loss terms (hydragnn/domain_losses/composite.py) need batch fields. The
+    # signature is checked rather than the loss_accepts_data attribute, because wrappers that
+    # delegate attributes to an inner Base model (e.g. the OPF example) would inherit the
+    # attribute without accepting the argument; every other model keeps its old call pattern
+    if "data" in inspect.signature(model.module.loss).parameters:
+        return {"data": data}
+    return {}
 
 def _print_named_task_losses(verbosity, task_names, losses_by_split):
     """Print each task loss with its name and a consistent split format."""
@@ -890,6 +902,7 @@ def train(
                         mask=mask,
                         mask_loc=mask_loc,
                         target_dim=target_dim,
+                        **_loss_data_kwargs(model, data),
                     )
             if trace_level > 0:
                 tr.start("forward_sync", **syncopt)
@@ -1061,6 +1074,7 @@ def validate(
                     mask=mask,
                     mask_loc=mask_loc,
                     target_dim=target_dim,
+                    **_loss_data_kwargs(model, data),
                 )
         error = error.detach()
         if torch.is_tensor(tasks_loss):
@@ -1159,6 +1173,7 @@ def test(
                     mask_loc=mask_loc,
                     target_dim=target_dim,
                     use_padding_mask=use_padding_mask,
+                    **_loss_data_kwargs(model, data),
                 )
         ## FIXME: temporary
         if int(os.getenv("HYDRAGNN_DUMP_TESTDATA", "0")) == 1:

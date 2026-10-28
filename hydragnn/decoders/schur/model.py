@@ -58,8 +58,34 @@ def dense_from_padded_target(row, n_basis: int):
     return dense
 
 
+def trace_normalize(D_hat, overlap_matrix, n_electrons):
+    '''scale the predicted density matrix so its electron count equals the number of electrons'''
+
+    # Section 2.2 and Theorem 2.1: after step K the prediction is multiplied by the number of
+    # electrons over the trace of the overlap matrix times the prediction. A positive scalar
+    # keeps it symmetric and PSD. The basis is not orthogonal, so the plain trace is not the
+    # electron count. Both matrices are symmetric, so the trace of their product is the sum of
+    # their entrywise product.
+    n_basis = int(D_hat.shape[0])
+    assert D_hat.shape == (n_basis, n_basis) and overlap_matrix.shape == (n_basis, n_basis)
+    assert overlap_matrix.dtype == D_hat.dtype and overlap_matrix.device == D_hat.device
+
+    electron_count = torch.sum(overlap_matrix * D_hat) # scalar
+    # positive for a nonzero PSD prediction; a teacher-forced prediction carries no such guarantee
+    count_value = float(electron_count.detach())
+    assert math.isfinite(count_value) and count_value > 0.0, (
+        f'electron count of the predicted density matrix is {count_value:.6e}, '
+        'so it cannot be scaled to the number of electrons'
+    )
+    trace_scale = n_electrons / electron_count # scalar
+    return trace_scale * D_hat, trace_scale
+
+
 class SchurDecoderModel(Module):
     '''HydraGNN backbone plus the sequential Schur decoder of Sections 5.1-5.5'''
+
+    # the training loop passes the batch to loss() as data= only for models that declare this
+    loss_accepts_data = True
 
     def __init__(
         self,
@@ -95,6 +121,7 @@ class SchurDecoderModel(Module):
         checkpoint_z_head: bool = True,
         max_basis_dim=None,
         report_stride: int = 50,
+        trace_normalization: bool = False,
     ):
         super().__init__()
 
@@ -111,6 +138,12 @@ class SchurDecoderModel(Module):
             )
         if supervision == 'semi_sequential' and chunk_width is None:
             raise ValueError("supervision='semi_sequential' requires chunk_width to be set")
+        # the scale depends on every entry, so under windowed supervision the loss of a window
+        # would depend on steps outside it
+        if trace_normalization and supervision != 'joint':
+            raise ValueError(
+                f"trace_normalization requires supervision='joint', got {supervision}"
+            )
 
         # The decoder consumes Base.encode, which is the encoder half of Base.forward. A stack
         # that overrides forward does not go through it: MACEStack, for instance, interleaves
@@ -136,6 +169,7 @@ class SchurDecoderModel(Module):
         self.z_regularization_weight = float(z_regularization_weight)
         self.delta_regularization_weight = float(delta_regularization_weight)
         self.max_basis_dim = None if max_basis_dim is None else int(max_basis_dim)
+        self.trace_normalization = bool(trace_normalization)
         self.current_epoch = 0
         # every report_stride calls to loss(), one diagnostic line; 0 turns it off
         self.report_stride = int(report_stride)
@@ -281,12 +315,24 @@ class SchurDecoderModel(Module):
                 '--density_matrix_delta so promolecular_upper_triangle is stored'
             )
 
+        # the overlap matrix and the number of electrons, needed only for trace normalization
+        overlap_rows, electron_numbers = None, None
+        if self.trace_normalization:
+            if not (hasattr(data, 'overlap_upper_triangle') and hasattr(data, 'n_electrons')):
+                raise ValueError(
+                    'trace_normalization needs overlap_upper_triangle and n_electrons in the batch; '
+                    'use a dataset written by examples/qmugs/utils/add_overlap.py or preprocessed '
+                    'with --store_overlap_matrix'
+                )
+            overlap_rows = data.overlap_upper_triangle.reshape(num_graphs, -1)
+            electron_numbers = data.n_electrons.reshape(-1)
+
         charges = data.charge.reshape(-1)
         multiplicities = data.multiplicity.reshape(-1)
         atom_counts = data.natoms_int.reshape(-1)
 
         kept, matrices, promolecular_matrices = [], [], []
-        predicted_matrices, latents, pivots = [], [], []
+        predicted_matrices, latents, pivots, trace_scales = [], [], [], []
 
         for graph in range(num_graphs):
             n_basis = int(sizes[graph])
@@ -384,12 +430,21 @@ class SchurDecoderModel(Module):
                 detach_every=detach_every,
             )
 
+            # Section 2.2, after step K and before the loss; on the total, also for the delta target
+            trace_scale = None
+            if self.trace_normalization:
+                overlap_matrix = dense_from_padded_target(overlap_rows[graph], n_basis).to(D_hat.dtype)
+                D_hat, trace_scale = trace_normalize(
+                    D_hat, overlap_matrix, electron_numbers[graph].to(D_hat.dtype)
+                ) # (n_basis, n_basis), scalar
+
             kept.append(graph)
             matrices.append(density_matrix)
             promolecular_matrices.append(promolecular)
             predicted_matrices.append(D_hat)
             latents.append(z_pairs)
             pivots.append(delta)
+            trace_scales.append(trace_scale)
 
         if len(kept) == 0:
             raise ValueError(
@@ -404,6 +459,7 @@ class SchurDecoderModel(Module):
             'promolecular': promolecular_matrices,
             'z': latents,
             'delta': pivots,
+            'trace_scale': trace_scales,
         }
 
     def loss(
@@ -415,6 +471,7 @@ class SchurDecoderModel(Module):
         mask_loc=None,
         target_dim=None,
         use_padding_mask=False,
+        data=None,
     ):
         '''the total loss of Section 4.4, restricted to the currently active steps'''
 
@@ -495,6 +552,14 @@ class SchurDecoderModel(Module):
             largest_z = max(float(z.abs().max()) for z in pred['z'])
             largest_delta = max(float(d.abs().max()) for d in pred['delta'])
             largest_prediction = max(float(D.abs().max()) for D in pred['D_hat'])
+            # mean scale, and the mean relative electron deficit of the prediction before scaling
+            if self.trace_normalization:
+                scales = [float(scale) for scale in pred['trace_scale']]
+                logging.info(
+                    'Schur decoder: mean trace scale=%.6e mean relative electron deficit=%.6e',
+                    sum(scales) / len(scales),
+                    sum(1.0 - 1.0 / scale for scale in scales) / len(scales),
+                )
             logging.info(
                 'Schur decoder: reconstruction=%.6e regularization=%.6e '
                 'relative_total=%.6e relative_delta=%.6e '
@@ -508,7 +573,30 @@ class SchurDecoderModel(Module):
                 largest_prediction,
             )
 
-        return total_reconstruction + total_regularization, [total_reconstruction]
+        # per-epoch report through hydragnn/loss_reporting.py, plus the composite loss terms, which
+        # need the batch (hydragnn/domain_losses/composite.py); the composite loss lives on the backbone
+        total = total_reconstruction + total_regularization
+        report = {
+            'supervised.reconstruction': {
+                'raw': total_reconstruction.detach(),
+                'weight': 1.0,
+                'weighted': total_reconstruction.detach(),
+            },
+            'supervised.regularization': {
+                'raw': total_regularization.detach(),
+                'weight': 1.0,
+                'weighted': total_regularization.detach(),
+            },
+        }
+        composite_loss = getattr(self.backbone, 'composite_loss', None)
+        if data is not None and composite_loss is not None:
+            extra, extra_report = composite_loss(pred, data, self)
+            if extra is not None:
+                total = total + extra
+            report.update(extra_report)
+        self.last_loss_components = report
+
+        return total, [total_reconstruction]
 
     def __str__(self):
         return 'SchurDecoderModel(' + str(self.backbone) + ')'

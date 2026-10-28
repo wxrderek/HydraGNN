@@ -2,6 +2,7 @@ import copy
 
 from .interatomic import InteratomicPotentialDomainLoss
 from .constraint_optimizers import create_constraint_optimizer
+from .composite import CompositeLoss
 
 
 def create_domain_loss(model, config):
@@ -10,6 +11,10 @@ def create_domain_loss(model, config):
     provider = config.get("provider")
     if provider == "interatomic_potential":
         return InteratomicPotentialDomainLoss(model, config)
+    if provider == "composite":
+        # attached as an attribute, not a wrapper, so state dict keys and checkpoints are unchanged
+        model.composite_loss = CompositeLoss(config)
+        return model
     if provider == "optimal_power_flow":
         raise ValueError(
             "The optimal_power_flow provider requires dataset metadata and cannot "
@@ -42,6 +47,7 @@ def defer_domain_loss(config, provider):
 
 __all__ = [
     "InteratomicPotentialDomainLoss",
+    "CompositeLoss",
     "create_domain_loss",
     "defer_domain_loss",
     "uses_interatomic_potential",

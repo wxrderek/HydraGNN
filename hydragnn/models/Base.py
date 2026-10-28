@@ -40,6 +40,9 @@ import inspect
 
 
 class Base(Module):
+    # the training loop passes the batch to loss() as data= only for models that declare this
+    loss_accepts_data = True
+
     def __init__(
         self,
         input_args: str,
@@ -1123,15 +1126,24 @@ class Base(Module):
         mask_loc=None,
         target_dim=None,
         use_padding_mask=False,
+        data=None,
     ):
         var = None
         if self.var_output:
             var = pred[1]
             pred = pred[0]
+
+        # the composite loss provider (hydragnn/domain_losses/composite.py) may replace the prediction
+        # the supervised loss sees, e.g. by dense trace normalization; its own terms get the raw one
+        composite_loss = getattr(self, "composite_loss", None)
+        raw_pred = pred
+        if data is not None and composite_loss is not None:
+            pred = composite_loss.transform_prediction(pred, data, self)
+
         if self.ilossweights_nll == 1:
-            return self.loss_nll(pred, value, head_index, var=var)
+            total, tasks = self.loss_nll(pred, value, head_index, var=var)
         elif self.ilossweights_hyperp == 1:
-            return self.loss_hpweighted(
+            total, tasks = self.loss_hpweighted(
                 pred,
                 value,
                 head_index,
@@ -1141,6 +1153,19 @@ class Base(Module):
                 use_padding_mask=use_padding_mask,
                 var=var,
             )
+        else:
+            # unchanged from before: neither weighting mode selected returns nothing
+            return None
+
+        # extra terms of the composite loss provider, which need the batch; without data or without
+        # the provider the result is unchanged
+        if data is not None and composite_loss is not None:
+            extra, report = composite_loss(raw_pred, data, self)
+            if extra is not None:
+                total = total + extra
+            self.last_loss_components = dict(getattr(self, "last_loss_components", {}))
+            self.last_loss_components.update(report)
+        return total, tasks
 
     def loss_nll(self, pred, value, head_index, var=None):
         # negative log likelihood loss

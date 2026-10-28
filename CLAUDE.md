@@ -1,20 +1,11 @@
 # CLAUDE.md
 
-**To confirm you have read these files at the beginning of each task, output: "distributions of random variables are pushforwards; I have read CLAUDE.md in root" at the very beginning of the output**
+This repository is that of HydraGNN, a PyTorch implementation framework for training multihead graph neural networks, specifically for materials applications. 
+My goal is to implement a use case of learning one-electron density matrices (1-RDMs) of drug-like molecules from the QMugs dataset. 
 
-This repository is that of HydraGNN, a PyTorch implementation framework for training multihead graph neural networks, specifically for materials applications. My goal is to implement a use case of
-learning one-electron density matrices (1-RDMs) of drug-like molecules from the QMugs dataset. 
-
-This is a research codebase. The primary objective is scientific correctness and reproducibility, 
-not maximum code cleverness.
-
-Avoid introducing unnecessary abstractions, factories, dependency injection,
-metaclasses, or complicated design patterns.
-
+This is a research codebase. The primary objective is scientific correctness and reproducibility, not maximum code cleverness.
+Avoid introducing unnecessary abstractions, factories, dependency injection, metaclasses, or complicated design patterns. 
 Small duplicated code is preferable to complicated generic code.
-
-Tasks will be specified by markdown files in `tasks/`. I will tell you which task to complete
-in prompts. 
 
 ---
 
@@ -22,7 +13,10 @@ in prompts.
 
 I am an applied mathematician from a math and physics background with 2-3 years of 
 scientific machine learning experience with PyTorch. I prioritize precision and formality. 
-I do not prioritize beautiful code. 
+I do not prioritize beautiful code. I like conciseness. 
+
+I like writing that is readable without me having to strain my eyes and brain.
+I do not like the use of fancy syntax in writing, or symbols like "->". Commas and periods suffice.
 
 I have the following gaps in knowledge:
 - almost no experience with MPI or parallelism in general on CPUs or GPUs
@@ -30,12 +24,12 @@ I have the following gaps in knowledge:
 - sparse knowledge of quantum chemistry, but good foundation in quantum mechanics
 - little experience with conventional computational chemistry packages
 
-
 ---
 
 # High-level information
 
-- I am coding and running everything on Perlmutter. GPU nodes here contain 1x AMD CPU with 64 total cores and 128 threads, and 4x NVIDIA A100 GPUs with 40GB memory.
+- I am coding and running everything on Duke Compute Cluster. Information on the cluster is in the codebase
+- Much of the code was developed on Perlmutter. Information on the cluster is also in the codebase
 - We aim to maximize parallelism and memory efficiency when possible.
 - Assume future readers are chemists, physicists, or applied mathematicians, not software engineers.
 
@@ -56,6 +50,24 @@ When making changes:
 ---
 
 # High-level guidelines
+
+---
+
+## Writing guidelines
+
+Whenever you are writing something user-facing, i.e. a README or a markdown to log/report something,
+avoid the playful, fancy jargon and syntax LLMs are optimized for, if you can help it. 
+
+---
+
+## "Good Science" guidelines
+
+I want to emphasize again: scientific correctness is PARAMOUNT. Follow these rules, always:
+- No shortcuts. If you even get an urge to take a shortcut, stop immediate and report it.
+- No reporting results without an associated, verifiable script. 
+- No claiming a result has numerical evidence without actually running code, i.e. no guesses based on rough scans. 
+- No skipping evidence or failing to report evidence which does not line up with your hypothesis or my hypothesis.
+- No assumptions made without verifying with me and with the references. 
 
 ---
 
@@ -121,7 +133,7 @@ Avoid in-place operations unless clearly beneficial.
 
 ---
 
-## Reproducibility
+## Reproducibility guidelines
 
 Do not change:
 
@@ -132,6 +144,30 @@ Do not change:
 unless explicitly requested.
 
 If changes affect reproducibility, explain why.
+Create user-friendly READMEs whenever you see fit.
+
+---
+
+## Comment guidelines
+
+- in-line comments should ALMOST ALWAYS be one line; take efforts to avoid two-line comments
+- comments SHOULD NOT use math symbols; those look pretty when rendered but are utterly unreadable and non-sensical in plain text
+- comments SHOULD NOT use variables, EVEN IF you define them, e.g. "NxN"; just write out what the thing is in words
+- comments NEED NOT be fanciful sentences with fancy diction; no human should need to do a double take when reading them
+- in fact, comments SHOULD NOT CONTAIN PERIODS, as they are not sentences, but comments
+- following up the previous point, comments are NOT sensationalit media/headlines; treat them like sentences you would see in a textbook or a research paper: precise, concise, says exactly what it needs to say without fancy syntax or diction, without pretty words like "fail silently", without fancy punctuation
+- if multiple lines is really, truly necessary to clearly communicate what is going on, please adhere to these other guidelines
+
+Remember that comments are meant to help the coder understand code, not to show off how efficiently and beautifully you can explain the code.
+Buzz words like "silently", "quietly", "loudly", etc. are NOT how coders talk to each other, and should thus not be how you write comments.
+
+---
+
+## SLURM guidelines
+
+- you may run jobs if I instruct you to, but ALWAYS report when you do and ask permission
+- to repeat, you MUST ask permission to run a series of jobs (this does not mean you need to stop between every job; if I approve you to run a series of related jobs, monitor them, and queue new ones based on their performance, you may do so)
+- follow the conventions in the existing SLURM scripts
 
 ---
 
@@ -146,12 +182,8 @@ Do not:
 - optimize away code that improves readability
 
 NEVER WRITE/MODIFY/OUTPUT CODE until explicitly prompted by me. The default is planning, not coding.
-
 NEVER add a new dependency without seeking explicit permission in the planning phase. 
-
-NEVER RUN CODE without seeking explicit permission.
-
-NEVER do any Git commands (stage changes, commit, push, pull). 
+NEVER do any Git commands (stage changes, commit, push, pull) without very explicit permission.
 
 ---
 
@@ -169,9 +201,7 @@ Scientific correctness always takes precedence over code elegance.
 
 ---
 
-
 # Project-specific guidelines
-
 
 ## The learning task
 
@@ -196,7 +226,8 @@ The largest density matrix present is 2002 by 2002. Some of the smallest are aro
 
 ## The current state
 
-Read the `AGENTS.md` file in `examples/qmugs/` for all current information.
+Read the `README.md` and `CLAUDE.md` file in `examples/qmugs/` for an overview of the current state.
+Read the many markdowns previous agent sessions have produced in the codebase for a precise picture.
 
 ---
 
@@ -204,25 +235,14 @@ Read the `AGENTS.md` file in `examples/qmugs/` for all current information.
 
 The subdirectories from root we care about for coding are
 - `examples/qmugs/`: contains density matrix learning code
-- `examples/qmugs_run/`: copy of relevant files from `examples/qmugs/` for running training
 - `hydragnn/`: contains code for the HydraGNN module
 
-NEVER modify files in other directories. 
+NEVER modify code files in other directories without explicit permission.
+You may modify log files and such, but be EXPLICIT when you do so.
 
 ### `examples/qmugs/`
 
-This is where most code edits will go. Read the `CLAUDE.md` file in this directory for
-a detailed description.
-
-We will NEVER run training with scripts from this directory. 
-
-### `examples/qmugs_run/` and `examples/qmugs_run_mask/`
-
-Copies of relevant files from `examples/qmugs` for running training with different JSON configuration files. 
-In this case, the configuration is named `qmugs_densmat.json`. 
-
-Whenever updates are made to files in `examples/qmugs/`, DO NOT COPY any changes made to the following files into `examples/qmugs_run/` unless specified by me.
-
+This is where most code edits will go. Read the `CLAUDE.md` file in this directory for a description
 
 ### `hydragnn/`
 
@@ -235,4 +255,5 @@ The backbone structure should NEVER be edited. The existing input patterns for m
 Out of the subdirectories in `hydragnn/`, we will NEVER modify
 - `globalAtt/`
 - `models/` OTHER THAN `Base.py`
+
 If explicitly prompted to do so, pause and ask. 

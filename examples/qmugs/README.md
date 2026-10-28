@@ -4,33 +4,27 @@
 ```
 qmugs
 |
-├── eda                                    # results from eda.py
-|   ├── densmat_eda.json                   # EDA configuration
-|   ├── entries.png                        # dataset entry counts
-|   └── sizes.png                          # density matrix size distribution
-|
 ├── figs                                   # functions to plot things
 |   ├── density_matrix_visualizers.py      # density matrix heatmaps
 |   ├── density_visualizers.py             # electron density point clouds and isosurfaces
 |   ├── dipole_moment_visualizers.py       # dipole moment vectors and parity plots
-|   └── metrics_visualizers.py             # error metrics vs. molecule size
+|   ├── metrics_visualizers.py             # error metrics vs. molecule size
+|   └── schur_decoder_visualizers.py       # block error vs k, pivots and latent norms
 |
 ├── scripts                                # SLURM scripts, one subdirectory per machine
 |   ├── dcc                                # Duke Compute Cluster
 |   |   ├── qmugs_densmat_dcc.sh           # runs training
-|   |   ├── qmugs_eda_dcc.sh               # runs EDA script (NO LONGER USED)
 |   |   ├── qmugs_figs_dcc.sh              # runs figures given a previous inference run
 |   |   ├── qmugs_inference_dcc.sh         # runs inference
 |   |   ├── qmugs_pre_dcc.sh               # runs data preprocessing to prep for training
 |   |   ├── qmugs_schur_dcc.sh             # runs training with the Schur decoder
 |   |   ├── qmugs_schur_pre_dcc.sh         # runs data preprocessing for the Schur decoder
-|   |   ├── qmugs_schur_decomp_test_dcc.sh # runs schur_decomp_test.py (DCC only)
-|   |   ├── qmugs_schur_decoder_test_dcc.sh # runs schur_decoder_test.py (DCC only)
-|   |   ├── qmugs_scan_dcc.sh              # runs scan_dataset_health.py (DCC only)
-|   |   ├── qmugs_inspect_ckpt_dcc.sh      # runs inspect_checkpoints.py (DCC only)
+|   |   ├── qmugs_schur_inference_dcc.sh   # runs inference with a Schur decoder model
+|   |   ├── qmugs_schur_figs_dcc.sh        # runs standalone figures, Schur or dense
 |   |   └── test.sh                        # tests environment and package setup
-|   └── perlmutter                         # Perlmutter (NERSC), same six scripts
 |
+├── schur_long                             # restart card, segment driver and report of the 400-epoch Schur run
+├── slurm_output                           # SLURM logs, one subdirectory per job type
 ├── utils
 |   ├── download_data.json                 # data download config, UPDATE THIS to point to your own directories
 |   ├── download_data.py                   # Python wrapper for data download functions
@@ -38,22 +32,17 @@ qmugs
 |   ├── inference_utils.py                 # utilities used only by the inference path
 |   └── utils.py                           # utilities, importantly including density matrix pre/post-processing
 |
-├── eda.py                                 # script with EDA functionalities for the QMugs dataset
 ├── figs.py                                # Python script to run figure plotting
 ├── qmugs_densmat.json                     # HydraGNN configuration for the learning task
 ├── qmugs_schur.json                       # HydraGNN configuration for the Schur decoder
 ├── qmugs_densmat_inference.py             # Python script to run inference on a trained model
 ├── qmugs_densmat_train.py                 # Python script to run preprocessing or training
-├── schur_decomp_test.py                   # diagnostics on ground-truth density matrices, for the Schur decoder
-├── schur_decoder_test.py                  # verification suite for hydragnn/decoders/schur/
-├── scan_dataset_health.py                 # read-only screen of a preprocessed dataset for NaN-producing inputs
-├── inspect_checkpoints.py                 # read-only report of where a NaN sits in a saved checkpoint
 ├── qmugs.py                               # Python file containing QMugsDataset and QMugsInference
 ├── requirements.txt                       # QMugs-specific dependencies
 └── README.md
 
 ```
-All other files in this directory are log files from previous runs.
+Archived on 2026-10-21 to `/work/xw262/HydraGNN_archive/` (see its `README.md` and `MANIFEST.tsv`): `eda.py` and `eda/`, `scripts/perlmutter/`, `sync_checks/`, `schur_decomp_test.py`, `schur_decoder_test.py`, `scan_dataset_health.py`, `inspect_checkpoints.py` and their DCC scripts. The README sections below that describe them refer to the archived copies.
 ---
 
 ## Dev Reminders for Perlmutter
@@ -120,8 +109,6 @@ python -m pip install -e . --no-deps
 Note the `--no-deps` flag avoids reinstalling possibly incompatible versions of torch family modules after compatible ones have been installed by the installation script. 
 
 The environment is built under `/hpc/group/youlab/$USER/`, NOT inside the repository as on Perlmutter. This is not a preference: the VAST filesystem backing `/work` rejects filenames containing `*`, `?`, `:`, or `|`, and `psi4` ships basis sets named e.g. `6-31g**.g94`, so it cannot be installed there. Override with `INSTALL_ROOT` if needed. See `references/dcc_info/perlmutter_to_dcc_transfer.md`. 
-
-Prefer running the installation script inside a `youlab-gpu` batch job rather than on a login node, so that the CUDA checks are meaningful. Login nodes have no GPU. 
 
 ---
 
@@ -229,6 +216,12 @@ The `data.y_mask` attribute stores this further train and validation mask. The `
 
 ### Specifying output constraints
 
+**Not implemented (checked 2026-10-22).** `output_constraint_selection` in
+`hydragnn/utils/model/model.py` is a stub and is never called, so the `output_constraints` key
+below has no effect. For a trace constraint use `density_matrix.trace_normalization` (dense head)
+or `SchurDecoder.trace_normalization`; see "Trace normalization" and "Composite loss terms". The
+original description follows.
+
 The density matrix learning pipeline supports 2 forms of output constraints. By "output constaints",
 we mean constraints applied on the output of the last output head of the network before loss computation, such that the network architecture remains identical. 
 
@@ -268,6 +261,86 @@ matrices are expected to have equal trace.
     ...
 }
 ```
+
+### Overlap matrix and electron count in the dataset
+
+The electron count of a density matrix is the trace of the overlap matrix times the density
+matrix, not the plain trace. The trace constraint and the overlap-weighted losses therefore need
+the atomic orbital overlap matrix and the number of electrons of each conformer. Two optional
+fields hold them:
+
+- `overlap_upper_triangle`: the row-major upper triangle of the overlap matrix, float32, zero
+  padded exactly like `promolecular_upper_triangle` (length 320400 at a padding of 800). It comes
+  from `psi4.core.MintsHelper(wfn.basisset()).ao_overlap()`, in the same orbital order as the
+  stored density matrix.
+- `n_electrons`: the number of electrons described by the density matrix, int32. This is the sum
+  of atomic numbers minus the charge minus the core electrons that def2-SVP replaces by an
+  effective core potential (28 for iodine, none up to krypton). It is checked against the number
+  of alpha plus beta electrons of the wavefunction when it is written. Using the plain sum of
+  atomic numbers would be wrong by 28 for every molecule containing iodine.
+
+Both fields add about 1.3 MB per conformer. Datasets without them still work everywhere; the
+metrics below are then skipped with one warning.
+
+**Adding the fields to an existing dataset.** `utils/add_overlap.py` reads every pickle of a
+dataset, opens its wavefunction from the stored `wfn_path`, attaches the two fields and writes the
+pickle to the same relative path under a new directory. The meta files are copied unchanged, so the
+splits and the sample order are the same. It refuses to write into a non-empty directory. From
+`examples/qmugs/`:
+
+```
+ADD_OVERLAP_SOURCE=/work/$USER/qmugs/QMugs001_max800_delta_uptr_decodercmp.pickle \
+ADD_OVERLAP_DESTINATION=/work/$USER/qmugs/QMugs001_max800_delta_uptr_decodercmp_overlap.pickle \
+ADD_OVERLAP_ELECTRON_COUNT_TOLERANCE=1e-5 \
+sbatch scripts/dcc/qmugs_add_overlap_dcc.sh
+```
+
+The source pickle in this example, `QMugs001_max800_delta_uptr_decodercmp.pickle`, was deleted on
+2026-10-28 after the `_overlap` pickle was verified to hold the same split
+(`logs/baselines/split_QMugs001_max800.json`); the command is kept as the record of how the
+`_overlap` pickle was made.
+
+With `ADD_OVERLAP_CHECK_ONLY=1` nothing is written except the log directory.
+`ADD_OVERLAP_MAX_SAMPLES` limits the number of conformers per split, for tests.
+
+**Storing the fields during preprocessing.** `qmugs_densmat_train.py --store_overlap_matrix`
+attaches the same two fields in `QMugsDataset._mol_to_graph`. The DCC preprocessing scripts set it
+with `SCHUR_STORE_OVERLAP=1` (`qmugs_schur_pre_dcc.sh`) or `STORE_OVERLAP=1` (`qmugs_pre_dcc.sh`).
+Both routes use the same helpers, `overlap_matrix` and `number_of_electrons` in `utils/utils.py`,
+and write identical fields. Preprocessing with `--max_density_matrix_size` reads
+`eda/densmat_eda.json`.
+
+**Ground-truth checks.** For every conformer, `utils/add_overlap.py` evaluates the quantities
+below on the true density matrix: once from the wavefunction in float64, and once from the stored
+float32 fields as the model sees them. Per-conformer rows go to `ground_truth_checks.csv` and
+per-split statistics to `summary.json`, both in `logs/qmugs-add-overlap-<jobid>/`:
+
+- the electron count error;
+- the closed-shell idempotency defect, and the alpha and beta defects for open-shell cases;
+- the natural occupations, which are the eigenvalues of the overlap-symmetrized density matrix;
+- the overlap-weighted error of the promolecular baseline;
+- the smallest eigenvalue of the overlap matrix, and the largest deviation of its diagonal from 1.
+
+**Inference metrics.** When the dataset stores the overlap matrix, `QMugsInference` adds these
+metrics, for the Schur decoder and the dense head alike, all computed in float64:
+
+| metric | definition |
+|---|---|
+| `electron_count_error` | trace of overlap times predicted density matrix, minus the number of electrons (signed, in electrons) |
+| `electron_count_relative_error` | absolute value of the above divided by the number of electrons |
+| `true_electron_count_error` | the same for the true density matrix, a data check |
+| `s_metric_relative_error` | square root of tr(R S R S) / tr(D S D S), with R the prediction error, S the overlap matrix and D the true density matrix |
+| `idempotency_relative_defect` | Frobenius norm of (predicted times overlap times predicted minus twice predicted), divided by the Frobenius norm of the true density matrix |
+| `true_idempotency_relative_defect` | the same for the true density matrix |
+
+`trace_error` remains the plain trace and is not the electron count.
+
+**What to expect.** On 9 test conformers (3 per split), the true density matrices gave electron
+count errors below 6e-7 and idempotency defects of 5e-8 to 7e-8. Occupations were all within 4e-8
+of 0 or 2, and there were no fractional occupations. The promolecular baseline has an
+overlap-weighted error of about 0.55. The 2026-10-21 calibration on the epoch-391 Schur model gave
+an electron count error of about -37 electrons, an overlap-weighted error of 0.388 and an
+idempotency defect of 0.546.
 
 ## Schur Decoder
 
@@ -369,6 +442,7 @@ it does today. Starting from `qmugs_densmat.json`, four things change:
 | `z_row_chunk`, `checkpoint_z_head` | — | memory controls for the pair head |
 | `max_basis_dim` | — | conformers larger than this are skipped and logged |
 | `report_stride` | — | one diagnostic line every this many calls to `loss()`; `0` silences it |
+| `trace_normalization` | 2.2, Thm. 2.1 | scale each prediction to the number of electrons after the last step; `false` by default, needs the overlap dataset and `joint` supervision |
 
 **How each head is conditioned.** The reference leaves "metadata" and the graph open in
 Equations 11-13. This implementation resolves them as concatenation followed by an MLP, in three
@@ -531,8 +605,189 @@ untested.
 - *Checkpoints are not interchangeable.* Attaching the decoder prefixes every state-dict key
   with `backbone.`, so a checkpoint from a dense-head run will not load into a Schur model, or
   the reverse. Use a fresh `--modelname` and keep `"continue": 0`.
-- *Inference and figures are not wired up yet.* `qmugs_densmat_inference.py` and `figs.py` still
-  expect a padded upper-triangle vector from a dense head.
+
+### Trace normalization
+
+The electron count of a density matrix is the trace of the overlap matrix times the density
+matrix. Section 2.2 of the reference fixes it after the last step of the recursion: the predicted
+total is multiplied by the number of electrons over its electron count, before the loss. A
+positive scalar keeps the prediction symmetric and PSD, so under free running all three density
+matrix constraints then hold exactly. The scale is applied by `trace_normalize` in
+`hydragnn/decoders/schur/model.py`.
+
+```
+"SchurDecoder": {
+    ...
+    "supervision": "joint",
+    "trace_normalization": true
+}
+```
+
+**Data.** The batch must carry `overlap_upper_triangle` and `n_electrons`; see "Overlap matrix
+and electron count in the dataset" above. Without them the decoder stops with an error.
+
+**Delta target.** The recursion always builds the total, promolecular plus delta (Theorem 2.2),
+and the total is what gets scaled. The delta loss then compares the scaled total minus the
+promolecular matrix with the true delta. Scaling only the delta part cannot work: the
+promolecular matrix already has the right electron count.
+
+**Supervision.** Only `joint` is accepted. The scale depends on every entry, so under
+`semi_sequential` or `per_step` the loss of a window would depend on steps outside it.
+
+**Leading blocks.** The whole matrix is scaled, so the leading k by k block of the output is the
+recursion state times the same scalar. The `schur_block_relative_error_k*` metrics are computed on
+the scaled blocks.
+
+**Inference.** `--schur_trace_normalization` (`SCHUR_TRACE_NORMALIZATION` in
+`qmugs_schur_inference_dcc.sh`) is `config` by default, which keeps the trained setting; `on` or
+`off` overrides it, for instance to normalize a model trained without it. The scale of each
+conformer is saved as `schur_trace_scale`. The flag adds no parameters, so existing checkpoints
+load unchanged.
+
+**Tests.** `schur_trace_test.py` (`scripts/dcc/qmugs_schur_trace_test_dcc.sh`) checks the exact
+electron count, symmetry and PSD after scaling, a gradcheck through recursion and scaling, and
+the flag end to end through `SchurDecoderModel` for both targets and both routings.
+
+**What to expect.** The stride log line reports the mean trace scale and the mean relative
+electron deficit before scaling. Normalizing the epoch-391 model after training fixes the
+electron count, but makes the dipole and the relative Frobenius error worse (REPORT-2026-10-21
+§4.1), because its missing charge sits in the overlap population and not on the diagonal.
+
+### Composite loss terms
+
+Extra loss terms are added to the entrywise loss through the `composite` provider of
+`hydragnn/domain_losses/`, for the Schur decoder and the dense head alike. Each term is a mean
+over the molecules of the batch, and each enters the objective times its weight.
+
+```
+"Training": {
+    ...
+    "loss": {
+        "enabled": true,
+        "provider": "composite",
+        "terms": [
+            {"name": "electron_count", "weight": 0.24},
+            {"name": "overlap_metric", "weight": 0.032},
+            {"name": "idempotency", "weight": 0.012},
+            {"name": "frobenius_total", "weight": 0.020},
+            {"name": "frobenius_delta", "weight": 0.0}
+        ]
+    }
+}
+```
+
+| term | definition | what it targets |
+|---|---|---|
+| `electron_count` | (trace of overlap times raw prediction minus number of electrons, over number of electrons), squared | the electron count; on the Schur decoder it acts on the prediction before trace normalization, which pins its scale |
+| `overlap_metric` | tr(R S R S) / tr(D S D S), with R the prediction error, S the overlap matrix, D the true density matrix | the error in the norm weighted by the overlap matrix, which weights the bonding off-diagonal entries |
+| `idempotency` | squared Frobenius norm of (prediction times overlap times prediction minus twice the prediction), over the squared Frobenius norm of the true density matrix; molecules with multiplicity 1 only | the occupation spectrum of a closed-shell density matrix |
+| `frobenius_total` | squared Frobenius norm of the prediction error, over that of the true total density matrix | the relative error of the total, each molecule weighted equally |
+| `frobenius_delta` | squared Frobenius norm of the prediction error, over that of the true delta against the promolecular matrix | the relative error of the delta, which weights molecules close to the promolecular matrix more |
+
+The terms are the squares of the inference metrics `electron_count_relative_error`,
+`s_metric_relative_error`, `idempotency_relative_defect`, `relative_frobenius_error` and
+`schur_relative_delta_error`.
+
+**Total or delta target.** For any entrywise loss the two targets give the same loss, because the
+residual of the delta, the predicted delta minus the true delta, equals the residual of the total.
+The long Schur run trained with target `total` (`run_segment.sh` exports `SCHUR_TARGET=total`,
+which overrides the config), and the dense head predicts the delta, but both minimized the same
+entrywise residual. The choice matters only for the relative Frobenius terms, which share that
+residual and differ in the denominator. `frobenius_delta` needs `promolecular_upper_triangle`.
+
+**Data.** The terms need `overlap_upper_triangle` and `n_electrons`; see "Overlap matrix and
+electron count in the dataset". On the dense head, `qmugs_densmat_train.py` sets
+`density_matrix.dense_target` to `delta` or `total` from the output name and logs it, since the
+dense output must be unpacked and, for the delta target, have the promolecular matrix added.
+
+**Weights.** The example weights make each term about equal to the MAE of the epoch-391 Schur
+model under teacher forcing, the routing used in training (MAE 3.04e-3, job 59257158). From the
+term values measured there, weight = 3.04e-3 / value:
+
+| term | value | weight |
+|---|---|---|
+| `electron_count` | 0.0129 | 0.24 |
+| `overlap_metric` | 0.0954 | 0.032 |
+| `idempotency` | 0.2529 | 0.012 |
+| `frobenius_total` | 0.151 | 0.020 |
+| `frobenius_delta` | 0.458 | 0.0066 |
+
+They are starting points, not tuned values.
+On a barely trained model the terms are much larger: in a 20-batch dense head check the raw
+idempotency term was 3.64, so its weighted value was four times the entrywise loss.
+
+**With trace normalization.** Trace normalization alone leaves the raw scale of the prediction
+free, and trained from scratch it diverged within about 16 steps (job 59258340). Train it only
+with `electron_count` at a nonzero weight; the training script warns otherwise.
+
+**Dense trace normalization.** `"density_matrix": {"trace_normalization": true}` in the `loss`
+block scales the dense head's total (promolecular plus predicted delta, for a delta output name)
+to the number of electrons, with the same function as the Schur decoder (`trace_normalize`).
+`Base.loss` applies it before the entrywise loss, through `CompositeLoss.transform_prediction`, so
+the entrywise loss compares the normalized prediction with the target; the electron count term
+sees the raw prediction. `QMugsInference` applies the same scaling when the saved config has the
+key and reports `dense_trace_scale`. Only upper-triangle outputs are supported. It needs the
+composite provider enabled and is refused on the Schur decoder.
+
+**Validation.** By default the validation and test losses include the terms, so the learning
+rate scheduler and the best checkpoint follow the full objective, and the validation loss is not
+comparable with runs without the terms. With `"include_in_evaluation": false` in the `loss` block,
+the terms are still computed and reported in validation and test but left out of the returned
+loss, so the scheduler and the best checkpoint follow the entrywise loss only. Training always
+includes them. The per-epoch `LossComponents` line reports each part separately; the entrywise
+part is `supervised.reconstruction` for the Schur decoder and `supervised.head_0` for the dense
+head.
+
+**Checkpoints.** The provider is a plain object attached to the model, with no parameters, so it
+changes no state dict key, and existing checkpoints load unchanged.
+
+**Other models.** Any HydraGNN model whose `loss` method takes a `data` argument (`Base` and
+`SchurDecoderModel`) receives the batch, and new terms are registered in
+`hydragnn/domain_losses/composite.py`; see the comment at the top of that file.
+
+**Tests.** `composite_loss_test.py` (`scripts/dcc/qmugs_composite_loss_test_dcc.sh`) checks each
+term at the truth, against numpy, and by gradcheck; that the Schur and dense adapters agree; that
+the loss is unchanged without the provider; and that the electron count term keeps the trace scale
+bounded over training steps.
+
+**What to expect.** Each enabled term appears as `domain.<term>` in the `LossComponents` line.
+
+### Inference and figures
+
+`qmugs_densmat_inference.py` and `figs.py` recognise a Schur model from the `SchurDecoder` block of
+its saved `config.json`. The Schur scripts take every value from the environment;
+`MODEL_DIR` and `CHECKPOINT_PATH` are required, since the default checkpoint search sorts names
+and puts `_epoch_10.pk` before `_epoch_9.pk`:
+
+```
+MODEL_DIR=/work/$USER/HydraGNN/logs/<run> CHECKPOINT_PATH=<run>_epoch_<n>.pk \
+    SCHUR_ROUTING=free_running PERC_DOWNSAMPLE_TEST=1.0 \
+    sbatch scripts/dcc/qmugs_schur_inference_dcc.sh
+LOG_DIR=/work/$USER/HydraGNN/logs/<inference run> RUN_SAMPLE_FIGS=1 \
+    sbatch scripts/dcc/qmugs_schur_figs_dcc.sh
+```
+
+- `SCHUR_ROUTING=free_running` (the default) feeds `D_hat_{k-1}` back, so no ground truth enters
+  the prediction and every prediction is PSD. `teacher_forcing` reproduces the training forward
+  pass and is for checking against the logged loss.
+- Besides the dense-head metrics, each conformer gets `schur_block_relative_error_k{10,25,50,75}`
+  (the relative Frobenius error of the leading `k %` block, which under free running is the
+  recursion's state at that step), `schur_relative_delta_error`, `schur_min_pivot`,
+  `schur_max_pivot` and `schur_max_abs_z`.
+- Downstream calculations (`RUN_DOWNSTREAM_CALCULATION=1`, `DOWNSTREAM_CALCULATIONS="electron_density
+  dipole_moment"`) and figures (`RUN_FIGS=1` plus the `RUN_*_FIGS` and `FIGS_*` variables) work
+  as for the dense head. Schur models add a block-error-vs-`k` curve, pivots and `||z_k||` vs `k`
+  (`figs/schur_decoder_visualizers.py`); both model types get eigenvalue spectra.
+- Give each downstream run its own `ARTIFACTS_DIR`. Cube files are written under it with no run
+  name in the path, so a later run would overwrite an earlier run's predicted cubes. `figs.py`
+  checks a reused cube's integral against the record and recomputes it on a mismatch.
+- `qmugs_schur_figs_dcc.sh` also works on dense-head inference runs, and unlike
+  `qmugs_figs_dcc.sh` it has no hard-coded block overriding the environment.
+
+The 2026-10-21 evaluation of the 400-epoch run, with every inference run and ledger, is in
+`schur_long/REPORT-2026-10-21.md`. Its job ledger and runs were archived on 2026-10-28 (ledger
+`/work/xw262/HydraGNN_archive/schur_long_evaluation/ledger_schur-inference_jobs.tsv`). The reference
+evaluations kept for comparison, on the overlap dataset, are listed in `logs/baselines/README.md`.
 
 ### Verifying the implementation
 
@@ -551,6 +806,9 @@ sbatch scripts/dcc/qmugs_schur_decoder_test_dcc.sh
 
 Set `DECODER_WFN_PATH` to a Psi4 wavefunction file to run the oracle checks on a real conformer
 as well as on synthetic matrices. The script exits nonzero if any check fails.
+
+**Archived on 2026-10-21.** `schur_decoder_test.py` and its script now live in
+`/work/xw262/HydraGNN_archive/schur_development/code/`. Copy both back to run the suite.
 
 ## Diagnosing NaNs during training
 
@@ -603,9 +861,8 @@ the DCC login nodes, so it runs as a batch job:
 sbatch scripts/dcc/qmugs_scan_dcc.sh
 ```
 
-It lands on `youlab-gpu` only because the `youlab` CPU nodes are saturated; it requests no
-`--gres`, so the node's GPUs stay free. The defaults scan the three draws that matter for the NaN
-investigation. Override with `SCAN_DATASETS`, `SCAN_DATASET_DIR`, `SCAN_LABELS`, `SCAN_RADIUS`,
+The defaults scan the three draws that matter for the NaN investigation. 
+Override with `SCAN_DATASETS`, `SCAN_DATASET_DIR`, `SCAN_LABELS`, `SCAN_RADIUS`,
 `SCAN_N_REPORT`, and `SCAN_LIMIT`, for instance
 
 ```

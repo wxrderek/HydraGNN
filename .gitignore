@@ -17,6 +17,7 @@ HydraGNN-Installation-Perlmutter/
 HydraGNN-Installation-Duke-Compute-Cluster/
 references/*_info/
 references/*_methods/
+references/*_presentation_draft/
 *.doc
 *.docx
   **/logs/

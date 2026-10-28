@@ -5,3 +5,6 @@
 
 /cube_files
 /.ipynb_checkpoints
+# research scripts and reports of the long Schur run and the loss trials, kept out of git
+/schur_long/
+/loss_trials/
